@@ -176,7 +176,7 @@ class TestSyncManagerSaveFailure:
                 CLAUDE_MUX_DOT_ENV = d / ".env"
 
             sync = _Sync(cm)
-            with patch("claude_mux.tui._atomic_write", side_effect=OSError("disk full")):
+            with patch("claude_mux.sync._atomic_write", side_effect=OSError("disk full")):
                 result = sync._save_settings({})
             assert result is False
         finally:

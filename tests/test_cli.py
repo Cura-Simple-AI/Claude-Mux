@@ -293,3 +293,197 @@ class TestConfig:
         data = json.loads(result.output)
         assert "config_dir" in data
         assert "active" in data
+
+
+class TestAdd:
+    def test_add_basic(self, runner, tmp_dir):
+        with _patch_cm(tmp_dir):
+            result = runner.invoke(cli, [
+                "add", "-n", "deepseek",
+                "-u", "https://api.deepseek.com/v1",
+                "-k", "DEEPSEEK_API_KEY",
+            ])
+        assert result.exit_code == 0
+        assert "deepseek" in result.output
+
+    def test_add_json(self, runner, tmp_dir):
+        with _patch_cm(tmp_dir):
+            result = runner.invoke(cli, [
+                "add", "--json",
+                "-n", "myds",
+                "-u", "https://api.deepseek.com/v1",
+                "-k", "DS_KEY",
+            ])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["ok"] is True
+        assert data["name"] == "myds"
+
+    def test_add_duplicate_fails(self, runner, tmp_dir):
+        cm = _cm(tmp_dir)
+        cm.add_subscription("deepseek", "https://api.deepseek.com/v1", "DS_KEY")
+        with _patch_cm(tmp_dir):
+            result = runner.invoke(cli, [
+                "add", "-n", "deepseek",
+                "-u", "https://api.deepseek.com/v1",
+                "-k", "DS_KEY",
+            ])
+        assert result.exit_code == 1
+
+    def test_add_with_model_maps(self, runner, tmp_dir):
+        with _patch_cm(tmp_dir):
+            result = runner.invoke(cli, [
+                "add", "-n", "openai",
+                "-u", "https://api.openai.com/v1",
+                "-k", "OPENAI_API_KEY",
+                "--haiku", "gpt-4o-mini",
+                "--sonnet", "gpt-4o",
+                "--opus", "o1-mini",
+            ])
+        assert result.exit_code == 0
+        cm = _cm(tmp_dir)
+        sub = next(s for s in cm.subscriptions if s["name"] == "openai")
+        assert sub["model_maps"]["haiku"] == "gpt-4o-mini"
+        assert sub["model_maps"]["sonnet"] == "gpt-4o"
+
+    def test_add_oauth_auth_type(self, runner, tmp_dir):
+        with _patch_cm(tmp_dir):
+            result = runner.invoke(cli, [
+                "add", "-n", "claude-max",
+                "-u", "https://api.anthropic.com",
+                "-k", "CLAUDE_CODE_OAUTH_TOKEN",
+                "--auth", "oauth",
+            ])
+        assert result.exit_code == 0
+        cm = _cm(tmp_dir)
+        sub = next(s for s in cm.subscriptions if s["name"] == "claude-max")
+        assert sub["auth_type"] == "oauth"
+
+
+class TestEdit:
+    def test_edit_url(self, runner, tmp_dir):
+        cm = _cm(tmp_dir)
+        cm.add_subscription("deepseek", "https://old.url/v1", "DS_KEY")
+        with _patch_cm(tmp_dir):
+            result = runner.invoke(cli, ["edit", "deepseek", "--url", "https://new.url/v1"])
+        assert result.exit_code == 0
+        cm2 = _cm(tmp_dir)
+        sub = cm2.subscriptions[0]
+        assert sub["provider_url"] == "https://new.url/v1"
+
+    def test_edit_not_found(self, runner, tmp_dir):
+        with _patch_cm(tmp_dir):
+            result = runner.invoke(cli, ["edit", "nonexistent", "--url", "http://x"])
+        assert result.exit_code == 3
+
+    def test_edit_nothing_to_update(self, runner, tmp_dir):
+        cm = _cm(tmp_dir)
+        cm.add_subscription("deepseek", "https://api.deepseek.com/v1", "DS_KEY")
+        with _patch_cm(tmp_dir):
+            result = runner.invoke(cli, ["edit", "deepseek"])
+        assert result.exit_code == 2
+
+    def test_edit_model_maps(self, runner, tmp_dir):
+        cm = _cm(tmp_dir)
+        cm.add_subscription("ds", "http://x", "K")
+        with _patch_cm(tmp_dir):
+            result = runner.invoke(cli, ["edit", "ds", "--sonnet", "deepseek-reasoner"])
+        assert result.exit_code == 0
+        cm2 = _cm(tmp_dir)
+        assert cm2.subscriptions[0]["model_maps"]["sonnet"] == "deepseek-reasoner"
+
+    def test_edit_json(self, runner, tmp_dir):
+        cm = _cm(tmp_dir)
+        cm.add_subscription("ds", "http://x", "K")
+        with _patch_cm(tmp_dir):
+            result = runner.invoke(cli, ["edit", "ds", "--url", "http://new", "--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["ok"] is True
+
+
+class TestDelete:
+    def test_delete_with_yes_flag(self, runner, tmp_dir):
+        cm = _cm(tmp_dir)
+        cm.add_subscription("deepseek", "https://api.deepseek.com/v1", "DS_KEY")
+        with _patch_cm(tmp_dir):
+            result = runner.invoke(cli, ["delete", "deepseek", "--yes"])
+        assert result.exit_code == 0
+        assert "deepseek" in result.output
+        cm2 = _cm(tmp_dir)
+        assert len(cm2.subscriptions) == 0
+
+    def test_delete_not_found(self, runner, tmp_dir):
+        with _patch_cm(tmp_dir):
+            result = runner.invoke(cli, ["delete", "nonexistent", "--yes"])
+        assert result.exit_code == 3
+
+    def test_delete_json(self, runner, tmp_dir):
+        cm = _cm(tmp_dir)
+        cm.add_subscription("ds", "http://x", "K")
+        with _patch_cm(tmp_dir):
+            result = runner.invoke(cli, ["delete", "ds", "--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["ok"] is True
+        assert data["name"] == "ds"
+
+    def test_delete_prompts_without_yes(self, runner, tmp_dir):
+        cm = _cm(tmp_dir)
+        cm.add_subscription("ds", "http://x", "K")
+        with _patch_cm(tmp_dir):
+            # Simulate user typing 'y' at the confirmation prompt
+            result = runner.invoke(cli, ["delete", "ds"], input="y\n")
+        assert result.exit_code == 0
+
+
+class TestForceModel:
+    def test_force_model_sets_tier(self, runner, tmp_dir):
+        cm = _cm(tmp_dir)
+        cm.add_subscription("ds", "http://x", "K")
+        with _patch_cm(tmp_dir):
+            result = runner.invoke(cli, ["force-model", "ds", "deepseek-reasoner", "--tier", "opus"])
+        assert result.exit_code == 0
+        cm2 = _cm(tmp_dir)
+        assert cm2.subscriptions[0]["model_maps"]["opus"] == "deepseek-reasoner"
+
+    def test_force_model_default_tier_sonnet(self, runner, tmp_dir):
+        cm = _cm(tmp_dir)
+        cm.add_subscription("ds", "http://x", "K")
+        with _patch_cm(tmp_dir):
+            result = runner.invoke(cli, ["force-model", "ds", "deepseek-chat"])
+        assert result.exit_code == 0
+        cm2 = _cm(tmp_dir)
+        assert cm2.subscriptions[0]["model_maps"]["sonnet"] == "deepseek-chat"
+
+    def test_force_model_reset(self, runner, tmp_dir):
+        cm = _cm(tmp_dir)
+        sub = cm.add_subscription("ds", "http://x", "K")
+        cm.update_subscription(sub["id"], model_maps={"sonnet": "deepseek-chat"})
+        with _patch_cm(tmp_dir):
+            result = runner.invoke(cli, ["force-model", "ds", "--reset", "--tier", "sonnet"])
+        assert result.exit_code == 0
+        cm2 = _cm(tmp_dir)
+        assert "sonnet" not in cm2.subscriptions[0]["model_maps"]
+
+    def test_force_model_no_model_no_reset(self, runner, tmp_dir):
+        cm = _cm(tmp_dir)
+        cm.add_subscription("ds", "http://x", "K")
+        with _patch_cm(tmp_dir):
+            result = runner.invoke(cli, ["force-model", "ds"])
+        assert result.exit_code == 2
+
+    def test_force_model_not_found(self, runner, tmp_dir):
+        with _patch_cm(tmp_dir):
+            result = runner.invoke(cli, ["force-model", "nonexistent", "some-model"])
+        assert result.exit_code == 3
+
+    def test_force_model_json(self, runner, tmp_dir):
+        cm = _cm(tmp_dir)
+        cm.add_subscription("ds", "http://x", "K")
+        with _patch_cm(tmp_dir):
+            result = runner.invoke(cli, ["force-model", "ds", "my-model", "--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["ok"] is True
+        assert data["model"] == "my-model"

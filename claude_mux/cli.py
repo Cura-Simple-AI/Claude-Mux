@@ -457,6 +457,188 @@ def cmd_config(as_json):
 
 
 # ---------------------------------------------------------------------------
+# add
+# ---------------------------------------------------------------------------
+
+@cli.command("add")
+@click.option("--name", "-n", required=True, help="Subscription name (e.g. deepseek)")
+@click.option("--url", "-u", required=True, help="Provider base URL")
+@click.option("--key-env", "-k", required=True, help="Env var name that holds the API key")
+@click.option("--auth", default="bearer", show_default=True,
+              help="Auth type: bearer | gh_token | x-goog-api-key | oauth")
+@click.option("--haiku", default="", help="Model alias for haiku tier")
+@click.option("--sonnet", default="", help="Model alias for sonnet tier")
+@click.option("--opus", default="", help="Model alias for opus tier")
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON")
+def cmd_add(name, url, key_env, auth, haiku, sonnet, opus, as_json):
+    """Add a new subscription.
+
+    Example:
+
+      claude-mux add -n deepseek -u https://api.deepseek.com/v1 -k DEEPSEEK_API_KEY
+
+    For Claude Max (OAuth):
+
+      claude-mux add -n claude-max -u https://api.anthropic.com -k CLAUDE_CODE_OAUTH_TOKEN --auth oauth
+    """
+    cm = _cm()
+    if any(s["name"].lower() == name.lower() for s in cm.subscriptions):
+        click.echo(f"Error: subscription '{name}' already exists", err=True)
+        sys.exit(1)
+
+    model_maps = {}
+    if haiku:
+        model_maps["haiku"] = haiku
+    if sonnet:
+        model_maps["sonnet"] = sonnet
+    if opus:
+        model_maps["opus"] = opus
+
+    sub = cm.add_subscription(name, url, key_env, auth_type=auth, model_maps=model_maps)
+
+    if as_json:
+        click.echo(json.dumps({"ok": True, "id": sub["id"], "name": sub["name"]}))
+    else:
+        click.echo(f"Added: {sub['name']} ({auth})")
+
+
+# ---------------------------------------------------------------------------
+# edit
+# ---------------------------------------------------------------------------
+
+@cli.command("edit")
+@click.argument("name")
+@click.option("--url", "-u", default=None, help="New provider base URL")
+@click.option("--key-env", "-k", default=None, help="New env var name for API key")
+@click.option("--auth", default=None, help="New auth type")
+@click.option("--haiku", default=None, help="Model alias for haiku tier")
+@click.option("--sonnet", default=None, help="Model alias for sonnet tier")
+@click.option("--opus", default=None, help="Model alias for opus tier")
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON")
+def cmd_edit(name, url, key_env, auth, haiku, sonnet, opus, as_json):
+    """Edit an existing subscription.
+
+    Only the fields you pass are updated.
+    """
+    cm = _cm()
+    sub = _find_sub(cm, name)
+    if not sub:
+        click.echo(f"Error: subscription '{name}' not found", err=True)
+        sys.exit(3)
+
+    updates = {}
+    if url is not None:
+        updates["provider_url"] = url
+    if key_env is not None:
+        updates["api_key_env"] = key_env
+    if auth is not None:
+        updates["auth_type"] = auth
+
+    model_maps = {}
+    if haiku is not None:
+        model_maps["haiku"] = haiku
+    if sonnet is not None:
+        model_maps["sonnet"] = sonnet
+    if opus is not None:
+        model_maps["opus"] = opus
+    if model_maps:
+        updates["model_maps"] = model_maps
+
+    if not updates:
+        click.echo("Nothing to update — pass at least one option", err=True)
+        sys.exit(2)
+
+    updated = cm.update_subscription(sub["id"], **updates)
+    if as_json:
+        click.echo(json.dumps({"ok": True, "name": updated["name"]}))
+    else:
+        click.echo(f"Updated: {updated['name']}")
+
+
+# ---------------------------------------------------------------------------
+# delete
+# ---------------------------------------------------------------------------
+
+@cli.command("delete")
+@click.argument("name")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt")
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON")
+def cmd_delete(name, yes, as_json):
+    """Delete a subscription."""
+    cm = _cm()
+    sub = _find_sub(cm, name)
+    if not sub:
+        click.echo(f"Error: subscription '{name}' not found", err=True)
+        sys.exit(3)
+
+    if not yes and not as_json:
+        click.confirm(f"Delete '{sub['name']}'?", abort=True)
+
+    ok = cm.delete_subscription(sub["id"])
+    if as_json:
+        click.echo(json.dumps({"ok": ok, "name": sub["name"]}))
+    elif ok:
+        click.echo(f"Deleted: {sub['name']}")
+    else:
+        click.echo(f"Error: failed to delete '{sub['name']}'", err=True)
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# force-model
+# ---------------------------------------------------------------------------
+
+@cli.command("force-model")
+@click.argument("name")
+@click.argument("model", required=False)
+@click.option("--tier", default="sonnet", show_default=True,
+              help="Which tier to override: haiku | sonnet | opus")
+@click.option("--reset", is_flag=True, help="Remove the forced model override")
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON")
+def cmd_force_model(name, model, tier, reset, as_json):
+    """Force a specific model for a subscription tier.
+
+    Example: override the 'sonnet' tier to use a specific model name:
+
+      claude-mux force-model deepseek deepseek-reasoner --tier sonnet
+
+    Reset the override:
+
+      claude-mux force-model deepseek --reset --tier sonnet
+    """
+    cm = _cm()
+    sub = _find_sub(cm, name)
+    if not sub:
+        click.echo(f"Error: subscription '{name}' not found", err=True)
+        sys.exit(3)
+
+    if reset:
+        # update_subscription merges model_maps — to delete a key we must replace directly
+        maps = dict(sub.get("model_maps", {}))
+        maps.pop(tier, None)
+        for s in cm._data["subscriptions"]:
+            if s["id"] == sub["id"]:
+                s["model_maps"] = maps
+                cm._save()
+                break
+        if as_json:
+            click.echo(json.dumps({"ok": True, "name": sub["name"], "action": "reset", "tier": tier}))
+        else:
+            click.echo(f"Reset {tier} model for {sub['name']}")
+        return
+
+    if not model:
+        click.echo("Error: provide MODEL or --reset", err=True)
+        sys.exit(2)
+
+    cm.update_subscription(sub["id"], model_maps={tier: model})
+    if as_json:
+        click.echo(json.dumps({"ok": True, "name": sub["name"], "tier": tier, "model": model}))
+    else:
+        click.echo(f"Set {sub['name']} {tier} → {model}")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
