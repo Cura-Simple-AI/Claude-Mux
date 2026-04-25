@@ -6,7 +6,11 @@ from unittest.mock import MagicMock, patch, PropertyMock
 
 
 def _make_app(tmp_path, subscriptions=None, default_instance=None, test_results=None):
-    """Build a minimal Claude Mux app stub with _build_event_log available."""
+    """Build a minimal Claude Mux app stub with _build_event_log available.
+
+    Uses a real FailoverManager so recent_events() exercises the actual log parser.
+    The FAILOVER_LOG path is redirected to tmp_path for test isolation.
+    """
     import claude_mux as cm_pkg
     from claude_mux.failover import FailoverManager
     from claude_mux.sync import SyncManager
@@ -23,7 +27,13 @@ def _make_app(tmp_path, subscriptions=None, default_instance=None, test_results=
                 config.set_default(sub["id"])
 
     sync = MagicMock(spec=SyncManager)
-    failover = MagicMock(spec=FailoverManager)
+    # Use a real FailoverManager so recent_events() works; redirect log to tmp_path
+    failover = FailoverManager.__new__(FailoverManager)
+    failover.cm = config
+    failover.sync = sync
+    failover._failed_subs = set()
+    failover._original_sub_id = None
+    failover._failover_ts = None
     failover.FAILOVER_LOG = tmp_path / "failover.log"
 
     app = ClaudeMux.__new__(ClaudeMux)

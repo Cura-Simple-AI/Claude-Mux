@@ -36,6 +36,7 @@ import os
 import re
 import shutil
 import socket
+import subprocess
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -465,3 +466,31 @@ class ConfigManager:
             return None
         d = CLAUDE_MUX_DIR / "instances" / sub["name"]
         return d if d.exists() else None
+
+    # --- API key resolution ---
+
+    def resolve_api_key(self, sub: dict, *, allow_subprocess: bool = True) -> str:
+        """Return the effective API key for a subscription.
+
+        Resolution order:
+        1. sub["api_key"] (stored literal — OAuth tokens, direct bearer)
+        2. gh auth token subprocess (gh_token auth only, if allow_subprocess)
+        3. os.environ[api_key_env]
+
+        This method lives on ConfigManager because key resolution is a config
+        concern: it reads stored subscription data and environment variables.
+        """
+        api_key = sub.get("api_key", "")
+        if api_key:
+            return api_key
+        api_key_env = sub.get("api_key_env", "")
+        auth_type = sub.get("auth_type", "bearer")
+        if auth_type == "gh_token" and allow_subprocess:
+            try:
+                result = subprocess.run(
+                    ["gh", "auth", "token"], capture_output=True, text=True, timeout=10,
+                )
+                return result.stdout.strip() if result.returncode == 0 else os.environ.get(api_key_env, "")
+            except Exception:
+                return os.environ.get(api_key_env, "")
+        return os.environ.get(api_key_env, "") if api_key_env else ""

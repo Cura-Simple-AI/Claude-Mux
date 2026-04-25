@@ -1768,44 +1768,23 @@ class HeimsenseApp(App):
 
     def _build_event_log(self, sub_name: str, sub_id: str) -> str:
         """Return a mini event-log string for the detail panel (last 3 events)."""
-        events: list[tuple[float, str]] = []  # (timestamp, line)
+        cutoff = time.time() - 3600  # 1-hour cap
+        events: list[tuple[float, str]] = []  # (timestamp, rich_label)
 
         # 1. Last test result from in-memory cache
         tr = self._test_results.get(sub_id)
-        if tr:
+        if tr and tr["ts"] >= cutoff:
             icon = "✓" if tr["code"] == 200 else "✖"
             color = "green" if tr["code"] == 200 else "red"
             events.append((tr["ts"], f"[{color}]{icon} Tested {tr['code']}[/{color}]"))
 
-        # 2. Events from failover.log mentioning this sub's name
-        try:
-            log_path = self.failover.FAILOVER_LOG
-            if log_path.exists():
-                for line in log_path.read_text().splitlines():
-                    # Format: "2025-04-25 10:00:00  FROM=name  TO=name  REASON=..."
-                    if sub_name not in line:
-                        continue
-                    try:
-                        ts_str = line[:19]
-                        ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S").replace(
-                            tzinfo=timezone.utc
-                        ).timestamp()
-                    except ValueError:
-                        ts = 0.0
-                    if "FROM=" + sub_name in line:
-                        reason = line.split("REASON=", 1)[-1][:60] if "REASON=" in line else ""
-                        events.append((ts, f"[red]✖ Failover away[/red] — {reason}"))
-                    elif "TO=" + sub_name in line:
-                        events.append((ts, "[yellow]↩ Failover to[/yellow]"))
-        except Exception:
-            pass
+        # 2. Events from failover.log — parsing delegated to FailoverManager
+        events.extend(self.failover.recent_events(sub_name, since=cutoff))
 
         # 3. Last activated — approximate from sync (best effort)
         if self.cm.default_instance == sub_id:
             events.append((time.time(), "[green]● Active now[/green]"))
 
-        # Sort newest first, cap at 1h, keep last 3
-        cutoff = time.time() - 3600
         events = [(ts, label) for ts, label in events if ts >= cutoff]
         if not events:
             return ""
@@ -2410,24 +2389,15 @@ class HeimsenseApp(App):
             self._show_detail()
 
     def _apply_force_model(self, sub_id: str, force_model: str):
-        """Write or remove force-model env vars in settings.json."""
-        settings = self.sync._load_settings()
-        env = settings.setdefault("env", {})
-        if force_model and force_model != "__none__":
-            env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = force_model
-            env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = force_model
-            env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = force_model
-        else:
-            sub = self.cm.get_subscription(sub_id)
-            model_maps = sub.get("model_maps", {}) if sub else {}
-            for key, alias in [("haiku", "ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-                                ("sonnet", "ANTHROPIC_DEFAULT_SONNET_MODEL"),
-                                ("opus", "ANTHROPIC_DEFAULT_OPUS_MODEL")]:
-                if model_maps.get(key):
-                    env[alias] = model_maps[key]
-                else:
-                    env.pop(alias, None)
-        self.sync._save_settings(settings)
+        """Re-sync settings.json after force_model change.
+
+        Delegates to sync_default which is the single source of truth for
+        writing model env vars (including force_model override logic).
+        """
+        try:
+            self.sync.sync_default(sub_id)
+        except Exception as e:
+            log.warning("_apply_force_model: sync_default failed: %s", e)
 
     def on_key(self, event) -> None:
         """Intercept r/R at app level so it works even when an Input is focused."""

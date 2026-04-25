@@ -8,7 +8,6 @@ Uses explicit ENV_TO_SETTINGS_MAP — ANTHROPIC_API_KEY → ANTHROPIC_AUTH_TOKEN
 import logging
 import os
 import shutil
-import subprocess
 from pathlib import Path
 
 from claude_mux.config import (
@@ -41,27 +40,8 @@ class SyncManager:
     # ------------------------------------------------------------------
 
     def _resolve_api_key(self, sub: dict, *, allow_subprocess: bool = True) -> str:
-        """Return the effective API key for a subscription.
-
-        Resolution order:
-        1. sub["api_key"] (stored literal — OAuth tokens, direct bearer)
-        2. gh auth token subprocess (gh_token auth only, if allow_subprocess)
-        3. os.environ[api_key_env]
-        """
-        api_key = sub.get("api_key", "")
-        if api_key:
-            return api_key
-        api_key_env = sub.get("api_key_env", "")
-        auth_type = sub.get("auth_type", "bearer")
-        if auth_type == "gh_token" and allow_subprocess:
-            try:
-                result = subprocess.run(
-                    ["gh", "auth", "token"], capture_output=True, text=True, timeout=10,
-                )
-                return result.stdout.strip() if result.returncode == 0 else os.environ.get(api_key_env, "")
-            except Exception:
-                return os.environ.get(api_key_env, "")
-        return os.environ.get(api_key_env, "") if api_key_env else ""
+        """Delegate to ConfigManager.resolve_api_key (canonical implementation)."""
+        return self.cm.resolve_api_key(sub, allow_subprocess=allow_subprocess)
 
     # ------------------------------------------------------------------
     # Active subscription detection
@@ -181,14 +161,24 @@ class SyncManager:
         merged["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
         merged["ANTHROPIC_DISABLE_TELEMETRY"] = "true"
 
-        # Map model maps to settings via ANTHROPIC_DEFAULT_*_MODEL
+        # Map model maps to settings via ANTHROPIC_DEFAULT_*_MODEL.
+        # If force_model is set on the subscription, all three aliases map to it.
         model_maps = sub.get("model_maps", {})
-        if model_maps.get("haiku"):
-            merged["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = model_maps["haiku"]
-        if model_maps.get("sonnet"):
-            merged["ANTHROPIC_DEFAULT_SONNET_MODEL"] = model_maps["sonnet"]
-        if model_maps.get("opus"):
-            merged["ANTHROPIC_DEFAULT_OPUS_MODEL"] = model_maps["opus"]
+        force_model = sub.get("force_model", "")
+        _aliases = (
+            ("haiku", "ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+            ("sonnet", "ANTHROPIC_DEFAULT_SONNET_MODEL"),
+            ("opus", "ANTHROPIC_DEFAULT_OPUS_MODEL"),
+        )
+        if force_model and force_model != "__none__":
+            # Force all aliases to the same model — override any model_maps
+            for _, env_key in _aliases:
+                merged[env_key] = force_model
+        else:
+            for map_key, env_key in _aliases:
+                if model_maps.get(map_key):
+                    merged[env_key] = model_maps[map_key]
+                # Empty model_map → leave existing env var untouched (don't write None)
 
         # Clear deprecated custom model keys
         for key in SETTINGS_KEYS_TO_REMOVE:

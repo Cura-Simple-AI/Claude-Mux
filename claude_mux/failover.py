@@ -205,6 +205,38 @@ class FailoverManager:
         self._log_failover_event(failed_sub, None, reason)
         return None
 
+    def recent_events(self, sub_name: str, since: float) -> list[tuple[float, str]]:
+        """Return parsed failover log events for *sub_name* newer than *since* (Unix timestamp).
+
+        Each entry is (timestamp, rich_markup_label).
+        Format parsed: "YYYY-MM-DD HH:MM:SS  FROM=name  TO=name  REASON=..."
+        """
+        events: list[tuple[float, str]] = []
+        try:
+            if not self.FAILOVER_LOG.exists():
+                return events
+            from datetime import datetime, timezone
+            for line in self.FAILOVER_LOG.read_text().splitlines():
+                if sub_name not in line:
+                    continue
+                try:
+                    ts_str = line[:19]
+                    ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S").replace(
+                        tzinfo=timezone.utc
+                    ).timestamp()
+                except ValueError:
+                    ts = 0.0
+                if ts < since:
+                    continue
+                if "FROM=" + sub_name in line:
+                    reason = line.split("REASON=", 1)[-1][:60] if "REASON=" in line else ""
+                    events.append((ts, f"[red]✖ Failover away[/red] — {reason}"))
+                elif "TO=" + sub_name in line:
+                    events.append((ts, "[yellow]↩ Failover to[/yellow]"))
+        except Exception:
+            pass
+        return events
+
     def reset_failures(self):
         """Reset marked failed subscriptions (e.g. after manual test)."""
         self._failed_subs.clear()
