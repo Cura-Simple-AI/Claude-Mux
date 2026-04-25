@@ -1,6 +1,6 @@
 # Failover & Auto-resume
 
-Heimsense monitors your active provider and automatically switches on failure.
+claude-mux monitors your active provider and automatically switches on failure.
 
 ## When does failover trigger?
 
@@ -39,7 +39,7 @@ LOG: 2026-04-25 10:40:05  FROM=deepseek  TO=claude-max  REASON=auto-resume after
 
 ## Auto-resume (retry original)
 
-After 10 minutes (configurable), Heimsense automatically tries to reactivate the original provider:
+After 10 minutes (configurable), claude-mux automatically tries to reactivate the original provider:
 
 1. Tests the original provider's health endpoint
 2. If OK → switches back and resets failure state
@@ -61,7 +61,7 @@ Press `x` to trigger a failover check manually:
 ## Failover log
 
 ```bash
-cat ~/.heimsense/failover.log
+cat ~/.claude-mux/failover.log
 ```
 
 ```
@@ -74,7 +74,7 @@ View log in TUI with `L` (Failover Log modal).
 
 ## Background health-check
 
-Heimsense runs a periodic health-check (every 5 minutes) in the background:
+claude-mux runs a periodic health-check (every 5 minutes) in the background:
 
 1. Checks if `RETRY_ORIGINAL_AFTER_SECS` has elapsed → tries auto-resume
 2. Tests active subscription
@@ -85,11 +85,11 @@ Heimsense runs a periodic health-check (every 5 minutes) in the background:
 If **all** subscriptions fail:
 - Notification: "No working subscription found!"
 - Log: `TO=none`
-- Heimsense stays on the last known subscription
+- claude-mux stays on the last known subscription
 
 ## Configure failover order
 
-Add providers in priority order. Heimsense tries them top to bottom (excluding already-failed ones).
+Add providers in priority order. claude-mux tries them top to bottom (excluding already-failed ones).
 
 **Example:**
 1. Claude Max (primary — direct, fastest)

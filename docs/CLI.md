@@ -1,6 +1,6 @@
 # CLI Reference
 
-Heimsense provides a full command-line interface that mirrors every TUI action. Scripts, CI pipelines, and automation use the CLI; the TUI is a convenience layer on top of the same logic.
+claude-mux provides a full command-line interface that mirrors every TUI action. Scripts, CI pipelines, and automation use the CLI; the TUI is a convenience layer on top of the same logic.
 
 **Design principles:** [CLI Guidelines](https://clig.dev/) — subcommands, `--json` for scripting, stderr for errors, exit codes, `--help` on every command.
 
@@ -13,7 +13,7 @@ Heimsense provides a full command-line interface that mirrors every TUI action. 
 | `--json` | `-j` | Output as JSON (machine-readable) |
 | `--quiet` | `-q` | Suppress non-essential output |
 | `--no-color` | | Disable color output |
-| `--config-dir PATH` | | Override config directory (default: `~/.heimsense/`) |
+| `--config-dir PATH` | | Override config directory (default: `~/.claude-mux/`) |
 | `--version` | `-V` | Show version and exit |
 | `--help` | `-h` | Show help and exit |
 
@@ -33,13 +33,13 @@ Heimsense provides a full command-line interface that mirrors every TUI action. 
 
 ## Commands
 
-### `heimsense list`
+### `claude-mux list`
 
 List all subscriptions.
 
 ```bash
-heimsense list
-heimsense list --json
+claude-mux list
+claude-mux list --json
 ```
 
 **Output columns:** ID, Name, Provider, Status, Port, Active
@@ -63,23 +63,23 @@ heimsense list --json
 
 ---
 
-### `heimsense add`
+### `claude-mux add`
 
 Add a new subscription interactively or non-interactively.
 
 ```bash
 # Interactive wizard (same as TUI `+`)
-heimsense add
+claude-mux add
 
 # Non-interactive
-heimsense add \
+claude-mux add \
   --name deepseek \
   --provider deepseek \
   --api-key-env DEEPSEEK_API_KEY \
   --port 18082
 
 # Claude Max (OAuth) — opens browser for OAuth flow
-heimsense add --name claude-max --provider claude-max
+claude-mux add --name claude-max --provider claude-max
 ```
 
 **Flags:**
@@ -98,13 +98,13 @@ heimsense add --name claude-max --provider claude-max
 
 ---
 
-### `heimsense activate <name>`
+### `claude-mux activate <name>`
 
 Activate a subscription as the default for Claude Code.
 
 ```bash
-heimsense activate claude-max
-heimsense activate deepseek --json
+claude-mux activate claude-max
+claude-mux activate deepseek --json
 ```
 
 Updates `~/.claude/settings.json` with the correct env vars.
@@ -113,25 +113,25 @@ Updates `~/.claude/settings.json` with the correct env vars.
 
 ---
 
-### `heimsense start <name>`
+### `claude-mux start <name>`
 
 Start the proxy for a subscription (pm2).
 
 ```bash
-heimsense start deepseek
+claude-mux start deepseek
 ```
 
 **TUI equivalent:** `s` (Start)
 
 ---
 
-### `heimsense stop <name>`
+### `claude-mux stop <name>`
 
 Stop the proxy for a subscription.
 
 ```bash
-heimsense stop deepseek
-heimsense stop --all
+claude-mux stop deepseek
+claude-mux stop --all
 ```
 
 **Flags:**
@@ -143,17 +143,17 @@ heimsense stop --all
 
 ---
 
-### `heimsense test [name]`
+### `claude-mux test [name]`
 
 Run a health check on a subscription.
 
 ```bash
 # Test active subscription
-heimsense test
+claude-mux test
 
 # Test specific
-heimsense test deepseek
-heimsense test deepseek --json
+claude-mux test deepseek
+claude-mux test deepseek --json
 ```
 
 **JSON output:**
@@ -174,57 +174,57 @@ Exit code `4` if health check fails.
 
 ---
 
-### `heimsense edit <name>`
+### `claude-mux edit <name>`
 
 Edit a subscription's settings interactively or via flags.
 
 ```bash
 # Interactive
-heimsense edit deepseek
+claude-mux edit deepseek
 
 # Non-interactive
-heimsense edit deepseek --api-key-env NEW_KEY_VAR
-heimsense edit deepseek --port 18090
+claude-mux edit deepseek --api-key-env NEW_KEY_VAR
+claude-mux edit deepseek --port 18090
 ```
 
 **TUI equivalent:** `e` (Edit)
 
 ---
 
-### `heimsense delete <name>`
+### `claude-mux delete <name>`
 
 Delete a subscription (prompts for confirmation unless `--yes`).
 
 ```bash
-heimsense delete deepseek
-heimsense delete deepseek --yes   # skip confirmation
+claude-mux delete deepseek
+claude-mux delete deepseek --yes   # skip confirmation
 ```
 
 **TUI equivalent:** `d` (Delete)
 
 ---
 
-### `heimsense status [name]`
+### `claude-mux status [name]`
 
 Show status of one or all subscriptions.
 
 ```bash
-heimsense status
-heimsense status claude-max
-heimsense status --json
+claude-mux status
+claude-mux status claude-max
+claude-mux status --json
 ```
 
 **TUI equivalent:** Main table (refresh `r`)
 
 ---
 
-### `heimsense failover`
+### `claude-mux failover`
 
 Trigger a manual failover check on the active subscription.
 
 ```bash
-heimsense failover
-heimsense failover --json
+claude-mux failover
+claude-mux failover --json
 ```
 
 Tests active subscription; if failing, switches to the next available.
@@ -233,14 +233,14 @@ Tests active subscription; if failing, switches to the next available.
 
 ---
 
-### `heimsense failover-log`
+### `claude-mux failover-log`
 
 Show the failover event log.
 
 ```bash
-heimsense failover-log
-heimsense failover-log --tail 20
-heimsense failover-log --json
+claude-mux failover-log
+claude-mux failover-log --tail 20
+claude-mux failover-log --json
 ```
 
 **Flags:**
@@ -253,48 +253,48 @@ heimsense failover-log --json
 
 ---
 
-### `heimsense logs <name>`
+### `claude-mux logs <name>`
 
 Show PM2 proxy logs for a subscription.
 
 ```bash
-heimsense logs deepseek
-heimsense logs deepseek --tail 50
-heimsense logs deepseek --follow
+claude-mux logs deepseek
+claude-mux logs deepseek --tail 50
+claude-mux logs deepseek --follow
 ```
 
 **TUI equivalent:** `l` (PM2 Logs)
 
 ---
 
-### `heimsense force-model <name> <model>`
+### `claude-mux force-model <name> <model>`
 
 Override all model aliases to a single model.
 
 ```bash
-heimsense force-model deepseek deepseek-chat
-heimsense force-model claude-max claude-opus-4-6
-heimsense force-model deepseek --reset   # remove override
+claude-mux force-model deepseek deepseek-chat
+claude-mux force-model claude-max claude-opus-4-6
+claude-mux force-model deepseek --reset   # remove override
 ```
 
 **TUI equivalent:** `f` (Force model)
 
 ---
 
-### `heimsense config`
+### `claude-mux config`
 
 Show configuration paths and active settings.
 
 ```bash
-heimsense config
-heimsense config --json
+claude-mux config
+claude-mux config --json
 ```
 
 **Output:**
 ```
-Config dir:    ~/.heimsense/
-Subscriptions: ~/.heimsense/subscriptions.json
-Failover log:  ~/.heimsense/failover.log
+Config dir:    ~/.claude-mux/
+Subscriptions: ~/.claude-mux/subscriptions.json
+Failover log:  ~/.claude-mux/failover.log
 Claude config: ~/.claude/settings.json
 Active sub:    claude-max (oauth, direct)
 ```
@@ -309,7 +309,7 @@ Active sub:    claude-max (oauth, direct)
 #!/bin/bash
 # Switch to deepseek if DEEPSEEK_API_KEY is set
 if [ -n "$DEEPSEEK_API_KEY" ]; then
-  heimsense activate deepseek --quiet
+  claude-mux activate deepseek --quiet
 fi
 ```
 
@@ -317,7 +317,7 @@ fi
 
 ```bash
 # Fail CI if active provider is down
-heimsense test --json | python3 -c "
+claude-mux test --json | python3 -c "
 import sys, json
 r = json.load(sys.stdin)
 sys.exit(0 if r['ok'] else 4)
@@ -327,7 +327,7 @@ sys.exit(0 if r['ok'] else 4)
 ### List active subscription name
 
 ```bash
-ACTIVE=$(heimsense list --json | python3 -c "
+ACTIVE=$(claude-mux list --json | python3 -c "
 import sys, json
 subs = json.load(sys.stdin)
 active = next((s['name'] for s in subs if s['active']), None)
@@ -340,7 +340,7 @@ echo "Active: $ACTIVE"
 
 ```bash
 # In a loop — switch providers until one works
-heimsense test || heimsense failover
+claude-mux test || claude-mux failover
 ```
 
 ---
@@ -349,19 +349,19 @@ heimsense test || heimsense failover
 
 | TUI key | CLI command | Description |
 |---|---|---|
-| `r` | `heimsense status` | Refresh / show status |
-| `+` | `heimsense add` | Add subscription |
-| `Enter` | `heimsense activate <name>` | Set as default |
-| `s` (start) | `heimsense start <name>` | Start proxy |
-| `s` (stop) | `heimsense stop <name>` | Stop proxy |
-| `t` | `heimsense test [name]` | Health check |
-| `e` | `heimsense edit <name>` | Edit subscription |
-| `d` | `heimsense delete <name>` | Delete subscription |
-| `f` | `heimsense force-model <name> <model>` | Force model |
-| `l` | `heimsense logs <name>` | PM2 logs |
-| `L` | `heimsense failover-log` | Failover log |
-| `x` | `heimsense failover` | Manual failover |
-| `h` | `heimsense --help` | Help |
+| `r` | `claude-mux status` | Refresh / show status |
+| `+` | `claude-mux add` | Add subscription |
+| `Enter` | `claude-mux activate <name>` | Set as default |
+| `s` (start) | `claude-mux start <name>` | Start proxy |
+| `s` (stop) | `claude-mux stop <name>` | Stop proxy |
+| `t` | `claude-mux test [name]` | Health check |
+| `e` | `claude-mux edit <name>` | Edit subscription |
+| `d` | `claude-mux delete <name>` | Delete subscription |
+| `f` | `claude-mux force-model <name> <model>` | Force model |
+| `l` | `claude-mux logs <name>` | PM2 logs |
+| `L` | `claude-mux failover-log` | Failover log |
+| `x` | `claude-mux failover` | Manual failover |
+| `h` | `claude-mux --help` | Help |
 | `q` | (exit TUI) | — |
 
 ---

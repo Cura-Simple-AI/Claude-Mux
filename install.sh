@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Heimsense install script — installs heimsense + all required dependencies.
+# claude-mux install script — installs claude-mux + all required dependencies.
 # Usage:
 #   curl -sSL https://raw.githubusercontent.com/cura-ai/heimsense/main/install.sh | bash
 #   ./install.sh            # standard install
@@ -16,9 +16,9 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-info()    { echo -e "${GREEN}[heimsense]${NC} $*"; }
-warn()    { echo -e "${YELLOW}[heimsense]${NC} $*"; }
-error()   { echo -e "${RED}[heimsense] ERROR:${NC} $*" >&2; exit 1; }
+info()    { echo -e "${GREEN}[claude-mux]${NC} $*"; }
+warn()    { echo -e "${YELLOW}[claude-mux]${NC} $*"; }
+error()   { echo -e "${RED}[claude-mux] ERROR:${NC} $*" >&2; exit 1; }
 
 # --- Parse flags ---
 USE_PIPX=false
@@ -90,13 +90,13 @@ if ! command -v claude &>/dev/null; then
 fi
 
 # --- Verify ---
-if command -v heimsense &>/dev/null; then
-  VERSION=$(heimsense --version 2>/dev/null || echo "unknown")
-  info "✓ heimsense installed: $VERSION"
+if command -v claude-mux &>/dev/null; then
+  VERSION=$(claude-mux --version 2>/dev/null || echo "unknown")
+  info "✓ claude-mux installed: $VERSION"
   info ""
-  info "Run: heimsense"
+  info "Run: claude-mux"
   info "Docs: $REPO/docs/QUICKSTART.md"
 else
-  warn "heimsense not found in PATH after install."
+  warn "claude-mux not found in PATH after install."
   warn "You may need to: export PATH=\"\$HOME/.local/bin:\$PATH\""
 fi

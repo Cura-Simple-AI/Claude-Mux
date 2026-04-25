@@ -144,7 +144,7 @@ class TestSyncDefaultAllProviders:
     def _run_sync(self, d, sub, settings_path, env_overrides=None, api_key=None):
         class _Sync(hs.SyncManager):
             SETTINGS_PATH = settings_path
-            HEIMSENSE_DOT_ENV = d / ".env"
+            CLAUDE_MUX_DOT_ENV = d / ".env"
         cm = sub[0]
         sub_obj = sub[1]
         sync = _Sync(cm)

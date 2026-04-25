@@ -14,7 +14,7 @@ def make_cm_sync(tmp_path, settings_path):
 
     class _Sync(hs.SyncManager):
         SETTINGS_PATH = settings_path
-        HEIMSENSE_DOT_ENV = tmp_path / ".env"
+        CLAUDE_MUX_DOT_ENV = tmp_path / ".env"
 
     return cm, _Sync(cm)
 

@@ -1,6 +1,6 @@
-# Heimsense — Quickstart
+# claude-mux — Quickstart
 
-Heimsense is a terminal UI for managing AI provider subscriptions. Switch between Claude Max, DeepSeek, Copilot, Gemini, and other OpenAI-compatible proxies — with automatic failover.
+claude-mux is a terminal UI for managing AI provider subscriptions. Switch between Claude Max, DeepSeek, Copilot, Gemini, and other OpenAI-compatible proxies — with automatic failover.
 
 ## Installation
 
@@ -8,23 +8,23 @@ Heimsense is a terminal UI for managing AI provider subscriptions. Switch betwee
 
 ```bash
 pip install claude-mux
-heimsense
+claude-mux
 ```
 
 ### pipx (isolated environment)
 
 ```bash
 pipx install claude-mux
-heimsense
+claude-mux
 ```
 
 ### From source
 
 ```bash
-git clone https://github.com/cura-ai/heimsense
-cd heimsense
+git clone https://github.com/cura-ai/claude-mux
+cd claude-mux
 pip install -e .
-heimsense
+claude-mux
 ```
 
 ### Standalone (no install)
@@ -48,13 +48,13 @@ python3 claude-mux.py --tui
 Install pm2: `npm install -g pm2`  
 Install claude: `npm install -g @anthropic-ai/claude-code`
 
-Heimsense automatically checks for missing Python packages at startup and offers to install them.
+claude-mux automatically checks for missing Python packages at startup and offers to install them.
 
 ## First start
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  Heimsense TUI                                    0m 0s         │
+│  claude-mux TUI                                    0m 0s         │
 ├──────────────────────────┬──────────────────────────────────────┤
 │                          │                                      │
 │  No subscriptions        │  No subscription selected.           │
@@ -78,7 +78,7 @@ Heimsense automatically checks for missing Python packages at startup and offers
 
 ```bash
 # Start TUI
-heimsense
+claude-mux
 
 # Add DeepSeek (steps in TUI):
 # + → name: deepseek → 1 (DeepSeek) → API key: $DEEPSEEK_API_KEY → Enter (activate)
@@ -94,10 +94,10 @@ claude models  # shows active model mapping
 
 | File | Purpose |
 |---|---|
-| `~/.heimsense/subscriptions.json` | Subscription data |
-| `~/.heimsense/.env` | Active provider env vars |
-| `~/.heimsense/failover.log` | Failover events |
-| `~/.claude/settings.json` | Claude Code env config (updated by heimsense) |
+| `~/.claude-mux/subscriptions.json` | Subscription data |
+| `~/.claude-mux/.env` | Active provider env vars |
+| `~/.claude-mux/failover.log` | Failover events |
+| `~/.claude/settings.json` | Claude Code env config (updated by claude-mux) |
 
 ## Next steps
 

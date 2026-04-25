@@ -1,4 +1,4 @@
-"""python -m heimsense entry-point."""
+"""python -m claude_mux entry-point."""
 from claude_mux.cli import main
 
 main()

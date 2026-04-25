@@ -10,7 +10,7 @@ import claude_mux as hs
 def tmp_setup(tmp_path, monkeypatch):
     settings_path = tmp_path / "settings.json"
     monkeypatch.setattr(hs.SyncManager, "SETTINGS_PATH", settings_path)
-    monkeypatch.setattr(hs.SyncManager, "HEIMSENSE_DOT_ENV", tmp_path / ".env")
+    monkeypatch.setattr(hs.SyncManager, "CLAUDE_MUX_DOT_ENV", tmp_path / ".env")
     cm = hs.ConfigManager(data_file=tmp_path / "subscriptions.json")
     return cm, tmp_path, settings_path
 

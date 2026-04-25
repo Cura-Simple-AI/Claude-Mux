@@ -782,7 +782,7 @@ class SyncManager:
     """
 
     SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
-    HEIMSENSE_DOT_ENV = CLAUDE_MUX_DIR / ".env"
+    CLAUDE_MUX_DOT_ENV = CLAUDE_MUX_DIR / ".env"
 
     def __init__(self, config: ConfigManager):
         self.cm = config
@@ -808,7 +808,7 @@ class SyncManager:
         im = InstanceManager(self.cm)
         inst_env = im.generate_env(sub_id)  # ensures .env is fresh
         CLAUDE_MUX_DIR.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(inst_env, self.HEIMSENSE_DOT_ENV)
+        shutil.copy2(inst_env, self.CLAUDE_MUX_DOT_ENV)
 
         # 3. Merge to settings.json
         settings = self._load_settings()

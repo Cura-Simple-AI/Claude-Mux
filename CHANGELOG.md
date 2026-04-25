@@ -38,9 +38,9 @@ Format: [Semantic Versioning](https://semver.org/). Dates in ISO 8601.
 - `sync_default()` bearer-mode: `CLAUDE_CODE_OAUTH_TOKEN` is now removed from settings.json when switching OAuth→bearer
 
 ### Package
-- `heimsense/tui.py`: TUI code is now embedded directly in the Python package
-- `heimsense/__main__.py`: `python -m heimsense` now works
-- `heimsense/cli.py`: imports from `claude_mux.tui` (standalone, no scripts/ reference)
+- `claude_mux/tui.py`: TUI code is now embedded directly in the Python package
+- `claude_mux/__main__.py`: `python -m claude_mux` now works
+- `claude_mux/cli.py`: imports from `claude_mux.tui` (standalone, no scripts/ reference)
 
 ### Documentation
 - `docs/QUICKSTART.md` — installation, first start, configuration files
@@ -70,7 +70,7 @@ Format: [Semantic Versioning](https://semver.org/). Dates in ISO 8601.
 - Removed 7 dead code methods in `HeimsenseApp` (~90 lines): `_test_endpoint`, `_test_headers`, `_test_provider_url`, `_test_payload` (×2, duplicate), `_test_parse_reply` (×2, duplicate). `action_test()` has its own inline implementation.
 
 ### Tests
-- **test isolation**: `conftest.py` removes FileHandlers after import — tests no longer write to `~/.heimsense/heimsense-tui.log`
+- **test isolation**: `conftest.py` removes FileHandlers after import — tests no longer write to `~/.claude-mux/heimsense-tui.log`
 - `test_time_ago.py`: 7 tests for float-epoch + ISO string + edge cases
 - `test_utils.py`: 20 tests for `_format_duration`, `_status_char`, `_status_color`
 - **115 tests total** (up from 88)
@@ -82,7 +82,7 @@ Format: [Semantic Versioning](https://semver.org/). Dates in ISO 8601.
 ### Added
 - **Claude Max (OAuth)** provider — `claude setup-token` flow, 1-year token, direct to api.anthropic.com
 - **Subscription Failover** — automatic switch on HTTP 429/401/403/503 or rate-limit patterns
-- **Failover log** — events written to `~/.heimsense/failover.log` (FROM/TO/REASON)
+- **Failover log** — events written to `~/.claude-mux/failover.log` (FROM/TO/REASON)
 - **Auto-resume** — reactivates original subscription after 10 min (configurable via `RETRY_ORIGINAL_AFTER_SECS`)
 - **OAuth session death detection** — tmux session crash detected early with clear error message
 - **GitHub Actions CI** — test matrix Python 3.11 + 3.12
@@ -106,7 +106,7 @@ Format: [Semantic Versioning](https://semver.org/). Dates in ISO 8601.
 - Custom (OpenAI-compatible proxy)
 
 ### Architecture
-- `ConfigManager` — CRUD for `~/.heimsense/subscriptions.json` + atomic write
+- `ConfigManager` — CRUD for `~/.claude-mux/subscriptions.json` + atomic write
 - `InstanceManager` — PM2 lifecycle + `.env` generation per subscription
 - `SyncManager` — merge into `~/.claude/settings.json` (OAuth/bearer/proxy)
 - `FailoverManager` — health-check, failover, retry-original, log
