@@ -83,6 +83,9 @@ class FailoverManager:
         auth_type = sub.get("auth_type", "bearer")
         api_key = self.sync._resolve_api_key(sub, allow_subprocess=False)
 
+        if not api_key:
+            return False, "No API key available"
+
         if auth_type == "oauth":
             base_url = "https://api.anthropic.com"
         else:

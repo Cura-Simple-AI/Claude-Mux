@@ -157,7 +157,7 @@ class TestConfigManagerEdgeCases:
         d = Path(tempfile.mkdtemp())
         try:
             cm = hs.ConfigManager(data_file=d / "s.json")
-            sub = cm.add_subscription("My Provider", "http://x", "K")
+            sub = cm.add_subscription("my-provider", "http://x", "K")
             pm2_name = cm.get_pm2_name(sub["id"])
             assert pm2_name is not None
             assert "my-provider" in pm2_name.lower() or "claude-mux" in pm2_name.lower()

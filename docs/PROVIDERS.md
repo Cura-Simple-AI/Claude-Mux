@@ -1,6 +1,6 @@
 # Provider Setup Guide
 
-Heimsense supports 8 AI providers. All are used as a proxy for Claude Code.
+Claude Mux supports 8 AI providers. All are used as a proxy for Claude Code.
 
 ## Overview
 

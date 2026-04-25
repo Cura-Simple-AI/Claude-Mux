@@ -33,11 +33,16 @@ _check_and_install_deps()
 import json
 import logging
 import os
+import re
 import shutil
 import socket
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+
+# Safe subscription name: alphanumeric, dots, hyphens, underscores; max 100 chars.
+# Prevents path traversal (no slashes) and shell injection.
+_NAME_RE = re.compile(r"^[a-zA-Z0-9._-]{1,100}$")
 
 CLAUDE_MUX_DIR = Path.home() / ".claude-mux"
 SUBSCRIPTIONS_FILE = CLAUDE_MUX_DIR / "subscriptions.json"
@@ -325,7 +330,15 @@ class ConfigManager:
         notes: str = "",
         api_key: str = "",
     ) -> dict:
-        """Add new subscription."""
+        """Add new subscription.
+
+        Raises ValueError if name contains invalid characters (path traversal prevention).
+        """
+        if not _NAME_RE.match(name):
+            raise ValueError(
+                f"Invalid subscription name {name!r}. "
+                "Use only letters, digits, dots, hyphens, underscores (max 100 chars)."
+            )
         sub_id = _generate_id()
         now = _now()
         pm2_name = f"claude-mux-{name}"

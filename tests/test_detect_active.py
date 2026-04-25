@@ -124,3 +124,48 @@ class TestDetectActiveMissingSettings:
         cm.add_subscription("ds", "https://api.deepseek.com/v1", "K", auth_type="bearer")
         # settings file does not exist
         assert sync.detect_active() is None
+
+
+class TestDetectActiveMixedAuth:
+    """#22 — detect_active with oauth + direct + bearer in same subscriptions.json."""
+
+    def test_oauth_wins_when_token_matches(self, cm, sync, monkeypatch):
+        """OAuth sub matched by token even when bearer sub has matching port."""
+        oauth_sub = cm.add_subscription("max", "", "OAUTH_ENV", auth_type="oauth")
+        cm.update_subscription(oauth_sub["id"], api_key="sk-ant-tok-AAA")
+        bearer_sub = cm.add_subscription("ds", "https://api.deepseek.com/v1", "DS_KEY", auth_type="bearer")
+        cm.set_instance_port(bearer_sub["id"], 18080)
+        # Settings has oauth token — no localhost URL
+        _write_settings(sync, {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-tok-AAA"})
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        assert sync.detect_active() == oauth_sub["id"]
+
+    def test_direct_sub_matched_by_base_url(self, cm, sync, monkeypatch):
+        """Direct sub matched by provider_url in ANTHROPIC_BASE_URL."""
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        cm.add_subscription("max", "", "OAUTH_ENV", auth_type="oauth")  # no token stored
+        direct_sub = cm.add_subscription("zai", "https://api.z.ai/v1", "Z_KEY", auth_type="direct")
+        cm.add_subscription("ds", "https://api.deepseek.com/v1", "DS_KEY", auth_type="bearer")
+        _write_settings(sync, {"ANTHROPIC_BASE_URL": "https://api.z.ai/v1"})
+        assert sync.detect_active() == direct_sub["id"]
+
+    def test_bearer_sub_matched_by_port_when_others_dont_match(self, cm, sync, monkeypatch):
+        """Bearer sub matched by port when OAuth token and direct URL don't match."""
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        cm.add_subscription("max", "", "OAUTH_ENV", auth_type="oauth")
+        cm.add_subscription("zai", "https://api.z.ai/v1", "Z_KEY", auth_type="direct")
+        bearer_sub = cm.add_subscription("ds", "https://api.deepseek.com/v1", "DS_KEY", auth_type="bearer")
+        cm.set_instance_port(bearer_sub["id"], 18099)
+        _write_settings(sync, {"ANTHROPIC_BASE_URL": "http://localhost:18099"})
+        assert sync.detect_active() == bearer_sub["id"]
+
+    def test_no_match_when_all_auth_types_present_but_none_match(self, cm, sync, monkeypatch):
+        """Returns None when none of the mixed-auth subs match current settings."""
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        cm.add_subscription("max", "", "OAUTH_ENV", auth_type="oauth")
+        cm.add_subscription("zai", "https://api.z.ai/v1", "Z_KEY", auth_type="direct")
+        bearer_sub = cm.add_subscription("ds", "https://api.deepseek.com/v1", "DS_KEY", auth_type="bearer")
+        cm.set_instance_port(bearer_sub["id"], 18099)
+        # Settings has a different localhost port
+        _write_settings(sync, {"ANTHROPIC_BASE_URL": "http://localhost:19999"})
+        assert sync.detect_active() is None

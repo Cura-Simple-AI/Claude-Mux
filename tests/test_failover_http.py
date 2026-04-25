@@ -187,6 +187,41 @@ class TestDirectHTTPHealth:
         assert ok is False
         assert "connection" in reason.lower()
 
+    # --- #21: empty / None api_key must not send "Bearer None" ---
+
+    def test_empty_api_key_returns_false(self, tmp_setup):
+        """_test_direct_http with empty string api_key must return (False, ...).
+
+        Verifies the request is never sent (urlopen not called), so we never
+        hit the network with an Authorization header of 'Bearer None' or 'Bearer '.
+        """
+        cm, sync, fm, _ = tmp_setup
+        sub = self._oauth_sub(cm)
+        # Simulate empty resolved key (no stored token, no env var)
+        sync._resolve_api_key.return_value = ""
+
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            ok, reason = fm._test_direct_http(sub)
+
+        assert ok is False, "Empty api_key must result in failure"
+        mock_urlopen.assert_not_called(), "Must not send HTTP request with empty key"
+
+    def test_none_api_key_returns_false(self, tmp_setup):
+        """_test_direct_http with None api_key must return (False, ...) without sending 'Bearer None'.
+
+        _resolve_api_key returning None (e.g. env var missing) must be handled
+        gracefully — we must never forward a literal 'Bearer None' header.
+        """
+        cm, sync, fm, _ = tmp_setup
+        sub = self._oauth_sub(cm)
+        sync._resolve_api_key.return_value = None  # type: ignore[assignment]
+
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            ok, reason = fm._test_direct_http(sub)
+
+        assert ok is False, "None api_key must result in failure"
+        mock_urlopen.assert_not_called(), "Must not send HTTP request when api_key is None"
+
 
 class TestFailoverRetryOriginalFlow:
     def test_auto_resume_resets_state(self, tmp_setup):

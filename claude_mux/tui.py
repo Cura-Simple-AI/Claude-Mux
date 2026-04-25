@@ -329,28 +329,28 @@ class HelpModal(ModalScreen):
     BINDINGS = [("escape", "dismiss", "Close"), ("q", "dismiss", "Close"), ("h", "dismiss", "Close")]
 
     HELP_TEXT = """\
-[bold]Heimsense TUI — Keyboard Shortcuts[/bold]
+[bold]Claude Mux — Keyboard Shortcuts[/bold]
 [dim]Optimized for iPhone SSH (no Ctrl/F/arrow/Tab/ESC required)[/dim]
 
 [bold yellow]Navigation[/bold yellow]
   j / n / ↓   Move down  (iPhone: j or n)
   k / p / ↑   Move up    (iPhone: k or p)
-  1-9          Jump directly to row N
+  1-9          Activate provider N directly (skips current-settings row)
+  /            Filter providers by name (Enter/Esc to close)
   h / ?        Show this help
   q            Quit / Close modal
 
 [bold yellow]Provider management[/bold yellow]
   +         Add new subscription (wizard)
-  Enter     Activate selected subscription
-  e         Edit (model maps / fields)
+  e         Edit subscription (model maps, force-model, fields)
   d         Delete subscription (confirm: j=yes, n=no)
   R         Reauth (renew OAuth token)
+  Activate  Switch Claude Code to this provider (button / 1-9)
 
 [bold yellow]Proxy providers[/bold yellow]
   s         Start / Stop (toggle)
   t         Test HTTP endpoint
   l         Show PM2 logs (close: q/b)
-  f         Force model (route all → one)
 
 [bold yellow]System[/bold yellow]
   r         Refresh table and details
@@ -766,7 +766,19 @@ class AddWizard(ModalScreen):
 
     def _go_to_providers(self):
         """From step 1 → push ProviderSelectScreen."""
-        self._data["name"] = self.query_one("#wiz-name", Input).value.strip()
+        import re as _re
+        _NAME_RE = _re.compile(r"^[a-zA-Z0-9._-]{1,100}$")
+        raw_name = self.query_one("#wiz-name", Input).value.strip()
+        if not raw_name:
+            self.notify("Name is required.", severity="error")
+            return
+        if not _NAME_RE.match(raw_name):
+            self.notify(
+                "Name may only contain letters, digits, dots, hyphens, underscores (max 100 chars).",
+                severity="error",
+            )
+            return
+        self._data["name"] = raw_name
         self._data["auth_type"] = "bearer"  # default
         self.query_one("#wiz-name", Input).disabled = True
 
@@ -1246,7 +1258,7 @@ class AddWizard(ModalScreen):
                 model_maps=model_maps, notes=notes,
                 api_key=api_key,
             )
-            log.info("_oauth_finish: updated sub %s api_key=%s", sub_id, api_key[:10] if api_key else "NONE")
+            log.info("_oauth_finish: updated sub %s api_key_len=%d", sub_id, len(api_key) if api_key else 0)
         else:
             sub = self.cm.add_subscription(
                 name=name, provider_url=provider_url,
@@ -1515,10 +1527,27 @@ class HeimsenseApp(App):
                 width = 80
             title = "Claude Mux — Use any LLM inside Claude Code"
             right = age_label
-            gap = max(1, width - len(title) - len(right) - 2)
-            self.query_one("#app-header", Static).update(
-                f"[bold]{title}[/bold]{' ' * gap}[dim]{right}[/dim]"
+            # Subtract 2 for `padding: 0 1` on each side of #app-header.
+            # title and right are plain text; no markup characters affect len().
+            content_width = max(0, width - 2)
+            gap = max(1, content_width - len(title) - len(right))
+            # Show filter query in header when filter is active
+            filter_input = self.query_one("#filter-input", None)
+            filter_active = (
+                filter_input is not None
+                and "active" in (filter_input.classes or set())
+                and filter_input.value
             )
+            if filter_active:
+                filter_label = f"  [bold yellow]/ {filter_input.value}[/bold yellow]"
+                gap = max(1, content_width - len(title) - len(f"  / {filter_input.value}") - len(right))
+                self.query_one("#app-header", Static).update(
+                    f"[bold]{title}[/bold]{filter_label}{' ' * gap}[dim]{right}[/dim]"
+                )
+            else:
+                self.query_one("#app-header", Static).update(
+                    f"[bold]{title}[/bold]{' ' * gap}[dim]{right}[/dim]"
+                )
         except Exception:
             pass
 
@@ -1565,7 +1594,7 @@ class HeimsenseApp(App):
             name = Text(name_txt, style=name_style)
             # Mark the subscription that is currently active in Claude
             if sub_id == self._active_id:
-                name.append(" ◀", style="bold green")
+                name.append(" ●", style="bold green")
 
             if is_oauth:
                 oauth_token = sub.get("api_key", "")
@@ -1598,7 +1627,7 @@ class HeimsenseApp(App):
         # don't match any saved subscription (hidden when filter is active)
         if self._active_id is None and self.cm.subscriptions and not flt:
             virtual_name = Text("*current settings", style="dim italic")
-            virtual_name.append(" ◀", style="bold green")
+            virtual_name.append(" ●", style="bold green")
             cur_result = self._test_results.get("__current__")
             if cur_result is None:
                 cur_status = Text("?", style="dim")
@@ -1723,7 +1752,11 @@ class HeimsenseApp(App):
             self.notify("No Claude settings detected — nothing to test", severity="warning", timeout=4)
             return
 
-        self.notify("Testing current settings...", title="Test", timeout=2)
+        # Security note: the test sends the active token to the configured endpoint.
+        # For OAuth, this is always api.anthropic.com (trusted).
+        # For direct providers, this is the sub's provider_url.
+        endpoint = "api.anthropic.com" if sub.get("auth_type") == "oauth" else sub.get("provider_url", "?")
+        self.notify(f"Testing against {endpoint}…", title="Test", timeout=3)
         t0 = time.time()
         ok, reason = self.failover._test_direct_http(sub)
         elapsed = int((time.time() - t0) * 1000)
@@ -1769,21 +1802,27 @@ class HeimsenseApp(App):
 
         # 3. Last activated — approximate from sync (best effort)
         if self.cm.default_instance == sub_id:
-            events.append((time.time(), "[green]◀ Active now[/green]"))
-
-        if not events:
-            return ""
+            events.append((time.time(), "[green]● Active now[/green]"))
 
         # Sort newest first, cap at 1h, keep last 3
         cutoff = time.time() - 3600
         events = [(ts, label) for ts, label in events if ts >= cutoff]
+        if not events:
+            return ""
+
         events.sort(key=lambda e: e[0], reverse=True)
         lines = []
         for ts, label in events[:3]:
             ago = _time_ago(ts)
             lines.append(f"  {label}  [dim]{ago}[/dim]")
 
-        return "\n[dim]── Recent ─────────────────────[/dim]\n" + "\n".join(lines)
+        # Separator width adapts to detail panel (~50 chars typical; 40 is safe minimum)
+        try:
+            panel_w = max(40, self.query_one("#detail").size.width - 4)
+        except Exception:
+            panel_w = 40
+        sep = "─" * panel_w
+        return f"\n[dim]{sep}[/dim]\n" + "\n".join(lines)
 
     def _show_detail(self):
         """Show details for selected subscription."""
@@ -1823,7 +1862,7 @@ class HeimsenseApp(App):
         is_default = sub_id == self.cm.default_instance
         is_active_now = sub_id == self._active_id
         if is_active_now:
-            default_badge = " [bold green]▶ Active[/bold green]"
+            default_badge = " [bold green]● Active[/bold green]"
         elif is_default:
             default_badge = " [dim](default)[/dim]"
         else:
@@ -2161,10 +2200,10 @@ class HeimsenseApp(App):
             if not is_oauth:
                 self.im.generate_env(sub_id)
             result = self.sync.sync_default(sub_id)
-            label = "Activate" if is_oauth else "Sync"
+            label = "Activated" if is_oauth else "Settings synced"
             self.notify(
-                f"{sub['name']} — {label} OK",
-                title=label,
+                f"{sub['name']} — {label}. Claude Code will use this provider.",
+                title="Activate" if is_oauth else "Sync",
                 timeout=4,
             )
         except Exception as e:
@@ -2228,7 +2267,7 @@ class HeimsenseApp(App):
 
         # Health-check before switching
         self.notify(f"Checking {sub['name']}…", title="Activating", timeout=3)
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         ok, reason = await loop.run_in_executor(None, self.failover.test_health, sub_id)
 
         if not ok:
@@ -2623,10 +2662,12 @@ class HeimsenseApp(App):
         # Reauth only for OAuth
         self.query_one("#reauth", Button).display = enabled and is_oauth
 
-        # Launch (Sync/Activate) — hidden when provider is already the active one
+        # Launch (Activate/Sync) — hidden when provider is already the active one.
+        # OAuth/direct: "Activate" — writes token to settings.json, no proxy needed.
+        # Bearer/proxy: "Sync" — updates settings.json to point to local proxy port.
         launch_btn = self.query_one("#launch", Button)
         launch_btn.display = enabled and not is_active_now
-        launch_btn.label = "Activate" if is_oauth else "Sync"
+        launch_btn.label = "Activate" if is_oauth else "Sync settings"
 
         # Update BINDINGS so only relevant ones show in footer
         self._refresh_footer()
