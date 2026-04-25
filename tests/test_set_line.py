@@ -43,9 +43,10 @@ class TestSetLine:
             with patch.object(hs, "CLAUDE_MUX_DIR", d / "claude-mux"):
                 im = hs.InstanceManager(cm)
                 # Fjern ANTHROPIC_API_KEY fra template temporært
-                original = dict(hs.ENV_TEMPLATE_KEYS)
+                from claude_mux import tui as _tui
+                original = dict(_tui.ENV_TEMPLATE_KEYS)
                 reduced = {k: v for k, v in original.items() if k != "ANTHROPIC_API_KEY"}
-                with patch.dict("claude_mux.ENV_TEMPLATE_KEYS", reduced, clear=True):
+                with patch.dict("claude_mux.tui.ENV_TEMPLATE_KEYS", reduced, clear=True):
                     with patch.dict("os.environ", {"MY_KEY": "secret"}):
                         env_path = im.generate_env(sub["id"])
             content = env_path.read_text()

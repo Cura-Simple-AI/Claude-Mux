@@ -36,7 +36,7 @@ class TestGenerateEnv:
         d = Path(tempfile.mkdtemp())
         try:
             cm, sub = _make_env(d, auth, name, url, env_var, maps)
-            with patch("claude_mux.subprocess.run") as mock_run:
+            with patch("claude_mux.tui.subprocess.run") as mock_run:
                 mock_run.return_value = MagicMock(returncode=0, stdout="gh-token-123")
                 im = hs.InstanceManager(cm)
                 env_path = im.generate_env(sub["id"])
@@ -51,7 +51,7 @@ class TestGenerateEnv:
         d = Path(tempfile.mkdtemp())
         try:
             cm, sub = _make_env(d, auth, name, url, env_var, maps)
-            with patch("claude_mux.subprocess.run") as mock_run:
+            with patch("claude_mux.tui.subprocess.run") as mock_run:
                 mock_run.return_value = MagicMock(returncode=0, stdout="gh-token")
                 im = hs.InstanceManager(cm)
                 env_path = im.generate_env(sub["id"])
@@ -96,7 +96,7 @@ class TestGenerateEnv:
             cm, sub = _make_env(d, "gh_token", "copilot", "https://api.githubcopilot.com",
                                  "GH_TOKEN", {})
             with patch.object(hs, "CLAUDE_MUX_DIR", d / "claude-mux"):
-                with patch("claude_mux.subprocess.run") as mock_run:
+                with patch("claude_mux.tui.subprocess.run") as mock_run:
                     mock_run.return_value = MagicMock(returncode=0, stdout="gho_copilot_token\n")
                     im = hs.InstanceManager(cm)
                     env_path = im.generate_env(sub["id"])
@@ -112,7 +112,7 @@ class TestGenerateEnv:
             cm, sub = _make_env(d, "gh_token", "copilot", "https://api.githubcopilot.com",
                                  "GH_TOKEN", {})
             with patch.object(hs, "CLAUDE_MUX_DIR", d / "claude-mux"):
-                with patch("claude_mux.subprocess.run") as mock_run:
+                with patch("claude_mux.tui.subprocess.run") as mock_run:
                     mock_run.return_value = MagicMock(returncode=1, stdout="")
                     with patch.dict("os.environ", {"GH_TOKEN": "env-fallback-token"}):
                         im = hs.InstanceManager(cm)

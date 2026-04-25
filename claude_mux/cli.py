@@ -1,24 +1,467 @@
 #!/usr/bin/env python3
-"""Heimsense CLI entry-point."""
+"""claude-mux CLI — all TUI actions available as CLI subcommands.
+
+Every command follows CLI Guidelines (https://clig.dev/):
+  - --json for machine-readable output
+  - --quiet to suppress non-essential output
+  - Exit codes: 0=ok, 1=error, 2=usage, 3=not-found, 4=health-fail
+  - --help on every subcommand
+"""
+import json
 import sys
 
+import click
+
+from claude_mux.tui import (
+    __version__,
+    ConfigManager,
+    InstanceManager,
+    SyncManager,
+    FailoverManager,
+    CLAUDE_MUX_DIR,
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _cm() -> ConfigManager:
+    return ConfigManager()
+
+
+def _managers():
+    cm = _cm()
+    sync = SyncManager(cm)
+    im = InstanceManager(cm)
+    fm = FailoverManager(cm, sync)
+    return cm, sync, im, fm
+
+
+def _find_sub(cm: ConfigManager, name_or_id: str) -> dict | None:
+    """Resolve subscription by name or id (case-insensitive prefix match)."""
+    name_lower = name_or_id.lower()
+    for s in cm.subscriptions:
+        if s["id"] == name_or_id or s["name"].lower() == name_lower:
+            return s
+    # prefix match
+    matches = [s for s in cm.subscriptions if s["name"].lower().startswith(name_lower)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _sub_status(cm: ConfigManager, im: InstanceManager, sub: dict) -> str:
+    """Return human-readable status string for a subscription."""
+    if sub.get("auth_type") == "oauth":
+        return "oauth"
+    port = cm.get_instance_port(sub["id"])
+    if not port:
+        return "stopped"
+    try:
+        info = im.status(sub["id"])
+        return info.get("status", "stopped")
+    except Exception:
+        return "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Root group
+# ---------------------------------------------------------------------------
+
+@click.group(invoke_without_command=True, context_settings={"help_option_names": ["-h", "--help"]})
+@click.version_option(__version__, "-V", "--version", prog_name="claude-mux")
+@click.pass_context
+def cli(ctx):
+    """claude-mux — use any LLM inside Claude Code. Automatically.
+
+    Run without a subcommand to open the interactive TUI.
+    Use subcommands for scripting and automation.
+    """
+    if ctx.invoked_subcommand is None:
+        from claude_mux.tui import run_tui
+        run_tui()
+
+
+# ---------------------------------------------------------------------------
+# list
+# ---------------------------------------------------------------------------
+
+@cli.command("list")
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON")
+@click.option("--quiet", "-q", is_flag=True, help="Suppress header")
+def cmd_list(as_json, quiet):
+    """List all subscriptions."""
+    cm = _cm()
+    subs = cm.subscriptions
+    default_id = cm.default_instance
+
+    if as_json:
+        out = []
+        for s in subs:
+            out.append({
+                "id": s["id"],
+                "name": s["name"],
+                "provider": s.get("provider", ""),
+                "auth_type": s.get("auth_type", "bearer"),
+                "port": cm.get_instance_port(s["id"]),
+                "active": s["id"] == default_id,
+            })
+        click.echo(json.dumps(out, indent=2))
+        return
+
+    if not subs:
+        if not quiet:
+            click.echo("No subscriptions. Run 'claude-mux' to add one.")
+        sys.exit(0)
+
+    if not quiet:
+        active_name = next((s["name"] for s in subs if s["id"] == default_id), "none")
+        click.echo(f"Active: {active_name}\n")
+        click.echo(f"{'NAME':<20} {'PROVIDER':<20} {'AUTH':<10} {'PORT':<8} {'DEFAULT'}")
+        click.echo("-" * 66)
+
+    for s in subs:
+        is_default = "✓" if s["id"] == default_id else ""
+        port = cm.get_instance_port(s["id"]) or "-"
+        provider = s.get("provider_url", "")[:18]
+        auth = s.get("auth_type", "bearer")
+        click.echo(f"{s['name']:<20} {provider:<20} {auth:<10} {str(port):<8} {is_default}")
+
+
+# ---------------------------------------------------------------------------
+# status
+# ---------------------------------------------------------------------------
+
+@cli.command("status")
+@click.argument("name", required=False)
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON")
+def cmd_status(name, as_json):
+    """Show status of subscriptions.
+
+    NAME: optional subscription name to show a single entry.
+    """
+    cm, _, im, _ = _managers()
+    subs = [_find_sub(cm, name)] if name else cm.subscriptions
+
+    if name and not subs[0]:
+        click.echo(f"Error: subscription '{name}' not found", err=True)
+        sys.exit(3)
+
+    result = []
+    for s in subs:
+        st = _sub_status(cm, im, s)
+        result.append({
+            "name": s["name"],
+            "status": st,
+            "active": s["id"] == cm.default_instance,
+            "port": cm.get_instance_port(s["id"]),
+        })
+
+    if as_json:
+        click.echo(json.dumps(result, indent=2))
+        return
+
+    for r in result:
+        active_marker = " [active]" if r["active"] else ""
+        port_str = f" port={r['port']}" if r["port"] else ""
+        click.echo(f"{r['name']}: {r['status']}{port_str}{active_marker}")
+
+
+# ---------------------------------------------------------------------------
+# activate
+# ---------------------------------------------------------------------------
+
+@cli.command("activate")
+@click.argument("name")
+@click.option("--quiet", "-q", is_flag=True, help="Suppress output")
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON")
+def cmd_activate(name, quiet, as_json):
+    """Activate a subscription as the default for Claude Code.
+
+    Updates ~/.claude/settings.json with the correct env vars.
+    """
+    cm, sync, _, _ = _managers()
+    sub = _find_sub(cm, name)
+    if not sub:
+        click.echo(f"Error: subscription '{name}' not found", err=True)
+        sys.exit(3)
+
+    try:
+        sync.sync_default(sub["id"])
+        if as_json:
+            click.echo(json.dumps({"ok": True, "name": sub["name"], "id": sub["id"]}))
+        elif not quiet:
+            click.echo(f"Activated: {sub['name']}")
+    except Exception as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# start
+# ---------------------------------------------------------------------------
+
+@cli.command("start")
+@click.argument("name")
+@click.option("--quiet", "-q", is_flag=True)
+def cmd_start(name, quiet):
+    """Start the proxy for a subscription (pm2)."""
+    cm, _, im, _ = _managers()
+    sub = _find_sub(cm, name)
+    if not sub:
+        click.echo(f"Error: subscription '{name}' not found", err=True)
+        sys.exit(3)
+    if sub.get("auth_type") == "oauth":
+        click.echo(f"{sub['name']}: OAuth provider — no proxy needed", err=True)
+        sys.exit(1)
+    try:
+        result = im.start(sub["id"])
+        if not quiet:
+            click.echo(f"Started {sub['name']} on port {result['port']}")
+    except Exception as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# stop
+# ---------------------------------------------------------------------------
+
+@cli.command("stop")
+@click.argument("name", required=False)
+@click.option("--all", "stop_all", is_flag=True, help="Stop all running proxies")
+@click.option("--quiet", "-q", is_flag=True)
+def cmd_stop(name, stop_all, quiet):
+    """Stop the proxy for a subscription."""
+    cm, _, im, _ = _managers()
+
+    if stop_all:
+        for s in cm.subscriptions:
+            try:
+                im.stop(s["id"])
+                if not quiet:
+                    click.echo(f"Stopped {s['name']}")
+            except Exception:
+                pass
+        return
+
+    if not name:
+        click.echo("Error: provide NAME or --all", err=True)
+        sys.exit(2)
+
+    sub = _find_sub(cm, name)
+    if not sub:
+        click.echo(f"Error: subscription '{name}' not found", err=True)
+        sys.exit(3)
+    try:
+        im.stop(sub["id"])
+        if not quiet:
+            click.echo(f"Stopped {sub['name']}")
+    except Exception as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# test
+# ---------------------------------------------------------------------------
+
+@cli.command("test")
+@click.argument("name", required=False)
+@click.option("--json", "as_json", is_flag=True)
+def cmd_test(name, as_json):
+    """Run a health check on a subscription.
+
+    NAME: defaults to active subscription if omitted.
+
+    Exit code 4 if health check fails.
+    """
+    cm, sync, im, fm = _managers()
+
+    if name:
+        sub = _find_sub(cm, name)
+        if not sub:
+            click.echo(f"Error: subscription '{name}' not found", err=True)
+            sys.exit(3)
+        sub_id = sub["id"]
+    else:
+        sub_id = cm.default_instance
+        if not sub_id:
+            click.echo("Error: no active subscription", err=True)
+            sys.exit(3)
+        sub = cm.get_subscription(sub_id)
+
+    ok, reason = fm.test_health(sub_id)
+
+    if as_json:
+        port = cm.get_instance_port(sub_id)
+        click.echo(json.dumps({
+            "name": sub["name"],
+            "ok": ok,
+            "reason": reason,
+            "port": port,
+        }))
+    else:
+        status = "OK" if ok else "FAIL"
+        click.echo(f"{sub['name']}: {status} — {reason}")
+
+    if not ok:
+        sys.exit(4)
+
+
+# ---------------------------------------------------------------------------
+# failover
+# ---------------------------------------------------------------------------
+
+@cli.command("failover")
+@click.option("--json", "as_json", is_flag=True)
+def cmd_failover(as_json):
+    """Trigger a manual failover check on the active subscription.
+
+    Tests active subscription; if failing, switches to next available.
+    """
+    cm, sync, im, fm = _managers()
+    sub_id = cm.default_instance
+    if not sub_id:
+        click.echo("Error: no active subscription", err=True)
+        sys.exit(3)
+
+    ok, reason = fm.test_health(sub_id)
+    if ok:
+        sub = cm.get_subscription(sub_id)
+        if as_json:
+            click.echo(json.dumps({"ok": True, "name": sub["name"], "action": "none"}))
+        else:
+            click.echo(f"{sub['name']}: healthy — no failover needed")
+        return
+
+    new_id = fm.do_failover(sub_id)
+    if new_id:
+        new_sub = cm.get_subscription(new_id)
+        sync.sync_default(new_id)
+        if as_json:
+            click.echo(json.dumps({"ok": True, "switched_to": new_sub["name"], "reason": reason}))
+        else:
+            click.echo(f"Failover: switched to {new_sub['name']} (was: {reason})")
+    else:
+        if as_json:
+            click.echo(json.dumps({"ok": False, "reason": "no working subscription found"}))
+        else:
+            click.echo(f"Failover failed: no working subscription found ({reason})", err=True)
+        sys.exit(4)
+
+
+# ---------------------------------------------------------------------------
+# failover-log
+# ---------------------------------------------------------------------------
+
+@cli.command("failover-log")
+@click.option("--tail", "-n", default=0, type=int, help="Show last N lines (default: all)")
+@click.option("--json", "as_json", is_flag=True)
+def cmd_failover_log(tail, as_json):
+    """Show the failover event log."""
+    log_path = CLAUDE_MUX_DIR / "failover.log"
+    if not log_path.exists():
+        if as_json:
+            click.echo("[]")
+        else:
+            click.echo("No failover events yet.")
+        return
+
+    lines = log_path.read_text().splitlines()
+    if tail:
+        lines = lines[-tail:]
+
+    if as_json:
+        events = []
+        for line in lines:
+            parts = {}
+            for token in line.split("  "):
+                token = token.strip()
+                if "=" in token:
+                    k, _, v = token.partition("=")
+                    parts[k.lower()] = v
+                elif token:
+                    parts["ts"] = token
+            if parts:
+                events.append(parts)
+        click.echo(json.dumps(events, indent=2))
+    else:
+        click.echo("\n".join(lines) if lines else "No failover events yet.")
+
+
+# ---------------------------------------------------------------------------
+# logs
+# ---------------------------------------------------------------------------
+
+@cli.command("logs")
+@click.argument("name")
+@click.option("--tail", "-n", default=50, type=int, help="Show last N lines (default: 50)")
+def cmd_logs(name, tail):
+    """Show PM2 proxy logs for a subscription."""
+    import subprocess
+    cm = _cm()
+    sub = _find_sub(cm, name)
+    if not sub:
+        click.echo(f"Error: subscription '{name}' not found", err=True)
+        sys.exit(3)
+    pm2_name = cm.get_pm2_name(sub["id"]) or f"claude-mux-{sub['name']}"
+    try:
+        result = subprocess.run(
+            ["pm2", "logs", pm2_name, "--lines", str(tail), "--nostream"],
+            capture_output=True, text=True, timeout=10,
+        )
+        click.echo(result.stdout or result.stderr or "(no output)")
+    except FileNotFoundError:
+        click.echo("Error: pm2 not found — install with: npm install -g pm2", err=True)
+        sys.exit(1)
+    except Exception as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# config
+# ---------------------------------------------------------------------------
+
+@cli.command("config")
+@click.option("--json", "as_json", is_flag=True)
+def cmd_config(as_json):
+    """Show configuration paths and active settings."""
+    from claude_mux.tui import SyncManager
+    cm = _cm()
+    sync = SyncManager(cm)
+
+    default_id = cm.default_instance
+    active_sub = cm.get_subscription(default_id) if default_id else None
+    active_name = active_sub["name"] if active_sub else "none"
+    active_auth = active_sub.get("auth_type", "?") if active_sub else "-"
+
+    settings_path = sync.SETTINGS_PATH
+
+    if as_json:
+        click.echo(json.dumps({
+            "config_dir": str(CLAUDE_MUX_DIR),
+            "subscriptions": str(CLAUDE_MUX_DIR / "subscriptions.json"),
+            "failover_log": str(CLAUDE_MUX_DIR / "failover.log"),
+            "claude_settings": str(settings_path),
+            "active": active_name,
+            "active_auth": active_auth,
+        }, indent=2))
+        return
+
+    click.echo(f"Config dir:    {CLAUDE_MUX_DIR}")
+    click.echo(f"Subscriptions: {CLAUDE_MUX_DIR / 'subscriptions.json'}")
+    click.echo(f"Failover log:  {CLAUDE_MUX_DIR / 'failover.log'}")
+    click.echo(f"Claude config: {settings_path}")
+    click.echo(f"Active sub:    {active_name} ({active_auth})")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main():
-    """Start Heimsense TUI."""
-    import argparse
-    from claude_mux.tui import __version__
-
-    parser = argparse.ArgumentParser(
-        prog="claude-mux",
-        description="TUI manager for AI-provider subscriptions (Claude, Copilot, DeepSeek, Gemini...)",
-    )
-    parser.add_argument("--version", "-V", action="version", version=f"heimsense {__version__}")
-    parser.add_argument("--tui", action="store_true", help="Start TUI (default)", default=True)
-
-    args = parser.parse_args()
-
-    from claude_mux.tui import run_tui
-    run_tui()
+    cli()
 
 
 if __name__ == "__main__":

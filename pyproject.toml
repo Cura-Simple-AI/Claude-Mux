@@ -14,8 +14,9 @@ dependencies = [
     "textual>=0.80.0",
     "rich>=13.0.0",
     "psutil>=5.9.0",
+    "click>=8.0",
 ]
-keywords = ["tui", "ai", "claude", "llm", "subscription-manager"]
+keywords = ["tui", "ai", "claude", "llm", "subscription-manager", "failover", "multiplexer"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
