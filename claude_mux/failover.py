@@ -40,10 +40,12 @@ class FailoverManager:
         self._failover_ts: float | None = None  # timestamp of latest failover
 
     def test_health(self, sub_id: str | None = None) -> tuple[bool, str]:
-        """Test if a subscription works via `claude -p "write OK"`.
+        """Test if a subscription works via HTTP.
 
         Returns (ok: bool, reason: str).
-        Uses sub_id's settings (does NOT call sync_default temporarily — tests against current settings).
+        - oauth: GET /v1/models against api.anthropic.com with OAuth token
+        - direct: GET /v1/models against provider_url with API key
+        - bearer: POST /v1/messages against localhost proxy
         """
         target = sub_id or self.cm.default_instance
         if not target:
@@ -52,37 +54,75 @@ class FailoverManager:
         if not sub:
             return False, "Subscription not found"
 
-        # For OAuth: test via subprocess claude -p
-        # For proxy: test via HTTP directly against proxy
         auth_type = sub.get("auth_type", "bearer")
-        if auth_type == "oauth":
-            return self._test_via_claude_cli()
+        if auth_type in ("oauth", "direct"):
+            return self._test_direct_http(sub)
         else:
             port = self.cm.get_instance_port(target)
             if not port:
                 return False, "Proxy not running"
             return self._test_proxy_http(port, auth_type, sub)
 
-    def _test_via_claude_cli(self) -> tuple[bool, str]:
-        """Test active OAuth settings via `claude -p OK`."""
+    def _test_direct_http(self, sub: dict) -> tuple[bool, str]:
+        """Test oauth or direct subscription via GET /v1/models.
+
+        oauth:  GET https://api.anthropic.com/v1/models
+                Headers: Authorization: Bearer <token>
+                         anthropic-version: 2023-06-01
+                         anthropic-beta: oauth-2025-04-20
+
+        direct: GET <provider_url>/v1/models
+                Headers: Authorization: Bearer <api_key>
+                         anthropic-version: 2023-06-01
+
+        Success: HTTP 200 + body does not contain {"success": false}.
+        """
+        from urllib.request import Request, urlopen
+        from urllib.error import URLError, HTTPError
+
+        auth_type = sub.get("auth_type", "bearer")
+        api_key = self.sync._resolve_api_key(sub, allow_subprocess=False)
+
+        if auth_type == "oauth":
+            base_url = "https://api.anthropic.com"
+        else:
+            base_url = sub.get("provider_url", "").rstrip("/")
+            if not base_url:
+                return False, "No provider_url configured"
+
+        url = f"{base_url}/v1/models"
+        req = Request(url, method="GET")
+        req.add_header("Authorization", f"Bearer {api_key}")
+        req.add_header("anthropic-version", "2023-06-01")
+        if auth_type == "oauth":
+            req.add_header("anthropic-beta", "oauth-2025-04-20")
+
         try:
-            result = subprocess.run(
-                ["claude", "-p", "write OK"],
-                capture_output=True, text=True, timeout=30,
-            )
-            out = (result.stdout + result.stderr).lower()
-            if result.returncode == 0:
-                return True, "OK"
-            for pat in self.FAILOVER_PATTERNS:
-                if pat in out:
-                    return False, f"Rate-limit/auth error: {out[:120]}"
-            return False, f"Exit {result.returncode}: {out[:120]}"
-        except subprocess.TimeoutExpired:
-            return False, "Timeout (30s) — claude CLI not responding"
-        except FileNotFoundError:
-            return False, "claude CLI not found"
-        except Exception as e:
-            return False, str(e)
+            with urlopen(req, timeout=10) as resp:
+                code = resp.getcode()
+                if code in self.FAILOVER_CODES:
+                    return False, f"HTTP {code}"
+                body_bytes = resp.read(512)
+                try:
+                    body = json.loads(body_bytes)
+                    if body.get("success") is False:
+                        err_code = body.get("code", "")
+                        msg = body.get("message", "")
+                        return False, f"API error {err_code}: {msg}"
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+                return True, f"HTTP {code}"
+        except HTTPError as e:
+            if e.code in self.FAILOVER_CODES:
+                try:
+                    body = json.loads(e.read(512))
+                    msg = body.get("error", {}).get("message", e.reason)
+                except Exception:
+                    msg = e.reason
+                return False, f"HTTP {e.code} — {msg}"
+            return True, f"HTTP {e.code} (non-fatal)"
+        except (URLError, OSError) as e:
+            return False, f"Connection error: {e}"
 
     def _test_proxy_http(self, port: int, auth_type: str, sub: dict) -> tuple[bool, str]:
         """Test proxy endpoint direkte via HTTP."""

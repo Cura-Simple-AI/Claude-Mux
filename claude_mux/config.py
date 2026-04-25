@@ -136,11 +136,11 @@ PROVIDER_PRESETS = {
         "model_maps": {"haiku": "gemini-2.0-flash", "sonnet": "gemini-2.0-pro", "opus": "gemini-2.5-pro"},
     },
     "z-ai": {
-        "label": "z.ai",
-        "provider_url": "https://api.z.ai/v1",
-        "auth_type": "bearer",
+        "label": "z.ai (direct)",
+        "provider_url": "https://api.z.ai/api/anthropic",
+        "auth_type": "direct",
         "api_key_env": "Z_AI_API_KEY",
-        "model_maps": {"haiku": "z-ai-mini", "sonnet": "z-ai-medium", "opus": "z-ai-max"},
+        "model_maps": {"haiku": "glm-4.5-air", "sonnet": "glm-4.7", "opus": "glm-ww5"},
     },
     "custom": {
         "label": "Custom (OpenAI-compatible)",
@@ -149,6 +149,13 @@ PROVIDER_PRESETS = {
         "api_key_env": "CUSTOM_API_KEY",
         "model_maps": {},
     },
+}
+
+# Reverse-lookup: provider_url → display label (for detail panel)
+PROVIDER_URL_LABELS: dict[str, str] = {
+    p["provider_url"]: p["label"]
+    for p in PROVIDER_PRESETS.values()
+    if p.get("provider_url")
 }
 
 # Copilot models that support /chat/completions or /v1/messages
@@ -316,6 +323,7 @@ class ConfigManager:
         auth_type: str = "bearer",
         model_maps: dict | None = None,
         notes: str = "",
+        api_key: str = "",
     ) -> dict:
         """Add new subscription."""
         sub_id = _generate_id()
@@ -333,6 +341,8 @@ class ConfigManager:
             "updated_at": now,
             "notes": notes,
         }
+        if api_key:
+            sub["api_key"] = api_key
         self._data["subscriptions"].append(sub)
         self._data["instances"][sub_id] = {
             "pm2_name": pm2_name,

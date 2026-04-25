@@ -463,14 +463,15 @@ def cmd_config(as_json):
 @cli.command("add")
 @click.option("--name", "-n", required=True, help="Subscription name (e.g. deepseek)")
 @click.option("--url", "-u", required=True, help="Provider base URL")
-@click.option("--key-env", "-k", required=True, help="Env var name that holds the API key")
+@click.option("--key-env", "-k", default="", help="Env var name that holds the API key")
+@click.option("--api-key", "-K", default="", help="API key value (stored directly in subscriptions.json)")
 @click.option("--auth", default="bearer", show_default=True,
               help="Auth type: bearer | gh_token | x-goog-api-key | oauth")
 @click.option("--haiku", default="", help="Model alias for haiku tier")
 @click.option("--sonnet", default="", help="Model alias for sonnet tier")
 @click.option("--opus", default="", help="Model alias for opus tier")
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON")
-def cmd_add(name, url, key_env, auth, haiku, sonnet, opus, as_json):
+def cmd_add(name, url, key_env, api_key, auth, haiku, sonnet, opus, as_json):
     """Add a new subscription.
 
     Example:
@@ -494,7 +495,7 @@ def cmd_add(name, url, key_env, auth, haiku, sonnet, opus, as_json):
     if opus:
         model_maps["opus"] = opus
 
-    sub = cm.add_subscription(name, url, key_env, auth_type=auth, model_maps=model_maps)
+    sub = cm.add_subscription(name, url, key_env, auth_type=auth, model_maps=model_maps, api_key=api_key)
 
     if as_json:
         click.echo(json.dumps({"ok": True, "id": sub["id"], "name": sub["name"]}))
@@ -636,6 +637,104 @@ def cmd_force_model(name, model, tier, reset, as_json):
         click.echo(json.dumps({"ok": True, "name": sub["name"], "tier": tier, "model": model}))
     else:
         click.echo(f"Set {sub['name']} {tier} → {model}")
+
+
+# ---------------------------------------------------------------------------
+# active
+# ---------------------------------------------------------------------------
+
+@cli.command("active")
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON")
+def cmd_active(as_json):
+    """Print the subscription currently active in Claude Code.
+
+    Reads ~/.claude/settings.json and matches against saved subscriptions.
+    Exits with code 1 if no match is found.
+    """
+    from claude_mux.sync import SyncManager
+    cm = _cm()
+    sync = SyncManager(cm)
+    sub_id = sync.detect_active()
+    if sub_id:
+        sub = cm.get_subscription(sub_id)
+        name = sub["name"] if sub else sub_id
+        if as_json:
+            click.echo(json.dumps({"active": name, "id": sub_id}))
+        else:
+            click.echo(name)
+    else:
+        if as_json:
+            click.echo(json.dumps({"active": None}))
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# init
+# ---------------------------------------------------------------------------
+
+_STATUSLINE_SCRIPT = """\
+#!/bin/sh
+# claude-mux statusline — prints the subscription currently active in Claude Code.
+# Installed by: claude-mux init
+claude-mux active 2>/dev/null
+"""
+
+_STATUSLINE_SETTINGS_KEY = "statusLine"
+
+
+@cli.command("init")
+@click.option("--force", is_flag=True, help="Overwrite existing statusLine setting")
+def cmd_init(force):
+    """First-time setup: install the Claude Code status line integration.
+
+    Writes a statusLine entry to ~/.claude/settings.json so Claude Code
+    displays the active claude-mux subscription in its status bar.
+
+    Also installs ~/.claude-mux/bin/statusline.sh which is called by Claude.
+
+    Run once after installing claude-mux:
+
+      claude-mux init
+    """
+    import json
+    from pathlib import Path
+    from claude_mux.config import CLAUDE_MUX_DIR, _atomic_write
+
+    settings_path = Path.home() / ".claude" / "settings.json"
+    script_path = CLAUDE_MUX_DIR / "bin" / "statusline.sh"
+
+    # Install statusline.sh
+    script_path.parent.mkdir(parents=True, exist_ok=True)
+    script_path.write_text(_STATUSLINE_SCRIPT)
+    script_path.chmod(0o755)
+    click.echo(f"✓ Installed {script_path}")
+
+    # Patch settings.json
+    settings = {}
+    if settings_path.exists():
+        try:
+            with open(settings_path) as f:
+                settings = json.load(f)
+        except Exception:
+            pass
+
+    if _STATUSLINE_SETTINGS_KEY in settings and not force:
+        click.echo(
+            f"✓ statusLine already set in {settings_path} (use --force to overwrite)"
+        )
+    else:
+        settings[_STATUSLINE_SETTINGS_KEY] = {
+            "type": "command",
+            "command": f"sh {script_path}",
+        }
+        try:
+            _atomic_write(settings_path, settings)
+            click.echo(f"✓ statusLine written to {settings_path}")
+        except OSError as e:
+            click.echo(f"✗ Could not write {settings_path}: {e}", err=True)
+            sys.exit(1)
+
+    click.echo("\nclaude-mux is ready. Restart Claude Code to see the status line.")
 
 
 # ---------------------------------------------------------------------------

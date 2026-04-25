@@ -8,6 +8,7 @@ claude-mux is a terminal UI for managing AI provider subscriptions. Switch betwe
 
 ```bash
 pip install claude-mux
+claude-mux init   # set up Claude Code status line (run once)
 claude-mux
 ```
 
@@ -63,7 +64,7 @@ claude-mux automatically checks for missing Python packages at startup and offer
 │                          │  AI provider subscription.           │
 │                          │                                      │
 ├──────────────────────────┴──────────────────────────────────────┤
-│ r Refresh  + Add  h Help  q Quit                                │
+│ r Reload  + Add  h Help  q Quit                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -96,6 +97,8 @@ claude models  # shows active model mapping
 |---|---|
 | `~/.claude-mux/subscriptions.json` | Subscription data |
 | `~/.claude-mux/.env` | Active provider env vars |
+| `~/.claude-mux/active-name` | Cached name of the active subscription (for status line) |
+| `~/.claude-mux/bin/statusline.sh` | Status line script installed by `claude-mux init` |
 | `~/.claude-mux/failover.log` | Failover events |
 | `~/.claude/settings.json` | Claude Code env config (updated by claude-mux) |
 

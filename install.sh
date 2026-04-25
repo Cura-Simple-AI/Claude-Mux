@@ -83,6 +83,15 @@ if ! command -v pm2 &>/dev/null; then
   warn "Install with: npm install -g pm2"
 fi
 
+# --- Optional: heimsense ---
+HEIMSENSE_BIN="${HEIMSENSE_BIN:-$HOME/.local/bin/heimsense}"
+if [[ ! -x "$HEIMSENSE_BIN" ]]; then
+  warn "heimsense proxy binary not found at $HEIMSENSE_BIN"
+  warn "Bearer providers (DeepSeek, OpenAI, Gemini, Copilot) require heimsense to start."
+  warn "Claude Max (OAuth) works without it."
+  warn "Install heimsense: see $REPO#install-heimsense"
+fi
+
 # --- Optional: claude CLI ---
 if ! command -v claude &>/dev/null; then
   warn "claude CLI not found — needed for Claude Max OAuth setup"

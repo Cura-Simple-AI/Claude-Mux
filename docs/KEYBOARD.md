@@ -6,7 +6,7 @@ Heimsense is optimized for iPhone SSH keyboards (Blink Shell, a-Shell, SSH.app) 
 
 | Key | Alternative | Action |
 |---|---|---|
-| `r` | — | Refresh table and status |
+| `r` | — | Reload TUI (hotload restart) |
 | `+` | — | Add subscription (Add wizard) |
 | `Enter` | — | Activate selected subscription as default |
 | `s` | — | Start/Stop toggle (proxy) |
@@ -14,7 +14,6 @@ Heimsense is optimized for iPhone SSH keyboards (Blink Shell, a-Shell, SSH.app) 
 | `e` | — | Edit subscription |
 | `d` | — | Delete subscription (confirm) |
 | `f` | — | Force model (override all aliases to one model) |
-| `z` | — | Reload TUI (hotload on file change) |
 | `l` | — | View PM2 logs (proxy logs) |
 | `L` | — | View failover log |
 | `x` | — | Manual failover check |
@@ -100,6 +99,6 @@ Quit:           q  →  j
 ## All shortcuts (quick reference)
 
 ```
-TUI:  r + Enter s t e d f z l L x h ? q
+TUI:  r + Enter s t e d f l L x h ? q
 Nav:  j k n p 1-9
 ```

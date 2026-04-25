@@ -16,6 +16,7 @@ def tmp_setup():
     cm = hs.ConfigManager(data_file=d / "subs.json")
     sync = MagicMock()
     fm = hs.FailoverManager(cm, sync)
+    fm.FAILOVER_LOG = d / "failover.log"  # isolate from ~/.claude-mux/failover.log
     yield cm, sync, fm, d
     shutil.rmtree(d, ignore_errors=True)
 
@@ -96,6 +97,95 @@ class TestProxyHTTPHealth:
         ok, reason = fm.test_health(sub["id"])
         assert ok is False
         assert "proxy" in reason.lower() or "kørende" in reason.lower()
+
+
+class TestDirectHTTPHealth:
+    """Tests for _test_direct_http — oauth and direct auth types."""
+
+    def _make_resp(self, code: int, body: dict | None = None):
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.getcode.return_value = code
+        if body is not None:
+            mock_resp.read.return_value = json.dumps(body).encode()
+        else:
+            mock_resp.read.return_value = b'{"data": []}'
+        return mock_resp
+
+    def _oauth_sub(self, cm):
+        return cm.add_subscription("claude-max", "https://api.anthropic.com", "MY_OAUTH_TOKEN", auth_type="oauth")
+
+    def _direct_sub(self, cm):
+        sub = cm.add_subscription("z-ai", "https://api.z.ai/api/anthropic", "MY_KEY", auth_type="direct")
+        # provider_url is stored in subscription
+        cm._data["subscriptions"][-1]["provider_url"] = "https://api.z.ai/api/anthropic"
+        cm._save()
+        return cm.get_subscription(sub["id"])
+
+    def test_oauth_200_returns_ok(self, tmp_setup):
+        cm, sync, fm, _ = tmp_setup
+        sub = self._oauth_sub(cm)
+        sync._resolve_api_key.return_value = "tok"
+
+        with patch("urllib.request.urlopen", return_value=self._make_resp(200)):
+            ok, reason = fm.test_health(sub["id"])
+        assert ok is True
+
+    def test_oauth_401_returns_not_ok(self, tmp_setup):
+        cm, sync, fm, _ = tmp_setup
+        sub = self._oauth_sub(cm)
+        sync._resolve_api_key.return_value = "bad_token"
+        err = HTTPError(url="http://x", code=401, msg="Unauthorized", hdrs={}, fp=None)
+        err.read = lambda n: b'{"error": {"message": "invalid token"}}'
+
+        with patch("urllib.request.urlopen", side_effect=err):
+            ok, reason = fm.test_health(sub["id"])
+        assert ok is False
+        assert "401" in reason
+
+    def test_direct_200_success_body_ok(self, tmp_setup):
+        cm, sync, fm, _ = tmp_setup
+        sub = self._direct_sub(cm)
+        sync._resolve_api_key.return_value = "valid_key"
+
+        resp = self._make_resp(200, {"data": [{"id": "glm-4.7"}]})
+        with patch("urllib.request.urlopen", return_value=resp):
+            ok, reason = fm.test_health(sub["id"])
+        assert ok is True
+
+    def test_direct_200_success_false_returns_not_ok(self, tmp_setup):
+        """z.ai returns HTTP 200 with {"success": false, "code": 401} for invalid keys."""
+        cm, sync, fm, _ = tmp_setup
+        sub = self._direct_sub(cm)
+        sync._resolve_api_key.return_value = "invalid_key"
+
+        resp = self._make_resp(200, {"success": False, "code": 401, "message": "Invalid API key"})
+        with patch("urllib.request.urlopen", return_value=resp):
+            ok, reason = fm.test_health(sub["id"])
+        assert ok is False
+        assert "401" in reason or "Invalid" in reason
+
+    def test_direct_no_provider_url_returns_not_ok(self, tmp_setup):
+        cm, sync, fm, _ = tmp_setup
+        # Add subscription then clear provider_url to simulate missing config
+        sub = cm.add_subscription("broken", "", "K", auth_type="direct")
+        sync._resolve_api_key.return_value = "key"
+
+        ok, reason = fm.test_health(sub["id"])
+        assert ok is False
+        assert "provider_url" in reason.lower() or "configured" in reason.lower()
+
+    def test_direct_connection_error_returns_not_ok(self, tmp_setup):
+        cm, sync, fm, _ = tmp_setup
+        sub = self._direct_sub(cm)
+        sync._resolve_api_key.return_value = "key"
+        from urllib.error import URLError
+
+        with patch("urllib.request.urlopen", side_effect=URLError("timeout")):
+            ok, reason = fm.test_health(sub["id"])
+        assert ok is False
+        assert "connection" in reason.lower()
 
 
 class TestFailoverRetryOriginalFlow:

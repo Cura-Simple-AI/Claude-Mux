@@ -50,9 +50,9 @@ class InstanceManager:
     ecosystem.config.js merge (preserves non-claude-mux apps).
     """
 
-    CLAUDE_MUX_BIN = os.environ.get(
-        "CLAUDE_MUX_BIN",
-        str(Path.home() / ".local" / "bin" / "claude-mux"),
+    HEIMSENSE_BIN = os.environ.get(
+        "HEIMSENSE_BIN",
+        str(Path.home() / ".local" / "bin" / "heimsense"),
     )
     ECOSYSTEM_PATH = Path.home() / ".ecosystem.config.js"
 
@@ -137,6 +137,14 @@ class InstanceManager:
         sub = self.cm.get_subscription(sub_id)
         if sub is None:
             raise ValueError(f"Subscription {sub_id} not found")
+
+        # Direct auth types (oauth, direct) need no proxy — just sync settings
+        if sub.get("auth_type") in ("oauth", "direct"):
+            raise ValueError(
+                f"'{sub['name']}' uses direct API access — no proxy needed. "
+                "Use 'Set Default' (Enter) to activate it."
+            )
+
         pm2_name = self.cm.get_pm2_name(sub_id) or f"claude-mux-{sub['name']}"
 
         # Allocate port on start — always check that saved port is available
@@ -150,9 +158,9 @@ class InstanceManager:
         CLAUDE_MUX_DIR.mkdir(parents=True, exist_ok=True)
         shutil.copy2(env_path, CLAUDE_MUX_DIR / ".env")
 
-        if not Path(self.CLAUDE_MUX_BIN).exists():
+        if not Path(self.HEIMSENSE_BIN).exists():
             raise FileNotFoundError(
-                f"claude-mux binary not found at {self.CLAUDE_MUX_BIN}. "
+                f"heimsense binary not found at {self.HEIMSENSE_BIN}. "
                 f"Install: curl -fsSL https://raw.githubusercontent.com/cura-ai/claude-mux/main/scripts/install.sh | bash"
             )
 
@@ -163,7 +171,7 @@ class InstanceManager:
         subprocess.run(["pm2", "delete", pm2_name], capture_output=True, text=True)
 
         # Start via PM2 — bash sources .env explicitly so shell-env doesn't contaminate
-        cmd = f"set -a; source {env_path}; set +a; exec {self.CLAUDE_MUX_BIN} run"
+        cmd = f"set -a; source {env_path}; set +a; exec {self.HEIMSENSE_BIN} run"
         result = subprocess.run(
             [
                 "pm2", "start", "bash",
@@ -250,7 +258,7 @@ class InstanceManager:
             env_path = inst_dir / ".env"
             apps.append({
                 "name": pm2_name,
-                "script": self.CLAUDE_MUX_BIN,
+                "script": self.HEIMSENSE_BIN,
                 "args": "run",
                 "env_file": str(env_path) if env_path.exists() else "",
                 "cwd": str(CLAUDE_MUX_DIR),

@@ -20,6 +20,9 @@ from claude_mux.config import (
 
 log = logging.getLogger("claude-mux")
 
+# Plain-text file caching the active subscription name for fast statusline reads.
+ACTIVE_NAME_FILE = CLAUDE_MUX_DIR / "active-name"
+
 
 class SyncManager:
     """Synchronize default instance's .env to ~/.claude/settings.json.
@@ -33,6 +36,91 @@ class SyncManager:
     def __init__(self, config: ConfigManager):
         self.cm = config
 
+    # ------------------------------------------------------------------
+    # Key resolution
+    # ------------------------------------------------------------------
+
+    def _resolve_api_key(self, sub: dict, *, allow_subprocess: bool = True) -> str:
+        """Return the effective API key for a subscription.
+
+        Resolution order:
+        1. sub["api_key"] (stored literal — OAuth tokens, direct bearer)
+        2. gh auth token subprocess (gh_token auth only, if allow_subprocess)
+        3. os.environ[api_key_env]
+        """
+        api_key = sub.get("api_key", "")
+        if api_key:
+            return api_key
+        api_key_env = sub.get("api_key_env", "")
+        auth_type = sub.get("auth_type", "bearer")
+        if auth_type == "gh_token" and allow_subprocess:
+            try:
+                result = subprocess.run(
+                    ["gh", "auth", "token"], capture_output=True, text=True, timeout=10,
+                )
+                return result.stdout.strip() if result.returncode == 0 else os.environ.get(api_key_env, "")
+            except Exception:
+                return os.environ.get(api_key_env, "")
+        return os.environ.get(api_key_env, "") if api_key_env else ""
+
+    # ------------------------------------------------------------------
+    # Active subscription detection
+    # ------------------------------------------------------------------
+
+    def detect_active(self) -> str | None:
+        """Return the sub_id of the subscription currently active in Claude.
+
+        Reads ~/.claude/settings.json and os.environ and matches against
+        subscriptions using auth-type-specific logic:
+
+        - oauth:   CLAUDE_CODE_OAUTH_TOKEN (env OR settings) == resolved api_key
+        - direct:  ANTHROPIC_BASE_URL == sub["provider_url"]
+        - bearer:  ANTHROPIC_BASE_URL == http://localhost:<instance_port>
+        """
+        settings_env = self._load_settings().get("env", {})
+
+        # OAuth token may live in os.environ (shell export) OR settings["env"]
+        oauth_token = (
+            os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+            or settings_env.get("CLAUDE_CODE_OAUTH_TOKEN", "")
+        )
+        base_url = settings_env.get("ANTHROPIC_BASE_URL", "")
+
+        for sub in self.cm.subscriptions:
+            sub_id = sub["id"]
+            auth_type = sub.get("auth_type", "bearer")
+
+            if auth_type == "oauth":
+                if not oauth_token:
+                    continue
+                # No subprocess during periodic TUI refresh — env only
+                resolved = self._resolve_api_key(sub, allow_subprocess=False)
+                if resolved and oauth_token == resolved:
+                    return sub_id
+
+            elif auth_type == "direct":
+                provider_url = sub.get("provider_url", "")
+                if provider_url and base_url == provider_url:
+                    return sub_id
+
+            else:  # bearer, gh_token, custom proxy
+                port = self.cm.get_instance_port(sub_id)
+                if port and base_url == f"http://localhost:{port}":
+                    return sub_id
+
+        return None
+
+    def read_active_name(self) -> str:
+        """Return the cached active subscription name, or empty string."""
+        try:
+            return ACTIVE_NAME_FILE.read_text().strip()
+        except OSError:
+            return ""
+
+    # ------------------------------------------------------------------
+    # Sync
+    # ------------------------------------------------------------------
+
     def sync_default(self, sub_id: str) -> dict:
         """Set sub_id as default and sync .env → settings.json.
 
@@ -42,6 +130,7 @@ class SyncManager:
         3. Merge relevant keys (only MERGE_KEYS) to ~/.claude/settings.json
         4. Set CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
         5. Set ANTHROPIC_DISABLE_TELEMETRY=true
+        6. Write ~/.claude-mux/active-name for statusline
         """
         sub = self.cm.get_subscription(sub_id)
         if sub is None:
@@ -62,27 +151,13 @@ class SyncManager:
         settings = self._load_settings()
         env_block = settings.setdefault("env", {})
 
-        # Read API key — OAuth: from sub["api_key"], gh_token → `gh auth token`, else os.environ
-        api_key_env = sub.get("api_key_env", "")
         auth_type = sub.get("auth_type", "bearer")
-        api_key = sub.get("api_key", "")
-        if not api_key:
-            if auth_type == "gh_token":
-                try:
-                    gh_result = subprocess.run(
-                        ["gh", "auth", "token"], capture_output=True, text=True, timeout=10,
-                    )
-                    api_key = gh_result.stdout.strip() if gh_result.returncode == 0 else os.environ.get(api_key_env, "")
-                except Exception:
-                    api_key = os.environ.get(api_key_env, "")
-            else:
-                api_key = os.environ.get(api_key_env, "") if api_key_env else ""
+        api_key = self._resolve_api_key(sub)
         provider_url = sub.get("provider_url", "")
         port = self.cm.get_instance_port(sub_id) or 0
         listen_addr = f"http://localhost:{port}"
-        auth_type = sub.get("auth_type", "bearer")
 
-        # Build settings env block: only keys in MERGE_KEYS
+        # Build settings env block
         merged = {}
 
         if auth_type == "oauth":
@@ -91,6 +166,12 @@ class SyncManager:
             merged["ANTHROPIC_AUTH_TOKEN"] = None
             if api_key:
                 merged["CLAUDE_CODE_OAUTH_TOKEN"] = api_key
+        elif auth_type == "direct":
+            # Direct Anthropic-compatible API (e.g. z.ai) — no proxy needed
+            merged["ANTHROPIC_BASE_URL"] = provider_url
+            if api_key:
+                merged["ANTHROPIC_AUTH_TOKEN"] = api_key
+            merged["CLAUDE_CODE_OAUTH_TOKEN"] = None
         else:
             merged["ANTHROPIC_BASE_URL"] = listen_addr
             if api_key:
@@ -122,6 +203,14 @@ class SyncManager:
                 env_block[key] = val
 
         self._save_settings(settings)
+
+        # 6. Cache active name for fast statusline reads
+        try:
+            ACTIVE_NAME_FILE.parent.mkdir(parents=True, exist_ok=True)
+            ACTIVE_NAME_FILE.write_text(sub["name"])
+        except OSError as e:
+            log.warning("Could not write active-name cache: %s", e)
+
         return {
             "default": sub["name"],
             "port": port,

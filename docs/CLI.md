@@ -214,7 +214,7 @@ claude-mux status claude-max
 claude-mux status --json
 ```
 
-**TUI equivalent:** Main table (refresh `r`)
+**TUI equivalent:** Main table (auto-refreshes every 5s)
 
 ---
 
@@ -301,6 +301,40 @@ Active sub:    claude-max (oauth, direct)
 
 ---
 
+### `claude-mux active`
+
+Print the name of the subscription currently active in Claude Code.
+
+Reads `~/.claude/settings.json` and matches against saved subscriptions using
+auth-type-specific logic (OAuth token, direct provider URL, or proxy port).
+
+```bash
+claude-mux active          # print name, exit 0; or exit 1 if no match
+claude-mux active --json   # {"active": "deepseek", "id": "de3a7e01-..."}
+```
+
+**Exit codes:** `0` = match found · `1` = no match (settings not from any saved subscription)
+
+---
+
+### `claude-mux init`
+
+First-time setup: installs the Claude Code status line integration.
+
+```bash
+claude-mux init           # install (safe to re-run — skips if already set)
+claude-mux init --force   # overwrite existing statusLine setting
+```
+
+**What it does:**
+1. Writes `~/.claude-mux/bin/statusline.sh` — a script that prints the active subscription name
+2. Adds a `statusLine` entry to `~/.claude/settings.json` so Claude Code shows the name in its status bar
+
+**After running:** restart Claude Code. The status bar shows the active subscription name,
+updated every time you activate a subscription with `claude-mux activate`.
+
+---
+
 ## Scripting examples
 
 ### Switch provider from a shell script
@@ -327,13 +361,12 @@ sys.exit(0 if r['ok'] else 4)
 ### List active subscription name
 
 ```bash
-ACTIVE=$(claude-mux list --json | python3 -c "
-import sys, json
-subs = json.load(sys.stdin)
-active = next((s['name'] for s in subs if s['active']), None)
-print(active or '')
-")
-echo "Active: $ACTIVE"
+# Simple (exits 1 if nothing matches)
+claude-mux active
+
+# JSON
+claude-mux active --json
+# → {"active": "deepseek", "id": "de3a7e01-..."}
 ```
 
 ### Automate failover on 429
@@ -349,13 +382,14 @@ claude-mux test || claude-mux failover
 
 | TUI key | CLI command | Description |
 |---|---|---|
-| `r` | `claude-mux status` | Refresh / show status |
+| `r` | — | Reload TUI (hotload restart) |
 | `+` | `claude-mux add` | Add subscription |
 | `Enter` | `claude-mux activate <name>` | Set as default |
 | `s` (start) | `claude-mux start <name>` | Start proxy |
 | `s` (stop) | `claude-mux stop <name>` | Stop proxy |
 | `t` | `claude-mux test [name]` | Health check |
 | `e` | `claude-mux edit <name>` | Edit subscription |
+| `e` on `*current` | — | Save current settings as new subscription |
 | `d` | `claude-mux delete <name>` | Delete subscription |
 | `f` | `claude-mux force-model <name> <model>` | Force model |
 | `l` | `claude-mux logs <name>` | PM2 logs |
@@ -363,6 +397,8 @@ claude-mux test || claude-mux failover
 | `x` | `claude-mux failover` | Manual failover |
 | `h` | `claude-mux --help` | Help |
 | `q` | (exit TUI) | — |
+| — | `claude-mux active` | Print active subscription name |
+| — | `claude-mux init` | Install Claude Code status line |
 
 ---
 
