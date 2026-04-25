@@ -48,7 +48,7 @@ claude-mux handles the rest.
 pip install claude-mux
 ```
 
-Or with pipx (isolated environment):
+Or with pipx (isolated environment, recommended):
 
 ```bash
 pipx install claude-mux
@@ -62,7 +62,7 @@ pipx install claude-mux
 claude-mux
 ```
 
-That's it. A TUI opens where you configure providers.
+That's it. A TUI opens where you configure providers and activate one as default.
 
 Claude Code will now:
 - use your configured providers
@@ -103,12 +103,18 @@ You keep working. No errors. No manual switching.
 ## CLI
 
 ```bash
-claude-mux            # Start TUI
-claude-mux --version  # Show version
-claude-mux --help     # Help
+claude-mux              # Start TUI
+claude-mux list         # List providers
+claude-mux activate <name>  # Set active provider
+claude-mux status       # Show status
+claude-mux test         # Health check
+claude-mux failover     # Manual failover
+claude-mux config       # Show config paths
+claude-mux --version
+claude-mux --help
 ```
 
-Full CLI reference (non-interactive mode): [docs/CLI.md](docs/CLI.md)
+Full CLI reference: [docs/CLI.md](docs/CLI.md)
 
 ---
 
@@ -146,7 +152,7 @@ Full reference: [docs/KEYBOARD.md](docs/KEYBOARD.md)
 ## Docs
 
 - [QUICKSTART.md](docs/QUICKSTART.md) — Installation and first steps
-- [PROVIDERS.md](docs/PROVIDERS.md) — Setup guide for all 8 providers
+- [PROVIDERS.md](docs/PROVIDERS.md) — Setup guide for all providers
 - [KEYBOARD.md](docs/KEYBOARD.md) — All keyboard shortcuts
 - [FAILOVER.md](docs/FAILOVER.md) — Automatic failover and auto-resume
 - [CLI.md](docs/CLI.md) — Full CLI reference
@@ -175,4 +181,4 @@ You should just be able to work.
 
 MIT — [LICENSE](LICENSE)
 
-Built by [Cura AI](https://github.com/cura-ai)
+Built by [Cura AI](https://github.com/Cura-Simple-AI)
