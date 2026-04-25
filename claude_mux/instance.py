@@ -95,7 +95,7 @@ class InstanceManager:
         api_key_env = sub.get("api_key_env", "")
         auth_type = sub.get("auth_type", "bearer")
 
-        # OAuth: token stored directly in subscription
+        # OAuth or bearer: token stored directly in subscription
         api_key_val = sub.get("api_key", "")
         if not api_key_val:
             if auth_type == "gh_token":
