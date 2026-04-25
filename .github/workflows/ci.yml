@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    paths:
+      - 'tools/heimsense/**'
+      - 'scripts/heimsense-tui.py'
+  pull_request:
+    paths:
+      - 'tools/heimsense/**'
+      - 'scripts/heimsense-tui.py'
+
+jobs:
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        working-directory: tools/heimsense
+        run: pip install -e ".[dev]"
+
+      - name: Run tests
+        working-directory: tools/heimsense
+        run: pytest tests/ -v --tb=short
+
+      - name: Verify heimsense-tui.py imports cleanly
+        run: |
+          python scripts/verify_import.py
