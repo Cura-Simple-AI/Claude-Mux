@@ -59,7 +59,7 @@ def _handle(conn, addr):
         req = _parse_request(conn)
         if req is None:
             return
-        method, path, headers, body = req
+        method, path, headers, body, qs = req
 
         # Health check
         if path == "/health":
@@ -72,22 +72,25 @@ def _handle(conn, addr):
             return
 
         upstream = f"{TARGET_URL}{path}"
+        if qs:
+            upstream += "?" + qs
         t0 = time.time()
 
-        req_headers = {
-            "Authorization": f"Bearer {AUTH_TOKEN}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
-        # anthropic-version: forward from client or use default
-        req_headers["anthropic-version"] = headers.get("anthropic-version", "2023-06-01")
-        # oauth-2025-04-20 is required for OAuth tokens to be accepted by Anthropic.
-        # Merge it with any beta flags the client sends (e.g. interleaved-thinking, context-management).
-        client_betas = [b.strip() for b in headers.get("anthropic-beta", "").split(",") if b.strip()]
-        all_betas = list(dict.fromkeys(["oauth-2025-04-20"] + client_betas))  # deduplicated, oauth first
-        req_headers["anthropic-beta"] = ",".join(all_betas)
-        # Forward other Anthropic-specific headers the client may send
-        for hdr in ("anthropic-dangerous-direct-browser-access", "x-app"):
+        req_headers = {"Content-Type": "application/json"}
+
+        # Forward x-api-key AS-IS if client sent it (OAuth tokens use this).
+        if "x-api-key" in headers:
+            req_headers["x-api-key"] = headers["x-api-key"]
+        elif "authorization" in headers:
+            req_headers["Authorization"] = headers["authorization"]
+        elif AUTH_TOKEN:
+            # Fallback: PROXY_AUTH_TOKEN (for non-OAuth providers)
+            req_headers["Authorization"] = f"Bearer {AUTH_TOKEN}"
+
+        # Forward ALL client headers that Anthropic needs — proxy is transparent
+        for hdr in ("anthropic-version", "anthropic-beta",
+                    "anthropic-dangerous-direct-browser-access", "x-app",
+                    "accept", "accept-encoding", "user-agent"):
             if hdr in headers:
                 req_headers[hdr] = headers[hdr]
 
@@ -148,7 +151,7 @@ def _handle(conn, addr):
 
 
 def _parse_request(conn):
-    """Read and parse HTTP/1.1 request from socket. Returns (method, path, headers, body)."""
+    """Read and parse HTTP/1.1 request from socket. Returns (method, path, headers, body, qs)."""
     try:
         data = b""
         while b"\r\n\r\n" not in data:
@@ -168,6 +171,7 @@ def _parse_request(conn):
             return None
         method = request_line[0]
         path = request_line[1].split("?")[0]
+        qs = request_line[1].split("?")[1] if "?" in request_line[1] else ""
 
         headers = {}
         for line in lines[1:]:
@@ -186,7 +190,7 @@ def _parse_request(conn):
                     break
                 body += chunk.decode("utf-8", errors="replace")
 
-        return method, path, headers, body
+        return method, path, headers, body, qs
     except Exception:
         log.exception("parse request error")
         return None
