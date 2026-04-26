@@ -91,15 +91,17 @@ def _handle(conn, addr):
             req_headers["anthropic-beta"] = headers["anthropic-beta"]
 
         if DEBUG:
-            # Log what the client sent us
+            # Write debug directly to stdout so PM2 captures it in out.log
+            def _dbg(msg):
+                sys.stdout.write(f"[DEBUG] {msg}\n")
+                sys.stdout.flush()
             client_hdrs_safe = {k: v for k, v in headers.items() if k != "authorization"}
-            log.debug("CLIENT → PROXY  headers=%s", json.dumps(client_hdrs_safe))
-            log.debug("CLIENT → PROXY  body=%s", (body or "")[:2000])
-            # Log what we forward upstream
+            _dbg(f"CLIENT→PROXY headers={json.dumps(client_hdrs_safe)}")
+            _dbg(f"CLIENT→PROXY body={((body or '')[:2000])}")
             upstream_hdrs_safe = {k: ("Bearer [REDACTED]" if k == "Authorization" else v)
                                    for k, v in req_headers.items()}
-            log.debug("PROXY → UPSTREAM  url=%s headers=%s", upstream, json.dumps(upstream_hdrs_safe))
-            log.debug("PROXY → UPSTREAM  body=%s", (body or "")[:2000])
+            _dbg(f"PROXY→UPSTREAM url={upstream} headers={json.dumps(upstream_hdrs_safe)}")
+            _dbg(f"PROXY→UPSTREAM body={((body or '')[:2000])}")
 
         data = body.encode() if body else None
         upstream_req = urllib.request.Request(upstream, data=data, headers=req_headers, method=method)
@@ -119,9 +121,8 @@ def _handle(conn, addr):
                 pass
 
             if DEBUG:
-                log.debug("UPSTREAM → PROXY  status=%d headers=%s", status,
-                          json.dumps(dict(upstream_resp.headers)))
-                log.debug("UPSTREAM → PROXY  body=%s", resp_body[:2000].decode("utf-8", errors="replace"))
+                _dbg(f"UPSTREAM→PROXY status={status} headers={json.dumps(dict(upstream_resp.headers))}")
+                _dbg(f"UPSTREAM→PROXY body={resp_body[:2000].decode('utf-8', errors='replace')}")
 
             _log_request(method, path, status, elapsed, model)
             _send_response(conn, status, resp_body, ctype=upstream_resp.headers.get("Content-Type", "application/json"))
@@ -130,9 +131,8 @@ def _handle(conn, addr):
             elapsed = int((time.time() - t0) * 1000)
             err_body = e.read()
             if DEBUG:
-                log.debug("UPSTREAM → PROXY  error=%d headers=%s", e.code,
-                          json.dumps(dict(e.headers)))
-                log.debug("UPSTREAM → PROXY  body=%s", err_body[:2000].decode("utf-8", errors="replace"))
+                _dbg(f"UPSTREAM→PROXY error={e.code} headers={json.dumps(dict(e.headers))}")
+                _dbg(f"UPSTREAM→PROXY body={err_body[:2000].decode('utf-8', errors='replace')}")
             _log_request(method, path, e.code, elapsed)
             _send_response(conn, e.code, err_body, ctype="application/json")
 
