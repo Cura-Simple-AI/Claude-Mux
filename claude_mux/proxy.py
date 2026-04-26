@@ -79,9 +79,15 @@ def _handle(conn, addr):
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
-        # Forward client headers that Anthropic needs
-        for hdr in ("anthropic-version", "anthropic-beta",
-                    "anthropic-dangerous-direct-browser-access", "x-app"):
+        # anthropic-version: forward from client or use default
+        req_headers["anthropic-version"] = headers.get("anthropic-version", "2023-06-01")
+        # oauth-2025-04-20 is required for OAuth tokens to be accepted by Anthropic.
+        # Merge it with any beta flags the client sends (e.g. interleaved-thinking, context-management).
+        client_betas = [b.strip() for b in headers.get("anthropic-beta", "").split(",") if b.strip()]
+        all_betas = list(dict.fromkeys(["oauth-2025-04-20"] + client_betas))  # deduplicated, oauth first
+        req_headers["anthropic-beta"] = ",".join(all_betas)
+        # Forward other Anthropic-specific headers the client may send
+        for hdr in ("anthropic-dangerous-direct-browser-access", "x-app"):
             if hdr in headers:
                 req_headers[hdr] = headers[hdr]
 

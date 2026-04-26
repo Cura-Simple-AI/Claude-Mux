@@ -98,6 +98,8 @@ class FailoverManager:
         req = Request(url, method="GET")
         req.add_header("Authorization", f"Bearer {api_key}")
         req.add_header("anthropic-version", "2023-06-01")
+        if auth_type == "oauth":
+            req.add_header("anthropic-beta", "oauth-2025-04-20")
 
         try:
             with urlopen(req, timeout=10) as resp:

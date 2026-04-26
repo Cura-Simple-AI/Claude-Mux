@@ -334,6 +334,7 @@ class SyncManager:
                 req = Request(url, method="GET")
                 req.add_header("Authorization", f"Bearer {api_key}")
                 req.add_header("anthropic-version", "2023-06-01")
+                req.add_header("anthropic-beta", "oauth-2025-04-20")
             elif auth_type == "direct":
                 base = sub.get("provider_url", "").rstrip("/")
                 if not base:
@@ -439,6 +440,7 @@ class SyncManager:
         if auth_type == "oauth":
             url = "https://api.anthropic.com/v1/messages"
             headers["Authorization"] = f"Bearer {api_key}"
+            headers["anthropic-beta"] = "oauth-2025-04-20"
         elif auth_type == "direct":
             base = sub.get("provider_url", "").rstrip("/")
             url = f"{base}/v1/messages"
