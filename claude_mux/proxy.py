@@ -24,8 +24,6 @@ LOG_FILE = os.environ.get("LOG_FILE")
 LISTEN_ADDR = os.environ.get("LISTEN_ADDR", ":18080")
 TARGET_URL = os.environ.get("PROXY_TARGET_URL", "").rstrip("/")
 AUTH_TOKEN = os.environ.get("PROXY_AUTH_TOKEN", "")
-# When set, inject anthropic-beta: oauth-2025-04-20 on every upstream request
-OAUTH_MODE = os.environ.get("PROXY_OAUTH_MODE", "") == "1"
 # When set, log full request/response headers and bodies to stdout
 DEBUG = os.environ.get("PROXY_DEBUG", "") == "1"
 
@@ -81,14 +79,11 @@ def _handle(conn, addr):
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
-        # Preserve anthropic-version if sent by client
-        if "anthropic-version" in headers:
-            req_headers["anthropic-version"] = headers["anthropic-version"]
-        # Preserve anthropic-beta if sent by client; always inject for OAuth mode
-        if OAUTH_MODE:
-            req_headers["anthropic-beta"] = "oauth-2025-04-20"
-        elif "anthropic-beta" in headers:
-            req_headers["anthropic-beta"] = headers["anthropic-beta"]
+        # Forward client headers that Anthropic needs
+        for hdr in ("anthropic-version", "anthropic-beta",
+                    "anthropic-dangerous-direct-browser-access", "x-app"):
+            if hdr in headers:
+                req_headers[hdr] = headers[hdr]
 
         if DEBUG:
             # Write debug directly to stdout so PM2 captures it in out.log
