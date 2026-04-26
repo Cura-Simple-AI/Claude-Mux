@@ -64,7 +64,6 @@ log = logging.getLogger("claude-mux")
 EMPTY_SUBSCRIPTIONS = {
     "version": 1,
     "subscriptions": [],
-    "default_instance": None,
     "instances": {},
 }
 
@@ -96,6 +95,8 @@ ENV_TEMPLATE_KEYS = {
     "MAX_TOKENS": "4096",
     "SERVER_METRICS_PORT": "",
     "MAX_RETRIES": "3",
+    "PROXY_TARGET_URL": "",
+    "PROXY_AUTH_TOKEN": "",
 }
 
 PROVIDER_PRESETS = {
@@ -133,6 +134,17 @@ PROVIDER_PRESETS = {
         "auth_type": "oauth",
         "api_key_env": "",
         "model_maps": {},
+    },
+    "claude-max-proxy": {
+        "label": "Claude (OAuth via proxy)",
+        "provider_url": "https://api.anthropic.com",
+        "auth_type": "oauth_proxy",
+        "api_key_env": "CLAUDE_CODE_OAUTH_TOKEN",
+        "model_maps": {
+            "haiku": "claude-haiku-4-5-20251001",
+            "sonnet": "claude-sonnet-4-6",
+            "opus": "claude-opus-4-6",
+        },
     },
     "gemini": {
         "label": "Gemini (Google)",
@@ -274,7 +286,6 @@ class ConfigManager:
             import copy
             return copy.deepcopy(EMPTY_SUBSCRIPTIONS)
         data.setdefault("subscriptions", [])
-        data.setdefault("default_instance", None)
         data.setdefault("instances", {})
         # Migration: remove auto-created claude-backup/auto-custom subs
         before_count = len(data["subscriptions"])
@@ -301,10 +312,11 @@ class ConfigManager:
             _lg.getLogger(__name__).info(
                 "Migration: removed %d auto-created subscription(s)", removed
             )
-            # Reset default if it pointed to a removed sub
-            remaining_ids = {s["id"] for s in data["subscriptions"]}
-            if data.get("default_instance") not in remaining_ids:
-                data["default_instance"] = None
+        # Clear default_instance if it points to a removed subscription
+        remaining_ids = {s["id"] for s in data["subscriptions"]}
+        default = data.get("default_instance")
+        if default and default not in remaining_ids:
+            data["default_instance"] = None
         return data
 
     def _save(self):
@@ -313,10 +325,6 @@ class ConfigManager:
     @property
     def subscriptions(self) -> list:
         return list(self._data.get("subscriptions", []))
-
-    @property
-    def default_instance(self):
-        return self._data.get("default_instance")
 
     # --- Subscription CRUD ---
 
@@ -397,21 +405,76 @@ class ConfigManager:
             s for s in self._data["subscriptions"] if s["id"] != sub_id
         ]
         self._data["instances"].pop(sub_id, None)
-        if self._data.get("default_instance") == sub_id:
-            self._data["default_instance"] = None
         if len(self._data["subscriptions"]) < before:
+            if self._data.get("default_instance") == sub_id:
+                self._data["default_instance"] = None
             self._save()
             return True
         return False
 
-    # --- Default instance ---
+    # --- Default instance (fallback for detect_active) ---
+
+    @property
+    def default_instance(self) -> str | None:
+        """Return configured default subscription id, or None."""
+        return self._data.get("default_instance")
 
     def set_default(self, sub_id: str) -> bool:
-        if self.get_subscription(sub_id) is None:
+        """Set the default subscription. Returns False if sub_id not found."""
+        if not self.get_subscription(sub_id):
             return False
         self._data["default_instance"] = sub_id
         self._save()
         return True
+
+    # --- Model cache + blacklist ---
+
+    def update_subscription_models(
+        self,
+        sub_id: str,
+        available_models: list[str],
+        models_fetched_at: float | None,
+    ) -> bool:
+        """Persist available_models + fetch timestamp without touching other fields."""
+        sub = self.get_subscription(sub_id)
+        if sub is None:
+            return False
+        sub["available_models"] = available_models[:200]  # cap defensively
+        sub["models_fetched_at"] = models_fetched_at
+        sub["updated_at"] = _now()
+        self._save()
+        return True
+
+    def add_blacklisted_model(self, sub_id: str, model_id: str) -> bool:
+        """Add model_id to sub's blacklist. Returns False if sub not found."""
+        sub = self.get_subscription(sub_id)
+        if sub is None:
+            return False
+        bl = sub.setdefault("blacklisted_models", [])
+        if model_id not in bl:
+            bl.append(model_id)
+            sub["updated_at"] = _now()
+            self._save()
+        return True
+
+    def remove_blacklisted_model(self, sub_id: str, model_id: str) -> bool:
+        """Remove model_id from sub's blacklist. Returns False if sub not found."""
+        sub = self.get_subscription(sub_id)
+        if sub is None:
+            return False
+        bl = sub.get("blacklisted_models", [])
+        if model_id in bl:
+            bl.remove(model_id)
+            sub["updated_at"] = _now()
+            self._save()
+        return True
+
+    def get_blacklisted_models(self, sub_id: str) -> list[str]:
+        """Return list of blacklisted model IDs for sub, or [] if sub not found."""
+        sub = self.get_subscription(sub_id)
+        if sub is None:
+            return []
+        return list(sub.get("blacklisted_models", []))
 
     # --- Port allocation ---
 

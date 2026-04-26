@@ -20,6 +20,7 @@ from claude_mux.tui import (
     FailoverManager,
     CLAUDE_MUX_DIR,
 )
+from claude_mux.sync import TIER_FALLBACK_MODELS, extract_response_body
 
 
 # ---------------------------------------------------------------------------
@@ -51,7 +52,7 @@ def _find_sub(cm: ConfigManager, name_or_id: str) -> dict | None:
 
 def _sub_status(cm: ConfigManager, im: InstanceManager, sub: dict) -> str:
     """Return human-readable status string for a subscription."""
-    if sub.get("auth_type") == "oauth":
+    if sub.get("auth_type") in ("oauth", "oauth_proxy"):
         return "oauth"
     port = cm.get_instance_port(sub["id"])
     if not port:
@@ -90,9 +91,9 @@ def cli(ctx):
 @click.option("--quiet", "-q", is_flag=True, help="Suppress header")
 def cmd_list(as_json, quiet):
     """List all subscriptions."""
-    cm = _cm()
+    cm, sync, _, _ = _managers()
     subs = cm.subscriptions
-    default_id = cm.default_instance
+    active_id = sync.detect_active()
 
     if as_json:
         out = []
@@ -103,7 +104,7 @@ def cmd_list(as_json, quiet):
                 "provider": s.get("provider", ""),
                 "auth_type": s.get("auth_type", "bearer"),
                 "port": cm.get_instance_port(s["id"]),
-                "active": s["id"] == default_id,
+                "active": s["id"] == active_id,
             })
         click.echo(json.dumps(out, indent=2))
         return
@@ -114,13 +115,13 @@ def cmd_list(as_json, quiet):
         sys.exit(0)
 
     if not quiet:
-        active_name = next((s["name"] for s in subs if s["id"] == default_id), "none")
+        active_name = next((s["name"] for s in subs if s["id"] == active_id), "none")
         click.echo(f"Active: {active_name}\n")
-        click.echo(f"{'NAME':<20} {'PROVIDER':<20} {'AUTH':<10} {'PORT':<8} {'DEFAULT'}")
+        click.echo(f"{'NAME':<20} {'PROVIDER':<20} {'AUTH':<10} {'PORT':<8} {'ACTIVE'}")
         click.echo("-" * 66)
 
     for s in subs:
-        is_default = "✓" if s["id"] == default_id else ""
+        is_default = "✓" if s["id"] == active_id else ""
         port = cm.get_instance_port(s["id"]) or "-"
         provider = s.get("provider_url", "")[:18]
         auth = s.get("auth_type", "bearer")
@@ -139,12 +140,14 @@ def cmd_status(name, as_json):
 
     NAME: optional subscription name to show a single entry.
     """
-    cm, _, im, _ = _managers()
+    cm, sync, im, _ = _managers()
     subs = [_find_sub(cm, name)] if name else cm.subscriptions
 
     if name and not subs[0]:
         click.echo(f"Error: subscription '{name}' not found", err=True)
         sys.exit(3)
+
+    active_id = sync.detect_active()
 
     result = []
     for s in subs:
@@ -152,7 +155,7 @@ def cmd_status(name, as_json):
         result.append({
             "name": s["name"],
             "status": st,
-            "active": s["id"] == cm.default_instance,
+            "active": s["id"] == active_id,
             "port": cm.get_instance_port(s["id"]),
         })
 
@@ -265,17 +268,117 @@ def cmd_stop(name, stop_all, quiet):
 # test
 # ---------------------------------------------------------------------------
 
+def _inference_test(sub: dict, model: str, cm: "ConfigManager", sync: "SyncManager") -> dict:
+    """Delegate to SyncManager.inference_test — single implementation shared w/ TUI."""
+    return sync.inference_test(sub, model)
+
+
 @cli.command("test")
 @click.argument("name", required=False)
+@click.argument("tier", required=False, type=click.Choice(["haiku", "sonnet", "opus"]))
+@click.option("--model", "model_override", default="",
+              help="Test a specific model ID directly (bypasses tier resolution)")
 @click.option("--json", "as_json", is_flag=True)
-def cmd_test(name, as_json):
-    """Run a health check on a subscription.
+def cmd_test(name, tier, model_override, as_json):
+    """Test a subscription via real inference across model tiers.
 
-    NAME: defaults to active subscription if omitted.
+    With no tier or model, all three tiers (haiku/sonnet/opus) are tested.
+    A tier test sends a real message and reports OK/FAIL per model.
+    This reveals partial failures such as haiku working but sonnet rate-limited.
 
-    Exit code 4 if health check fails.
+    Examples:
+
+      cm test                           # test all tiers on active subscription
+      cm test deepseek haiku            # test haiku tier on deepseek
+      cm test Test sonnet               # test sonnet tier on Test
+      cm test Test --model claude-haiku-4-5-20251001
+
+    Exit code 4 if any tier fails.
     """
-    cm, sync, im, fm = _managers()
+    cm, sync, _, _ = _managers()
+
+    if name:
+        sub = _find_sub(cm, name)
+        if not sub:
+            click.echo(f"Error: subscription '{name}' not found", err=True)
+            sys.exit(3)
+    else:
+        sub_id = sync.detect_active()
+        if not sub_id:
+            click.echo("Error: no active subscription", err=True)
+            sys.exit(3)
+        sub = cm.get_subscription(sub_id)
+
+    # Determine which tiers to test
+    if model_override:
+        tiers_to_test = [("custom", model_override)]
+    elif tier:
+        model = sync.resolve_model_for_tier(sub, tier) or TIER_FALLBACK_MODELS.get(tier, tier)
+        tiers_to_test = [(tier, model)]
+    else:
+        tiers_to_test = []
+        for t in ("haiku", "sonnet", "opus"):
+            model = sync.resolve_model_for_tier(sub, t) or TIER_FALLBACK_MODELS.get(t, t)
+            if model:
+                tiers_to_test.append((t, model))
+
+    if not tiers_to_test:
+        click.echo(f"{sub['name']}: no models available — run 'cm reload {sub['name']}' to fetch", err=True)
+        sys.exit(3)
+
+    results = []
+    any_fail = False
+    for t, model in tiers_to_test:
+        result = _inference_test(sub, model, cm, sync)
+        ok = result["code"] == 200
+        if not ok:
+            any_fail = True
+        results.append({
+            "tier": t,
+            "model": model,
+            "ok": ok,
+            "code": result["code"],
+            "elapsed_ms": result["elapsed"],
+            "body": result["body"],
+        })
+
+    if as_json:
+        click.echo(json.dumps({"name": sub["name"], "results": results}))
+    else:
+        for r in results:
+            status = "OK" if r["ok"] else "FAIL"
+            click.echo(
+                f"{sub['name']} [{r['tier']}] {r['model']}: {status} ({r['code']}, {r['elapsed_ms']}ms)"
+            )
+            if not r["ok"]:
+                click.echo(f"  → {r['body'][:200]}")
+            else:
+                click.echo(f"  → {r['body'][:120]}")
+
+    if any_fail:
+        sys.exit(4)
+
+
+# ---------------------------------------------------------------------------
+# models — show and refresh cached model list
+# ---------------------------------------------------------------------------
+
+@cli.command("models")
+@click.argument("name", required=False)
+@click.option("--refresh", is_flag=True, help="Re-fetch models from API before listing")
+@click.option("--json", "as_json", is_flag=True)
+def cmd_models(name, refresh, as_json):
+    """Show cached available models for a subscription.
+
+    Use --refresh to re-fetch from the provider API.
+
+    Examples:
+
+      cm models                   # list models for active subscription
+      cm models deepseek --refresh
+    """
+    import time as _time
+    cm, sync, _, _ = _managers()
 
     if name:
         sub = _find_sub(cm, name)
@@ -284,25 +387,186 @@ def cmd_test(name, as_json):
             sys.exit(3)
         sub_id = sub["id"]
     else:
-        sub_id = cm.default_instance
+        sub_id = sync.detect_active()
+        if not sub_id:
+            click.echo("Error: no active subscription", err=True)
+            sys.exit(3)
+        sub = cm.get_subscription(sub_id)
+        sub_id = sub["id"]
+
+    if refresh:
+        click.echo(f"Fetching models for {sub['name']}...")
+        models = sync.fetch_available_models(sub_id)
+        sub = cm.get_subscription(sub_id)  # reload after update
+        if not models:
+            click.echo(f"  ✗ Fetch failed (proxy not running or no API key)")
+        else:
+            click.echo(f"  ✓ {len(models)} models cached")
+
+    available = sub.get("available_models", [])
+    blacklisted = set(sub.get("blacklisted_models", []))
+    fetched_at = sub.get("models_fetched_at")
+    fetched_str = ""
+    if fetched_at:
+        import datetime
+        fetched_str = f" (fetched {datetime.datetime.fromtimestamp(fetched_at).strftime('%Y-%m-%d %H:%M')})"
+    elif "models_fetched_at" in sub:
+        fetched_str = " (last fetch failed)"
+
+    if as_json:
+        click.echo(json.dumps({
+            "name": sub["name"],
+            "available_models": available,
+            "blacklisted_models": list(blacklisted),
+            "models_fetched_at": fetched_at,
+        }))
+        return
+
+    if not available:
+        click.echo(f"{sub['name']}: no cached models{fetched_str} — run 'cm models {sub['name']} --refresh'")
+        return
+
+    click.echo(f"{sub['name']}: {len(available)} models{fetched_str}")
+    for m in available:
+        bl_marker = "  [blacklisted]" if m in blacklisted else ""
+        click.echo(f"  {m}{bl_marker}")
+
+
+# ---------------------------------------------------------------------------
+# blacklist — manage per-subscription model blacklist
+# ---------------------------------------------------------------------------
+
+@cli.command("blacklist")
+@click.argument("name")
+@click.argument("model", required=False)
+@click.option("--remove", "remove_model", default="", help="Model ID to remove from blacklist")
+@click.option("--list", "do_list", is_flag=True, help="List blacklisted models")
+@click.option("--json", "as_json", is_flag=True)
+def cmd_blacklist(name, model, remove_model, do_list, as_json):
+    """Manage the model blacklist for a subscription.
+
+    Blacklisted models are never used by 'cm test' or the TUI Test button.
+    Edit blacklisted_models in subscriptions.json directly for bulk changes.
+
+    Examples:
+
+      cm blacklist Test claude-opus-4-6        # blacklist a model
+      cm blacklist Test --remove claude-opus-4-6
+      cm blacklist Test --list
+    """
+    cm = _cm()
+    sub = _find_sub(cm, name)
+    if not sub:
+        click.echo(f"Error: subscription '{name}' not found", err=True)
+        sys.exit(3)
+
+    if remove_model:
+        ok = cm.remove_blacklisted_model(sub["id"], remove_model)
+        if as_json:
+            click.echo(json.dumps({"ok": ok, "action": "removed", "model": remove_model}))
+        elif ok:
+            click.echo(f"Removed from blacklist: {remove_model}")
+        else:
+            click.echo(f"{remove_model} was not in blacklist")
+        return
+
+    if do_list or not model:
+        bl = cm.get_blacklisted_models(sub["id"])
+        if as_json:
+            click.echo(json.dumps({"name": sub["name"], "blacklisted_models": bl}))
+        elif bl:
+            click.echo(f"{sub['name']} blacklisted models:")
+            for m in bl:
+                click.echo(f"  {m}")
+        else:
+            click.echo(f"{sub['name']}: no blacklisted models")
+        return
+
+    ok = cm.add_blacklisted_model(sub["id"], model)
+    if as_json:
+        click.echo(json.dumps({"ok": ok, "action": "added", "model": model}))
+    else:
+        click.echo(f"Blacklisted: {model} on {sub['name']}")
+
+
+# ---------------------------------------------------------------------------
+# probe — real inference test (same as TUI "Test" button)
+# ---------------------------------------------------------------------------
+
+@cli.command("probe")
+@click.argument("name", required=False)
+@click.option("--model", default="", help="Model override (default: haiku map, then sonnet map, then claude-haiku-4-5-20251001)")
+@click.option("--json", "as_json", is_flag=True)
+def cmd_probe(name, model, as_json):
+    """Send a real inference request to a subscription's proxy.
+
+    Same as pressing the Test button in the TUI — posts a message to
+    the local proxy and shows the full API response.
+
+    NAME: subscription name or id (defaults to active subscription).
+
+    Exit code 4 if the request fails.
+    """
+    import urllib.request
+    import time as _time
+
+    cm, sync, im, fm = _managers()
+
+    if name:
+        sub = _find_sub(cm, name)
+        if not sub:
+            click.echo(f"Error: subscription '{name}' not found", err=True)
+            sys.exit(3)
+    else:
+        sub_id = sync.detect_active()
         if not sub_id:
             click.echo("Error: no active subscription", err=True)
             sys.exit(3)
         sub = cm.get_subscription(sub_id)
 
-    ok, reason = fm.test_health(sub_id)
+    port = cm.get_instance_port(sub["id"])
+    if not port:
+        click.echo(f"Error: {sub['name']} is not running (no port assigned)", err=True)
+        sys.exit(3)
+
+    probe_model = (model
+                   or sub.get("model_maps", {}).get("haiku")
+                   or sub.get("model_maps", {}).get("sonnet")
+                   or TIER_FALLBACK_MODELS["haiku"])
+    url = f"http://localhost:{port}/v1/messages"
+    payload = json.dumps({
+        "model": probe_model,
+        "max_tokens": 100,
+        "stream": False,
+        "messages": [{"role": "user", "content": "Tell me a fun fact about the universe in 2 sentences."}],
+    }).encode()
+
+    t0 = _time.time()
+    try:
+        req = urllib.request.Request(url, data=payload, method="POST", headers={
+            "Content-Type": "application/json",
+            "anthropic-version": "2023-06-01",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                code = resp.getcode()
+                raw = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            code = e.code
+            raw = e.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        click.echo(f"Connection error: {e}", err=True)
+        sys.exit(4)
+
+    elapsed = int((_time.time() - t0) * 1000)
+    ok = code == 200
+    body = extract_response_body(raw, code)
 
     if as_json:
-        port = cm.get_instance_port(sub_id)
-        click.echo(json.dumps({
-            "name": sub["name"],
-            "ok": ok,
-            "reason": reason,
-            "port": port,
-        }))
+        click.echo(json.dumps({"name": sub["name"], "ok": ok, "code": code, "elapsed_ms": elapsed, "body": body}))
     else:
         status = "OK" if ok else "FAIL"
-        click.echo(f"{sub['name']}: {status} — {reason}")
+        click.echo(f"{sub['name']}: {status} ({code}, {elapsed}ms)\n\n{body}")
 
     if not ok:
         sys.exit(4)
@@ -320,7 +584,7 @@ def cmd_failover(as_json):
     Tests active subscription; if failing, switches to next available.
     """
     cm, sync, im, fm = _managers()
-    sub_id = cm.default_instance
+    sub_id = sync.detect_active()
     if not sub_id:
         click.echo("Error: no active subscription", err=True)
         sys.exit(3)
@@ -431,8 +695,8 @@ def cmd_config(as_json):
     cm = _cm()
     sync = SyncManager(cm)
 
-    default_id = cm.default_instance
-    active_sub = cm.get_subscription(default_id) if default_id else None
+    active_id = sync.detect_active()
+    active_sub = cm.get_subscription(active_id) if active_id else None
     active_name = active_sub["name"] if active_sub else "none"
     active_auth = active_sub.get("auth_type", "?") if active_sub else "-"
 
@@ -466,7 +730,7 @@ def cmd_config(as_json):
 @click.option("--key-env", "-k", default="", help="Env var name that holds the API key")
 @click.option("--api-key", "-K", default="", help="API key value (stored directly in subscriptions.json)")
 @click.option("--auth", default="bearer", show_default=True,
-              help="Auth type: bearer | gh_token | x-goog-api-key | oauth")
+              help="Auth type: bearer | gh_token | x-goog-api-key | oauth | oauth_proxy")
 @click.option("--haiku", default="", help="Model alias for haiku tier")
 @click.option("--sonnet", default="", help="Model alias for sonnet tier")
 @click.option("--opus", default="", help="Model alias for opus tier")
@@ -497,10 +761,16 @@ def cmd_add(name, url, key_env, api_key, auth, haiku, sonnet, opus, as_json):
 
     sub = cm.add_subscription(name, url, key_env, auth_type=auth, model_maps=model_maps, api_key=api_key)
 
+    # Attempt to fetch available models immediately (silent on failure)
+    sync = SyncManager(cm)
+    models = sync.fetch_available_models(sub["id"])
+
     if as_json:
-        click.echo(json.dumps({"ok": True, "id": sub["id"], "name": sub["name"]}))
+        click.echo(json.dumps({"ok": True, "id": sub["id"], "name": sub["name"],
+                               "models_fetched": len(models)}))
     else:
-        click.echo(f"Added: {sub['name']} ({auth})")
+        model_note = f" ({len(models)} models fetched)" if models else " (model fetch failed — run 'cm models --refresh')"
+        click.echo(f"Added: {sub['name']} ({auth}){model_note}")
 
 
 # ---------------------------------------------------------------------------
@@ -550,6 +820,12 @@ def cmd_edit(name, url, key_env, auth, haiku, sonnet, opus, as_json):
         sys.exit(2)
 
     updated = cm.update_subscription(sub["id"], **updates)
+
+    # Re-fetch models if URL or auth changed
+    if "provider_url" in updates or "auth_type" in updates:
+        sync = SyncManager(cm)
+        sync.fetch_available_models(updated["id"])
+
     if as_json:
         click.echo(json.dumps({"ok": True, "name": updated["name"]}))
     else:
@@ -669,6 +945,31 @@ def cmd_active(as_json):
 
 
 # ---------------------------------------------------------------------------
+# test-tui
+# ---------------------------------------------------------------------------
+
+@cli.command("test-tui")
+def cmd_test_tui():
+    """Open TUI and exit after 1s — verify no startup crash."""
+    import sys
+    from claude_mux.tui import HeimsenseApp, ConfigManager
+
+    class _TestApp(HeimsenseApp):
+        def on_mount(self):
+            super().on_mount()
+            self.set_timer(0.5, self.exit)
+
+    cm = ConfigManager()
+    app = _TestApp(cm)
+    try:
+        app.run()
+        click.echo("✅ TUI started OK")
+    except Exception as e:
+        click.echo(f"❌ TUI crash: {e}", err=True)
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
 # init
 # ---------------------------------------------------------------------------
 
@@ -733,6 +1034,20 @@ def cmd_init(force):
         except OSError as e:
             click.echo(f"✗ Could not write {settings_path}: {e}", err=True)
             sys.exit(1)
+
+    # Fetch available models for all subscriptions
+    cm2 = _cm()
+    from claude_mux.sync import SyncManager as _SM
+    sync2 = _SM(cm2)
+    subs = cm2.subscriptions
+    if subs:
+        click.echo("\nFetching available models...")
+        for s in subs:
+            models = sync2.fetch_available_models(s["id"])
+            if models:
+                click.echo(f"  ✓ {s['name']}: {len(models)} models")
+            else:
+                click.echo(f"  ✗ {s['name']}: fetch failed (proxy not running or no API key)")
 
     click.echo("\nclaude-mux is ready. Restart Claude Code to see the status line.")
 

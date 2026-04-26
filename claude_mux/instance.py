@@ -11,6 +11,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -116,6 +117,12 @@ class InstanceManager:
         if api_key_val:
             self._set_line(lines, "ANTHROPIC_API_KEY", api_key_val)
 
+        # oauth_proxy: write proxy-specific env vars
+        if auth_type == "oauth_proxy":
+            self._set_line(lines, "PROXY_TARGET_URL", sub.get("provider_url", ""))
+            self._set_line(lines, "PROXY_AUTH_TOKEN", api_key_val or "")
+            self._set_line(lines, "PROXY_OAUTH_MODE", "1")
+
         env_path.write_text("\n".join(lines) + "\n")
         env_path.chmod(0o600)
         return env_path
@@ -145,6 +152,10 @@ class InstanceManager:
                 "Use 'Set Default' (Enter) to activate it."
             )
 
+        # oauth_proxy uses Python proxy instead of heimsense
+        is_oauth_proxy = sub.get("auth_type") == "oauth_proxy"
+        proxy_bin = str(Path(sys.executable).parent / "claude-mux-proxy") if is_oauth_proxy else self.HEIMSENSE_BIN
+
         pm2_name = self.cm.get_pm2_name(sub_id) or f"claude-mux-{sub['name']}"
 
         # Allocate port on start — always check that saved port is available
@@ -158,9 +169,9 @@ class InstanceManager:
         CLAUDE_MUX_DIR.mkdir(parents=True, exist_ok=True)
         shutil.copy2(env_path, CLAUDE_MUX_DIR / ".env")
 
-        if not Path(self.HEIMSENSE_BIN).exists():
+        if not is_oauth_proxy and not Path(proxy_bin).exists():
             raise FileNotFoundError(
-                f"heimsense binary not found at {self.HEIMSENSE_BIN}. "
+                f"heimsense binary not found at {proxy_bin}. "
                 f"Install: curl -fsSL https://raw.githubusercontent.com/cura-ai/claude-mux/main/scripts/install.sh | bash"
             )
 
@@ -171,7 +182,8 @@ class InstanceManager:
         subprocess.run(["pm2", "delete", pm2_name], capture_output=True, text=True)
 
         # Start via PM2 — bash sources .env explicitly so shell-env doesn't contaminate
-        cmd = f"set -a; source {env_path}; set +a; exec {self.HEIMSENSE_BIN} run"
+        exec_cmd = self.HEIMSENSE_BIN if not is_oauth_proxy else f"{sys.executable} -m claude_mux.proxy"
+        cmd = f"set -a; source {env_path}; set +a; exec {exec_cmd}"
         result = subprocess.run(
             [
                 "pm2", "start", "bash",
@@ -306,6 +318,7 @@ class InstanceManager:
                 if proc.get("name") == pm2_name:
                     pm2_status = proc.get("pm2_env", {}).get("status", "stopped")
                     pid = proc.get("pid")
+                    pm2_id = proc.get("pm2_env", {}).get("pm_id")
                     # PM2 uptime is start time in epoch ms → format
                     started_at = proc.get("pm2_env", {}).get("pm_uptime") or proc.get("pm2_env", {}).get("created_at")
                     uptime_str = "-"
@@ -324,6 +337,7 @@ class InstanceManager:
                     return {
                         "status": pm2_status,
                         "pm2_name": pm2_name,
+                        "pm2_id": pm2_id,
                         "pid": pid,
                         "uptime": uptime_str,
                         "monit": proc.get("monit", {}),

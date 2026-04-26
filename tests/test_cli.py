@@ -179,59 +179,67 @@ class TestStatus:
 class TestTest:
     def test_test_no_active(self, runner, tmp_dir):
         fm_mock = MagicMock()
+        sync_mock = MagicMock()
+        sync_mock.detect_active.return_value = None
         with _patch_cm(tmp_dir):
             with patch("claude_mux.cli.FailoverManager", return_value=fm_mock):
                 with patch("claude_mux.cli.InstanceManager"):
-                    with patch("claude_mux.cli.SyncManager"):
+                    with patch("claude_mux.cli.SyncManager", return_value=sync_mock):
                         result = runner.invoke(cli, ["test"])
         assert result.exit_code == 3
 
     def test_test_ok_exit_0(self, runner, tmp_dir):
         cm = _cm(tmp_dir)
-        sub = cm.add_subscription("deepseek", "http://x", "K")
-        cm._data["default_instance"] = sub["id"]
-        cm._save()
-        fm_mock = MagicMock()
-        fm_mock.test_health.return_value = (True, "HTTP 200")
+        sub = cm.add_subscription("deepseek", "http://x", "K",
+                                  model_maps={"haiku": "deepseek-chat"})
+        sync_mock = MagicMock()
+        sync_mock.detect_active.return_value = sub["id"]
+        sync_mock.resolve_model_for_tier.side_effect = lambda s, t: s.get("model_maps", {}).get(t)
+        ok_result = {"code": 200, "body": "Fun fact!", "elapsed": 100, "model": "deepseek-chat"}
         with _patch_cm(tmp_dir):
-            with patch("claude_mux.cli.FailoverManager", return_value=fm_mock):
+            with patch("claude_mux.cli.FailoverManager"):
                 with patch("claude_mux.cli.InstanceManager"):
-                    with patch("claude_mux.cli.SyncManager"):
-                        result = runner.invoke(cli, ["test"])
+                    with patch("claude_mux.cli.SyncManager", return_value=sync_mock):
+                        with patch("claude_mux.cli._inference_test", return_value=ok_result):
+                            result = runner.invoke(cli, ["test"])
         assert result.exit_code == 0
         assert "OK" in result.output
 
     def test_test_fail_exit_4(self, runner, tmp_dir):
         cm = _cm(tmp_dir)
-        sub = cm.add_subscription("deepseek", "http://x", "K")
-        cm._data["default_instance"] = sub["id"]
-        cm._save()
-        fm_mock = MagicMock()
-        fm_mock.test_health.return_value = (False, "HTTP 429")
+        sub = cm.add_subscription("deepseek", "http://x", "K",
+                                  model_maps={"haiku": "deepseek-chat"})
+        sync_mock = MagicMock()
+        sync_mock.detect_active.return_value = sub["id"]
+        sync_mock.resolve_model_for_tier.side_effect = lambda s, t: s.get("model_maps", {}).get(t)
+        fail_result = {"code": 429, "body": "Rate limited", "elapsed": 50, "model": "deepseek-chat"}
         with _patch_cm(tmp_dir):
-            with patch("claude_mux.cli.FailoverManager", return_value=fm_mock):
+            with patch("claude_mux.cli.FailoverManager"):
                 with patch("claude_mux.cli.InstanceManager"):
-                    with patch("claude_mux.cli.SyncManager"):
-                        result = runner.invoke(cli, ["test"])
+                    with patch("claude_mux.cli.SyncManager", return_value=sync_mock):
+                        with patch("claude_mux.cli._inference_test", return_value=fail_result):
+                            result = runner.invoke(cli, ["test"])
         assert result.exit_code == 4
         assert "FAIL" in result.output
 
     def test_test_json_output(self, runner, tmp_dir):
         cm = _cm(tmp_dir)
-        sub = cm.add_subscription("deepseek", "http://x", "K")
-        cm._data["default_instance"] = sub["id"]
-        cm._save()
-        fm_mock = MagicMock()
-        fm_mock.test_health.return_value = (True, "HTTP 200")
+        sub = cm.add_subscription("deepseek", "http://x", "K",
+                                  model_maps={"haiku": "deepseek-chat"})
+        sync_mock = MagicMock()
+        sync_mock.detect_active.return_value = sub["id"]
+        sync_mock.resolve_model_for_tier.side_effect = lambda s, t: s.get("model_maps", {}).get(t)
+        ok_result = {"code": 200, "body": "Fun fact!", "elapsed": 100, "model": "deepseek-chat"}
         with _patch_cm(tmp_dir):
-            with patch("claude_mux.cli.FailoverManager", return_value=fm_mock):
+            with patch("claude_mux.cli.FailoverManager"):
                 with patch("claude_mux.cli.InstanceManager"):
-                    with patch("claude_mux.cli.SyncManager"):
-                        result = runner.invoke(cli, ["test", "--json"])
+                    with patch("claude_mux.cli.SyncManager", return_value=sync_mock):
+                        with patch("claude_mux.cli._inference_test", return_value=ok_result):
+                            result = runner.invoke(cli, ["test", "--json"])
         assert result.exit_code == 0
         data = json.loads(result.output)
-        assert data["ok"] is True
         assert data["name"] == "deepseek"
+        assert data["results"][0]["ok"] is True
 
 
 class TestFailoverLog:

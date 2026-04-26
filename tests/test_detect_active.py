@@ -15,6 +15,10 @@ def cm(tmp_path):
 def sync(cm, tmp_path, monkeypatch):
     s = SyncManager(cm)
     monkeypatch.setattr(SyncManager, "SETTINGS_PATH", tmp_path / "settings.json")
+    # Prevent real claude CLI from interfering — unit tests use settings.json fallback only
+    import claude_mux.sync as _sync_mod
+    monkeypatch.setattr(_sync_mod.subprocess, "run",
+        lambda *a, **kw: type("R", (), {"returncode": 1, "stdout": ""})())
     return s
 
 

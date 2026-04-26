@@ -14,6 +14,7 @@ def tmp_setup():
     d = Path(tempfile.mkdtemp())
     cm = hs.ConfigManager(data_file=d / "subscriptions.json")
     sync = MagicMock()
+    sync.detect_active.return_value = None
     fm = hs.FailoverManager(cm, sync)
     fm.FAILOVER_LOG = d / "failover.log"  # isolate from ~/.claude-mux/failover.log
     yield cm, sync, fm

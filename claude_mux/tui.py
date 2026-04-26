@@ -31,7 +31,7 @@ from claude_mux.config import (  # noqa: E402
     ConfigManager,
 )
 from claude_mux.instance import InstanceManager, _format_duration  # noqa: E402
-from claude_mux.sync import SyncManager  # noqa: E402
+from claude_mux.sync import SyncManager, TIER_FALLBACK_MODELS, extract_response_body  # noqa: E402
 from claude_mux.failover import FailoverManager  # noqa: E402
 
 import json
@@ -59,14 +59,36 @@ try:
     from textual.app import App, ComposeResult
     from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
     from textual.screen import ModalScreen, Screen
-    from textual.widgets import Button, DataTable, Footer, Input, Label, ProgressBar, RichLog, Select, Static
+    from textual.widgets import Button, DataTable, Footer, Input, Label, ProgressBar, RichLog, Select, Static, TextArea
     from textual.worker import Worker, WorkerState
     from rich.text import Text
     from rich.markup import escape
+    from rich.table import Table as RichTable
 
     _HAS_TEXTUAL = True
 except ImportError:
     _HAS_TEXTUAL = False
+
+
+def _detail_table(rows: list) -> "RichTable":
+    """Build a borderless two-column grid for detail panel key/value rows.
+
+    Each row is either:
+    - (label, value)  — label rendered bold-dim, colon appended automatically;
+                        value may be a str (treated as Rich markup), Text, or any renderable
+    - None            — blank separator row
+    """
+    t = RichTable.grid(padding=(0, 2))
+    t.add_column(style="bold dim", no_wrap=True)
+    t.add_column(overflow="fold")
+    for row in rows:
+        if row is None:
+            t.add_row("", "")
+        else:
+            label, value = row
+            cell = value if isinstance(value, Text) else Text.from_markup(str(value))
+            t.add_row(f"{label}:", cell)
+    return t
 
 
 def _status_char(status: str) -> str:
@@ -101,7 +123,9 @@ def _time_ago(iso_ts) -> str:
 # --- Model Test popup ---
 
 class HealthPopup(ModalScreen):
-    """Show model response."""
+    """Show model response with selectable body text."""
+
+    BINDINGS = [("escape", "dismiss", "Close")]
 
     def __init__(self, label: str, status_code: int, elapsed_ms: int, body: str):
         super().__init__()
@@ -111,14 +135,73 @@ class HealthPopup(ModalScreen):
         self._body = body
 
     def compose(self) -> ComposeResult:
-        yield Static(
-            f"[bold]{self._label}[/bold]  ([dim]{self._elapsed}ms[/dim])\n\n"
-            f"{self._body[:500]}"
-        )
-        yield Button("OK", id="ok", variant="primary")
+        with Vertical(id="health-popup-box"):
+            yield Static(
+                f"[bold]{self._label}[/bold]  ([dim]{self._elapsed}ms[/dim])",
+                id="health-popup-header",
+            )
+            yield TextArea(self._body[:2000], read_only=True, id="health-popup-body")
+            with Horizontal(id="health-popup-buttons"):
+                yield Button("Copy", id="copy", variant="default")
+                yield Button("OK", id="ok", variant="primary")
 
     def on_button_pressed(self, event: Button.Pressed):
-        self.dismiss()
+        if event.button.id == "copy":
+            self._do_copy()
+        else:
+            self.dismiss()
+
+    def _do_copy(self):
+        import os, subprocess, tempfile
+        # Strategy 1: OSC 52 (works in SSH / native terminals / Blink)
+        self.app.copy_to_clipboard(self._body)
+        # Strategy 2: open in VS Code editor if running inside VS Code / code-server
+        if os.environ.get("TERM_PROGRAM") == "vscode" or os.environ.get("VSCODE_IPC_HOOK_CLI"):
+            tmp = CLAUDE_MUX_DIR / "last-response.txt"
+            try:
+                tmp.write_text(self._body)
+                subprocess.Popen(["code", str(tmp)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.app.notify(f"Opened in VS Code editor — use CTRL+A, CTRL+C there", timeout=4)
+                return
+            except OSError:
+                pass
+        # Fallback: save to file and show path
+        tmp = CLAUDE_MUX_DIR / "last-response.txt"
+        try:
+            tmp.write_text(self._body)
+            self.app.notify(f"Saved to {tmp}\n(OSC 52 also sent — works in SSH/Blink)", timeout=5)
+        except OSError:
+            self.app.notify("Copied via OSC 52 (works in SSH/native terminals)", timeout=3)
+
+    CSS = """
+    HealthPopup {
+        align: center middle;
+    }
+    #health-popup-box {
+        width: 70;
+        height: auto;
+        max-height: 24;
+        border: solid $primary;
+        padding: 1 2;
+        background: $surface;
+    }
+    #health-popup-header {
+        height: auto;
+        margin-bottom: 1;
+    }
+    #health-popup-body {
+        height: 12;
+        width: 100%;
+    }
+    #health-popup-buttons {
+        height: auto;
+        align: right middle;
+        margin-top: 1;
+    }
+    #health-popup-buttons > Button {
+        margin-left: 1;
+    }
+    """
 
 
 # --- Name input modal (used for saving *current settings) ---
@@ -1318,14 +1401,15 @@ class HeimsenseApp(App):
         height: 1fr;
         border: solid $primary;
     }
-    DataTable > .datatable--cursor {
-        background: $accent;
-        color: $text;
+    DataTable.instance-list > .datatable--header {
+        display: none;
     }
-    DataTable > .datatable--cursor .text-green { color: green; }
-    DataTable > .datatable--cursor .text-red { color: red; }
-    DataTable > .datatable--cursor .text-yellow { color: yellow; }
-    DataTable > .datatable--cursor .text-gray { color: gray; }
+    DataTable:focus {
+        background-tint: $foreground 0%;
+    }
+    DataTable > .datatable--cursor {
+        background: $panel;
+    }
     Vertical.list-panel {
         width: 45%;
         height: 100%;
@@ -1348,7 +1432,7 @@ class HeimsenseApp(App):
         height: 1;
         width: 100%;
         padding: 0 1;
-        background: $primary;
+        background: $panel;
         color: $text;
         text-align: left;
     }
@@ -1361,6 +1445,14 @@ class HeimsenseApp(App):
     }
     #filter-input.active {
         display: block;
+    }
+    #providers-label {
+        height: 1;
+        width: 100%;
+        padding: 0 1;
+        background: $primary;
+        color: $text;
+        text-style: bold;
     }
     #script-age {
         height: 1;
@@ -1429,6 +1521,7 @@ class HeimsenseApp(App):
         yield Static(id="app-header", markup=True)
         with Horizontal():
             with Vertical(classes="list-panel"):
+                yield Static("[bold]Providers[/bold]", id="providers-label")
                 yield Input(placeholder="Filter providers…", id="filter-input")
                 yield DataTable(classes="instance-list", id="inst-table")
                 yield Button(Text.from_markup("[bold yellow]+[/bold yellow] Add Provider"), id="add", variant="primary", classes="add-btn")
@@ -1448,7 +1541,9 @@ class HeimsenseApp(App):
     def on_mount(self):
         table = self.query_one("#inst-table", DataTable)
         table.cursor_type = "row"
-        table.zebra_stripes = True
+        table.zebra_stripes = False
+        table.show_header = False
+        table.cursor_foreground_priority = "renderable"
         table.add_column("", width=1)   # status dot — minimal width, no header
         table.add_column("Name")
         self._refresh_table()
@@ -1457,7 +1552,7 @@ class HeimsenseApp(App):
             self._selected_id = self._initial_selected
             # Find row index for selected sub and set cursor
             for row_idx, sub in enumerate(sorted(self.cm.subscriptions, key=lambda s: (
-                0 if s["id"] == self.cm.default_instance else 1,
+                0 if s["id"] == self._active_id else 1,
                 s["name"].lower(),
             ))):
                 if sub["id"] == self._initial_selected:
@@ -1470,6 +1565,7 @@ class HeimsenseApp(App):
         # Context-sensitive is now controlled by _show_detail (called via _refresh_table cursor)
         # Auto-reload: check every 3 seconds if the script has changed on disk
         self._script_mtime = os.stat(os.path.abspath(__file__)).st_mtime
+        self._hotload_debounce_ts: float | None = None  # first mtime change detection
         self.set_interval(3, self._check_hotload)
         # Update table every 5 seconds (PM2 log scanning)
         self.set_interval(5, self._refresh_table)
@@ -1481,6 +1577,8 @@ class HeimsenseApp(App):
         self.set_interval(300, self._background_health_check)
         # Hint: suggest running claude-mux init if statusLine is not configured
         self.call_after_refresh(self._check_init_hint)
+        # Ensure the instance list has initial focus so j/k/n/p works immediately
+        self.query_one("#inst-table", DataTable).focus()
 
     def _check_init_hint(self):
         """Show a one-time hint if claude-mux init has not been run yet."""
@@ -1497,12 +1595,35 @@ class HeimsenseApp(App):
             new_mtime = os.stat(os.path.abspath(__file__)).st_mtime
             if new_mtime != self._script_mtime:
                 self._script_mtime = new_mtime
-                self.push_screen(HotloadModal(), self._on_hotload_result)
+                self._hotload_debounce_ts = time.time()
+            elif self._hotload_debounce_ts is not None:
+                # Stable for 42s → show modal
+                if time.time() - self._hotload_debounce_ts >= 42:
+                    self._hotload_debounce_ts = None
+                    self.push_screen(HotloadModal(), self._on_hotload_result)
         except Exception:
             pass
 
     def _on_hotload_result(self, do_reload: bool):
         if do_reload:
+            log.info("Hotload: running test-tui before reload...")
+            try:
+                result = subprocess.run(
+                    ["claude-mux", "test-tui"],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if result.returncode != 0:
+                    err = (result.stderr.strip() or result.stdout.strip()
+                           or "unknown error")
+                    self.notify(f"❌ test-tui failed: {err}", timeout=10)
+                    return
+            except FileNotFoundError:
+                self.notify("❌ claude-mux not found in PATH — cannot validate",
+                            timeout=5)
+                return
+            except Exception as e:
+                self.notify(f"❌ test-tui error: {e}", timeout=5)
+                return
             log.info("Hotload: restarting...")
             args = [sys.executable, os.path.abspath(__file__), "--tui"]
             if self._selected_id:
@@ -1557,7 +1678,7 @@ class HeimsenseApp(App):
     # --- Table ---
 
     # Auth-type colour palette
-    _AUTH_COLORS = {"oauth": "cyan", "direct": "yellow", "gh_token": "magenta"}
+    _AUTH_COLORS = {"oauth": "cyan", "oauth_proxy": "cyan", "direct": "yellow", "gh_token": "magenta"}
 
     def _refresh_table(self):
         """Refresh DataTable with subscriptions + test status."""
@@ -1566,10 +1687,9 @@ class HeimsenseApp(App):
         prev_cursor = table.cursor_row if table.row_count > 0 else None
         table.clear()
         self._sorted_rows = []
-        default_id = self.cm.default_instance
         self._active_id = self.sync.detect_active()
         sorted_subs = sorted(self.cm.subscriptions, key=lambda s: (
-            0 if s["id"] == default_id else 1,
+            0 if s["id"] == self._active_id else 1,
             s["name"].lower(),
         ))
         # Apply live filter
@@ -1585,16 +1705,16 @@ class HeimsenseApp(App):
             status = status_info.get("status", "unknown")
             is_failed = sub_id in self.failover._failed_subs
             name_txt = sub["name"] + (" ⚠" if is_failed else "")
-            # Colour by auth type; bold for default; red for failed
+            # Colour by auth type; bold for active; red for failed
             if is_failed:
-                name_style = "bold red" if sub_id == default_id else "red"
+                name_style = "bold red" if sub_id == self._active_id else "red"
             else:
                 auth_color = self._AUTH_COLORS.get(auth_type, "")
-                name_style = f"bold {auth_color}".strip() if sub_id == default_id else auth_color
+                name_style = f"bold {auth_color}".strip() if sub_id == self._active_id else auth_color
             name = Text(name_txt, style=name_style)
-            # Mark the subscription that is currently active in Claude
+            # Mark the subscription that is currently active in Claude with prefix
             if sub_id == self._active_id:
-                name.append(" ●", style="bold green")
+                name = Text("▶ ", style="bold green") + name
 
             if is_oauth:
                 oauth_token = sub.get("api_key", "")
@@ -1626,8 +1746,7 @@ class HeimsenseApp(App):
         # Virtual *current settings row — shown when Claude's active settings
         # don't match any saved subscription (hidden when filter is active)
         if self._active_id is None and self.cm.subscriptions and not flt:
-            virtual_name = Text("*current settings", style="dim italic")
-            virtual_name.append(" ●", style="bold green")
+            virtual_name = Text("▶ ", style="bold green") + Text("*current settings", style="dim italic")
             cur_result = self._test_results.get("__current__")
             if cur_result is None:
                 cur_status = Text("?", style="dim")
@@ -1692,21 +1811,28 @@ class HeimsenseApp(App):
         else:
             test_line = f"[red]✖ {cur_result['code']}[/red] — {cur_result['body']}"
 
-        detail.update(
-            "[bold yellow]*current settings[/bold yellow]\n\n"
-            "[dim]Claude is using settings not saved in claude-mux.[/dim]\n\n"
-            f"Auth:         {auth_display}\n"
-            f"Base URL:     {base_url or '(none)'}\n"
-            f"Key:          {key_display}\n"
-            f"\n"
-            f"Model Haiku:  {haiku}\n"
-            f"Model Sonnet: {sonnet}\n"
-            f"Model Opus:   {opus}\n"
-            f"\n"
-            f"Status:       {test_line}\n"
-            f"\n"
-            "[dim]Press [bold]e[/bold] to save as subscription · [bold]t[/bold] to test.[/dim]"
-        )
+        from rich.console import Group as RichGroup
+        tbl = _detail_table([
+            ("Auth", auth_display),
+            ("Base URL", base_url or "(none)"),
+            ("Key", key_display),
+            None,
+            ("Haiku", haiku),
+            ("Sonnet", sonnet),
+            ("Opus", opus),
+            None,
+            ("Status", test_line),
+        ])
+        detail.update(RichGroup(
+            Text.from_markup(
+                "[bold yellow]*current settings[/bold yellow]\n\n"
+                "[dim]Claude is using settings not saved in claude-mux.[/dim]\n\n"
+            ),
+            tbl,
+            Text.from_markup(
+                "\n[dim]Press [bold]e[/bold] to save as subscription · [bold]t[/bold] to test.[/dim]"
+            ),
+        ))
         # Show Save as... and Test buttons; hide the rest
         for btn_id in ("toggle", "launch", "reauth", "force_model", "logs"):
             self.query_one(f"#{btn_id}", Button).display = False
@@ -1740,10 +1866,13 @@ class HeimsenseApp(App):
                 return
             self.notify("Testing current proxy settings...", title="Test", timeout=2)
             t0 = time.time()
-            result = self._run_proxy_test(port, auth_token, "claude-sonnet-4-5")
+            result = self._run_proxy_test(port, auth_token, TIER_FALLBACK_MODELS["haiku"])
             elapsed = int((time.time() - t0) * 1000)
             status_code, reply = result["code"], result["body"]
-            self.push_screen(HealthPopup("*current settings — response", status_code, elapsed, reply))
+            if status_code == 200:
+                self.notify(f"OK ({elapsed}ms) — {reply[:120]}", title="*current settings — Test", timeout=8)
+            else:
+                self.push_screen(HealthPopup("*current settings — error", status_code, elapsed, reply))
             self._test_results["__current__"] = {"code": status_code, "body": reply, "ts": time.time()}
             self._refresh_table()
             self._show_detail()
@@ -1781,10 +1910,6 @@ class HeimsenseApp(App):
         # 2. Events from failover.log — parsing delegated to FailoverManager
         events.extend(self.failover.recent_events(sub_name, since=cutoff))
 
-        # 3. Last activated — approximate from sync (best effort)
-        if self.cm.default_instance == sub_id:
-            events.append((time.time(), "[green]● Active now[/green]"))
-
         events = [(ts, label) for ts, label in events if ts >= cutoff]
         if not events:
             return ""
@@ -1792,8 +1917,11 @@ class HeimsenseApp(App):
         events.sort(key=lambda e: e[0], reverse=True)
         lines = []
         for ts, label in events[:3]:
-            ago = _time_ago(ts)
-            lines.append(f"  {label}  [dim]{ago}[/dim]")
+            if ts == float("inf"):
+                lines.append(f"  {label}")
+            else:
+                ago = _time_ago(ts)
+                lines.append(f"  {label}  [dim]{ago}[/dim]")
 
         # Separator width adapts to detail panel (~50 chars typical; 40 is safe minimum)
         try:
@@ -1835,21 +1963,22 @@ class HeimsenseApp(App):
             detail.update("[red]Subscription not found[/red]")
             return
         self._set_context_sensitive(True)
+        # Auto-fetch available models if never fetched for this sub
+        if not sub.get("available_models") and "models_fetched_at" not in sub:
+            self._fetch_models_bg(sub_id)
         status_info = self.im.get_status(sub_id)
         status = status_info.get("status", "unknown")
         sc = _status_color(status)
-        is_default = sub_id == self.cm.default_instance
         is_active_now = sub_id == self._active_id
         if is_active_now:
-            default_badge = " [bold green]● Active[/bold green]"
-        elif is_default:
-            default_badge = " [dim](default)[/dim]"
+            default_badge = " [bold green]▶ Active[/bold green]"
         else:
             default_badge = ""
         is_oauth = sub.get("auth_type") in ("oauth", "direct")
         pid = status_info.get("pid") or "-"
         uptime = status_info.get("uptime") or "-"
         port = self.cm.get_instance_port(sub_id) or "?"
+        pm2_name = self.cm.get_pm2_name(sub_id)
 
         # Update toggle button: Start (stopped) / Stop (online)
         toggle_btn = self.query_one("#toggle", Button)
@@ -1897,16 +2026,29 @@ class HeimsenseApp(App):
         model_maps = sub.get("model_maps", {})
 
         # Always show subscription's model_maps — overrides only affect Force line (if default)
-        haiku_display = model_maps.get('haiku', '-')
-        sonnet_display = model_maps.get('sonnet', '-')
-        opus_display = model_maps.get('opus', '-')
-        is_default = sub_id == self.cm.default_instance
-        is_forced = (is_default and sonnet_override and sonnet_override == haiku_override == opus_override
+        haiku_display = model_maps.get('haiku', '').strip()
+        sonnet_display = model_maps.get('sonnet', '').strip()
+        opus_display = model_maps.get('opus', '').strip()
+        is_active = sub_id == self._active_id
+        is_forced = (is_active and sonnet_override and sonnet_override == haiku_override == opus_override
                      and sonnet_override not in model_maps.values())
-        force_line = f"[yellow]Force: {sonnet_override}[/yellow]" if is_forced else "[dim]Force: none[/dim]"
+        from rich.console import Group as RichGroup
 
-        notes_line = ("\nNotes:       " + sub.get("notes", "")) if sub.get("notes", "").strip() else ""
+        # Available models summary value
+        available_models = sub.get("available_models", [])
+        blacklisted_models = sub.get("blacklisted_models", [])
+        if available_models:
+            bl_count = len(blacklisted_models)
+            bl_note = f" ({bl_count} blacklisted)" if bl_count else ""
+            models_val = f"{len(available_models)} available{bl_note}"
+        elif "models_fetched_at" in sub:
+            models_val = "[dim]fetch failed[/dim]"
+        else:
+            models_val = "[dim]fetching…[/dim]"
+
+        header_txt = Text.from_markup(f"[bold]{escape(sub['name'])}[/bold]{default_badge}\n\n")
         event_log = self._build_event_log(sub["name"], sub_id)
+        event_txt = Text.from_markup(event_log) if event_log else Text("")
 
         if is_oauth:
             auth_type = sub.get("auth_type", "oauth")
@@ -1917,42 +2059,54 @@ class HeimsenseApp(App):
                 provider_label = "Claude Max (OAuth)"
             oauth_token = sub.get("api_key", "")
             token_prefix = oauth_token[:8] + "..." if oauth_token else "[red]not set[/red]"
-            detail.update(
-                f"[bold]{sub['name']}[/bold]{default_badge}\n\n"
-                f"Provider:    {provider_label}\n"
-                f"Token:       {token_prefix}\n"
-                f"\n"
-                f"Model Haiku:  {haiku_display}\n"
-                f"Model Sonnet: {sonnet_display}\n"
-                f"Model Opus:   {opus_display}\n"
-                f"{force_line}"
-                f"{notes_line}"
-                f"{event_log}"
-            )
+            rows = [
+                ("Provider", provider_label),
+                ("Token", token_prefix),
+            ]
+            model_rows = [(t, v) for t, v in [("Haiku", haiku_display), ("Sonnet", sonnet_display), ("Opus", opus_display)] if v]
+            if model_rows:
+                rows.append(None)
+                rows.extend(model_rows)
+            if is_forced:
+                rows.append(("Force", f"[yellow]{escape(sonnet_override)}[/yellow]"))
+            rows.append(("Models", models_val))
+            if sub.get("notes", "").strip():
+                rows.append(("Notes", escape(sub["notes"])))
+            detail.update(RichGroup(header_txt, _detail_table(rows), event_txt))
         else:
             provider_url = sub.get('provider_url', '-')
             provider_label = PROVIDER_URL_LABELS.get(provider_url, provider_url) or provider_url
             api_key_val = sub.get('api_key', '')
-            key_line = f"Token:       {api_key_val[:12]}..." if api_key_val else f"API Key env: {sub.get('api_key_env', '-')}"
-            port_line = f"Port:        {port}\n" if port and is_online else ""
-            detail.update(
-                f"[bold]{sub['name']}[/bold]{default_badge}\n\n"
-                f"Provider:    {provider_label}\n"
-                f"Status:      [{sc}]{status}[/{sc}] (PID: {pid})\n"
-                f"{port_line}"
-                f"Auth:        {sub.get('auth_type', 'bearer')}\n"
-                f"{key_line}\n"
-                f"\n"
-                f"Model Haiku:  {haiku_display}\n"
-                f"Model Sonnet: {sonnet_display}\n"
-                f"Model Opus:   {opus_display}\n"
-                f"{force_line}\n"
-                f"\n"
-                f"Uptime:      {uptime}\n"
-                f"Last HTTP:   {http_line}"
-                f"{notes_line}"
-                f"{event_log}"
-            )
+            pm2_id = status_info.get("pm2_id")
+            pm2_label = f" (PM2 id {pm2_id})" if pm2_id is not None else ""
+            pm2_name = status_info.get("pm2_name")
+            rows = [
+                ("Provider", provider_label),
+                ("Status", f"[{sc}]{status}[/{sc}]{pm2_label}"),
+            ]
+            if port and is_online:
+                rows.append(("Port", str(port)))
+            if pm2_name:
+                rows.append(("PM2", pm2_name))
+            if api_key_val:
+                rows.append(("Token", api_key_val[:12] + "..."))
+            else:
+                rows.append(("API Key env", sub.get('api_key_env', '-')))
+            model_rows = [(t, v) for t, v in [("Haiku", haiku_display), ("Sonnet", sonnet_display), ("Opus", opus_display)] if v]
+            if model_rows:
+                rows.append(None)
+                rows.extend(model_rows)
+            if is_forced:
+                rows.append(("Force", f"[yellow]{escape(sonnet_override)}[/yellow]"))
+            rows += [
+                ("Models", models_val),
+                None,
+                ("PM2 uptime", uptime),
+                ("Last HTTP", http_line),
+            ]
+            if sub.get("notes", "").strip():
+                rows.append(("Notes", escape(sub["notes"])))
+            detail.update(RichGroup(header_txt, _detail_table(rows), event_txt))
 
     def _on_data_table_row_highlighted(self, event: DataTable.RowHighlighted):
         """Arrow keys → update details."""
@@ -1988,7 +2142,7 @@ class HeimsenseApp(App):
                 target_id = self._sorted_rows[row_idx]
                 if target_id != "__current__":
                     table.move_cursor(row=row_idx)
-                    self._do_set_default(target_id)
+                    self._do_activate(target_id)
                     event.stop()
 
     def _close_filter(self):
@@ -2013,6 +2167,10 @@ class HeimsenseApp(App):
 
     # --- Actions ---
 
+    def _run_proxy_inference(self, sub: dict, model: str, auth_type: str) -> dict:
+        """Delegate to SyncManager.inference_test — single implementation shared w/ CLI."""
+        return self.sync.inference_test(sub, model)
+
     @staticmethod
     def _run_proxy_test(port: int, api_key: str, model: str) -> dict:
         """Call proxy port exactly as Claude Code would.
@@ -2024,6 +2182,7 @@ class HeimsenseApp(App):
         payload = json.dumps({
             "model": model,
             "max_tokens": 100,
+            "stream": False,
             "messages": [{"role": "user", "content": "Tell me a fun fact about the universe in 2 sentences."}],
         })
         start_ts = time.time()
@@ -2039,21 +2198,14 @@ class HeimsenseApp(App):
                 method="POST",
             )
             try:
-                with urllib.request.urlopen(req, timeout=15) as resp:
+                with urllib.request.urlopen(req, timeout=30) as resp:
                     http_code = resp.getcode()
                     raw = resp.read().decode("utf-8", errors="replace")
             except urllib.error.HTTPError as http_err:
                 http_code = http_err.code
                 raw = http_err.read().decode("utf-8", errors="replace")
             elapsed = int((time.time() - start_ts) * 1000)
-            if http_code == 200:
-                try:
-                    data = json.loads(raw)
-                    body = data.get("content", [{}])[0].get("text", raw)[:500]
-                except Exception:
-                    body = raw[:500]
-            else:
-                body = raw[:500]
+            body = extract_response_body(raw, http_code)
             log.info("Test %s: HTTP %d (%dms)", model, http_code, elapsed)
             return {"code": http_code, "body": body, "elapsed": elapsed}
         except Exception as e:
@@ -2061,7 +2213,7 @@ class HeimsenseApp(App):
             log.warning("Test failed for port %s: %s (%dms)", port, e, elapsed)
             return {"code": 0, "body": f"Error: {e}", "elapsed": elapsed}
 
-    def action_test(self):
+    async def action_test(self):
         """Test the selected subscription via HTTP health check.
 
         oauth/direct: GET /v1/models against the provider API directly.
@@ -2083,54 +2235,54 @@ class HeimsenseApp(App):
 
         auth_type = sub.get("auth_type", "bearer")
 
-        if auth_type in ("oauth", "direct"):
-            self.notify(f"Testing {sub['name']}...", title="Test", timeout=2)
-            t0 = time.time()
-            ok, reason = self.failover.test_health(sub_id)
-            elapsed = int((time.time() - t0) * 1000)
-            status_code = 200 if ok else 401
-            reply = reason
-            self.push_screen(HealthPopup(f"{sub['name']} — response", status_code, elapsed, reply))
+        # Determine which (tier, model) pairs to test — uses shared TIER_FALLBACK_MODELS
+        tiers_to_test = []
+        for tier in ("haiku", "sonnet", "opus"):
+            model = self.sync.resolve_model_for_tier(sub, tier) or TIER_FALLBACK_MODELS[tier]
+            tiers_to_test.append((tier, model))
+
+        self.notify(f"Testing {sub['name']} ({len(tiers_to_test)} tiers)…", title="Test", timeout=3)
+
+        def _do_tests():
+            results = []
+            for tier, model in tiers_to_test:
+                result = self._run_proxy_inference(sub, model, auth_type)
+                results.append((tier, model, result))
+            return results
+
+        def _on_done(results):
+            any_fail = False
+            last_result = None
+            for tier, model, result in results:
+                ok = result["code"] == 200
+                if not ok:
+                    any_fail = True
+                last_result = result
+                title = f"{sub['name']} [{tier}]"
+                if ok:
+                    self.notify(
+                        f"{model} — OK ({result['elapsed']}ms)\n{result['body'][:100]}",
+                        title=title, timeout=8
+                    )
+                else:
+                    self.notify(
+                        f"{model} — FAIL (HTTP {result['code']}): {result['body'][:80]}",
+                        title=title, severity="error", timeout=10
+                    )
+            # Save aggregate result
+            best = next((r for _, _, r in results if r["code"] == 200), None) or (results[-1][2] if results else {})
             self._test_results[sub_id] = {
-                "code": status_code,
-                "body": reply,
+                "code": best.get("code", 0),
+                "body": best.get("body", ""),
                 "ts": time.time(),
             }
             self._refresh_table()
             self._show_detail()
-            return
 
-        port = self.cm.get_instance_port(sub_id) or 0
-        if not port:
-            self.notify("Start the instance first (port not assigned)", title="Test", timeout=3)
-            return
-
-        model = (sub.get("model_maps", {}).get("sonnet")
-                 or sub.get("model_maps", {}).get("haiku") or "claude-sonnet-4-5")
-
-        # Get API key for claude-mux proxy (it uses ANTHROPIC_AUTH_TOKEN)
-        settings_env = self.sync._load_settings().get("env", {})
-        api_key = settings_env.get("ANTHROPIC_AUTH_TOKEN", "")
-        if not api_key and auth_type == "gh_token":
-            try:
-                gh_r = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, timeout=10)
-                api_key = gh_r.stdout.strip() if gh_r.returncode == 0 else "dummy"
-            except Exception:
-                api_key = "dummy"
-
-        self.notify(f"Testing {sub['name']} on port {port}...", title="Test", timeout=2)
-        result = self._run_proxy_test(port, api_key, model)
-        status_code, reply, elapsed = result["code"], result["body"], result["elapsed"]
-
-        self.push_screen(HealthPopup(f"{sub['name']} — response", status_code, elapsed, reply))
-        # Save test result to detail panel
-        self._test_results[sub_id] = {
-            "code": status_code,
-            "body": reply,
-            "ts": time.time(),
-        }
-        self._refresh_table()
-        self._show_detail()
+        worker = self.run_worker(_do_tests, thread=True, description=f"test-{sub['name']}")
+        await worker.wait()
+        if worker.result:
+            _on_done(worker.result)
 
     def action_start(self):
         """Start claude-mux for selected subscription."""
@@ -2166,7 +2318,7 @@ class HeimsenseApp(App):
 
     def action_launch(self):
         """Sync: generate .env + sync settings for selected subscription."""
-        sub_id = self._selected_id or self.cm.default_instance
+        sub_id = self._selected_id or self._active_id
         if not sub_id:
             self.notify("Select a subscription", title="Sync", timeout=3)
             return
@@ -2229,8 +2381,8 @@ class HeimsenseApp(App):
             return
         self.push_screen(LogViewer(pm2_name))
 
-    async def action_set_default(self):
-        """Set selected subscription as default — health-check first, confirm if failing."""
+    async def action_activate(self):
+        """Activate selected subscription — health-check first, confirm if failing."""
         import asyncio
         sub_id = self._selected_id
         if not sub_id or sub_id == "__current__":
@@ -2238,9 +2390,9 @@ class HeimsenseApp(App):
         sub = self.cm.get_subscription(sub_id)
         if not sub:
             return
-        current_default = self.cm.default_instance
+        current_active = self._active_id
         # Already active — just refresh
-        if current_default == sub_id:
+        if current_active == sub_id:
             self.notify(f"{sub['name']} is already active", timeout=3)
             return
 
@@ -2256,20 +2408,20 @@ class HeimsenseApp(App):
                 f"Activate anyway?"
             )
             confirm = ConfirmModal("Activate anyway?", msg)
-            self.push_screen(confirm, lambda result, sid=sub_id: self._do_set_default(sid) if result else None)
+            self.push_screen(confirm, lambda result, sid=sub_id: self._do_activate(sid) if result else None)
             return
 
         # Check passed — confirm if displacing another active provider
-        if current_default and current_default != sub_id:
-            cur_sub = self.cm.get_subscription(current_default)
-            cur_name = cur_sub["name"] if cur_sub else current_default
+        if current_active and current_active != sub_id:
+            cur_sub = self.cm.get_subscription(current_active)
+            cur_name = cur_sub["name"] if cur_sub else current_active
             msg = f"Switch active provider?\n\nFrom: {cur_name}\nTo: {sub['name']}"
             confirm = ConfirmModal("Switch Provider", msg)
-            self.push_screen(confirm, lambda ok, sid=sub_id: self._do_set_default(sid) if ok else None)
+            self.push_screen(confirm, lambda ok, sid=sub_id: self._do_activate(sid) if ok else None)
         else:
-            self._do_set_default(sub_id)
+            self._do_activate(sub_id)
 
-    def _do_set_default(self, sub_id: str):
+    def _do_activate(self, sub_id: str):
         """Execute provider switch after optional confirmation."""
         try:
             self.sync.sync_default(sub_id)
@@ -2279,6 +2431,10 @@ class HeimsenseApp(App):
             self.notify(f"Error: {e}", severity="error", timeout=5)
         self._refresh_table()
         self._show_detail()
+        # Fetch models in background if not yet cached
+        sub = self.cm.get_subscription(sub_id)
+        if sub and not sub.get("available_models"):
+            self._fetch_models_bg(sub_id)
 
     def action_delete(self):
         """Delete selected subscription (confirm first)."""
@@ -2383,10 +2539,12 @@ class HeimsenseApp(App):
             # Apply force_model to settings.json if this sub is the active one
             force_model = result.get("force_model", "__none__")
             sub_id = result["id"]
-            if sub_id == self._active_id or sub_id == self.cm.default_instance:
+            if sub_id == self._active_id:
                 self._apply_force_model(sub_id, force_model)
             self._refresh_table()
             self._show_detail()
+            # Fetch available models in background
+            self._fetch_models_bg(sub_id)
 
     def _apply_force_model(self, sub_id: str, force_model: str):
         """Re-sync settings.json after force_model change.
@@ -2398,6 +2556,30 @@ class HeimsenseApp(App):
             self.sync.sync_default(sub_id)
         except Exception as e:
             log.warning("_apply_force_model: sync_default failed: %s", e)
+
+    def _fetch_models_bg(self, sub_id: str):
+        """Fetch available models for sub_id in a background thread.
+
+        Uses Textual's run_worker so the UI stays responsive during the HTTP call.
+        Refreshes the table once the fetch completes.
+        """
+        def _do_fetch():
+            models = self.sync.fetch_available_models(sub_id)
+            sub = self.cm.get_subscription(sub_id)
+            name = sub["name"] if sub else sub_id
+            if models:
+                self.call_from_thread(
+                    self.notify, f"{len(models)} models cached", title=f"{name} — Models", timeout=4
+                )
+            else:
+                self.call_from_thread(
+                    self.notify, "Model fetch failed (proxy not running?)",
+                    title=f"{name} — Models", severity="warning", timeout=4
+                )
+            self.call_from_thread(self._refresh_table)
+            self.call_from_thread(self._show_detail)
+
+        self.run_worker(_do_fetch, thread=True)
 
     def on_key(self, event) -> None:
         """Intercept r/R at app level so it works even when an Input is focused."""
@@ -2422,11 +2604,10 @@ class HeimsenseApp(App):
                     log.info("Health-check: attempting to reactivate original sub %s", orig_id)
                     try:
                         # Save current active sub BEFORE switching
-                        current_sub = self.cm.get_subscription(self.cm.default_instance)
+                        current_sub = self.cm.get_subscription(self._active_id or self.sync.detect_active())
                         self.sync.sync_default(orig_id)
                         ok, reason = self.failover.test_health(orig_id)
                         if ok:
-                            self.cm.set_default(orig_id)
                             self.failover.reset_failures()
                             self.failover._log_failover_event(
                                 current_sub,
@@ -2443,13 +2624,13 @@ class HeimsenseApp(App):
                         log.warning("Health-check: could not reactivate original: %s", e)
                         self.failover._failover_ts = time.time()
 
-            default_id = self.cm.default_instance
-            if not default_id:
+            active_id = self._active_id or self.sync.detect_active()
+            if not active_id:
                 return
-            ok, reason = self.failover.test_health(default_id)
+            ok, reason = self.failover.test_health(active_id)
             if not ok:
-                log.warning("Health-check failed for %s: %s — attempting failover", default_id, reason)
-                self.call_from_thread(self._do_auto_failover, default_id, reason)
+                log.warning("Health-check failed for %s: %s — attempting failover", active_id, reason)
+                self.call_from_thread(self._do_auto_failover, active_id, reason)
         threading.Thread(target=_run, daemon=True).start()
 
     def _notify_resume(self, name: str):
@@ -2485,10 +2666,10 @@ class HeimsenseApp(App):
 
     def _update_subtitle(self):
         """Update app subtitle with active subscription and failover status."""
-        default_id = self.cm.default_instance
-        if default_id:
-            sub = self.cm.get_subscription(default_id)
-            name = sub["name"] if sub else default_id
+        active_id = self._active_id or self.sync.detect_active()
+        if active_id:
+            sub = self.cm.get_subscription(active_id)
+            name = sub["name"] if sub else active_id
             failed_count = len(self.failover._failed_subs)
             if failed_count:
                 self.sub_title = f"Active: {name}  ⚠ {failed_count} failed"
@@ -2499,18 +2680,18 @@ class HeimsenseApp(App):
 
     def action_failover_check(self):
         """Manual: test active subscription and failover if necessary."""
-        default_id = self.cm.default_instance
-        if not default_id:
+        active_id = self._active_id or self.sync.detect_active()
+        if not active_id:
             self.notify("No active subscription", timeout=3)
             return
-        sub = self.cm.get_subscription(default_id)
-        self.notify(f"Testing {sub['name'] if sub else default_id}...", timeout=3)
+        sub = self.cm.get_subscription(active_id)
+        self.notify(f"Testing {sub['name'] if sub else active_id}...", timeout=3)
         self.failover.reset_failures()
         self._background_health_check()
 
     def action_force_model(self):
         """F: force all model aliases to one model for active subscription."""
-        sub_id = self._selected_id or self.cm.default_instance
+        sub_id = self._selected_id or self._active_id
         if not sub_id:
             self.notify("Select a subscription first", timeout=3)
             return
@@ -2535,7 +2716,7 @@ class HeimsenseApp(App):
         env = settings.setdefault("env", {})
         if model == "__none__":
             # Remove force — restore model maps
-            sub_id = self._selected_id or self.cm.default_instance
+            sub_id = self._selected_id or self._active_id
             sub = self.cm.get_subscription(sub_id) if sub_id else None
             model_maps = sub.get("model_maps", {}) if sub else {}
             for key, alias in [("haiku", "ANTHROPIC_DEFAULT_HAIKU_MODEL"),
@@ -2616,10 +2797,10 @@ class HeimsenseApp(App):
         Add button is always shown."""
         sub = self.cm.get_subscription(self._selected_id) if self._selected_id else None
         is_oauth = bool(sub and sub.get("auth_type") == "oauth")
-        # Hide Activate button (and Set Default footer) when already active in Claude
+        # Hide Activate button (and Activate footer) when already active in Claude
         is_active_now = bool(self._selected_id and self._selected_id == self._active_id)
 
-        # force_model button removed — force is now a setting in Edit wizard
+        # Force model btn removed — force is setting in Edit wizard only
         self.query_one("#force_model", Button).display = False
         edit_btn = self.query_one("#edit", Button)
         edit_btn.display = enabled
@@ -2646,11 +2827,11 @@ class HeimsenseApp(App):
         """Return context- and width-sensitive footer bindings.
 
         Buttons cover: Start/Stop, Test, Sync, Reauth, Force Model, Edit, Logs, + Add.
-        Footer only shows what has NO button: Reload, Delete, Set Default, Quit, Help, Failover.
-        Set Default is hidden when selected provider is already active in Claude.
+        Footer only shows what has NO button: Reload, Delete, Activate, Quit, Help, Failover.
+        Activate is hidden when selected provider is already active in Claude.
 
-        <80:  Reload · Del · Set · Quit
-        <120: Reload · Del · Set Default · Quit · Help
+        <80:  Reload · Del · Activate · Quit
+        <120: Reload · Del · Activate · Quit · Help
         >=120: above + Failover · Failover Log
         """
         if width < 80:
@@ -2804,11 +2985,9 @@ if __name__ == "__main__":
             notes="TUI test",
         )
         print(f"Created: {sub['name']} (id={sub['id'][:8]}..., port={sub['default_port']})")
-        cm.set_default(sub["id"])
-        assert cm.default_instance == sub["id"]
         im = InstanceManager(cm)
         im.generate_env(sub["id"])
-        print(f"Default set to: {sub['name']}")
+        print(f"Active provider: {sub['name']}")
         print(f".env generated: {CLAUDE_MUX_DIR / 'instances' / sub['name'] / '.env'}")
         print("OK: Setup complete")
 
@@ -2818,8 +2997,6 @@ if __name__ == "__main__":
         sub = cm.add_subscription("test-all", "https://test.all", "TEST_KEY")
         assert len(cm.subscriptions) == initial_count + 1
         assert cm.get_subscription(sub["id"]) is not None
-        cm.set_default(sub["id"])
-        assert cm.default_instance == sub["id"]
         cm.delete_subscription(sub["id"])
         assert len(cm.subscriptions) == initial_count
         print("OK: ConfigManager")

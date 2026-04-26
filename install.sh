@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # claude-mux install script — installs claude-mux + all required dependencies.
 # Usage:
-#   curl -sSL https://raw.githubusercontent.com/cura-ai/heimsense/main/install.sh | bash
+#   curl -sSL https://raw.githubusercontent.com/Cura-Simple-AI/Claude-Mux/main/install.sh | bash
 #   ./install.sh            # standard install
 #   ./install.sh --pipx     # install in isolated pipx environment (recommended)
 #   ./install.sh --dev      # editable install for development
 
 set -euo pipefail
 
-REPO="https://github.com/cura-ai/heimsense"
+REPO="https://github.com/Cura-Simple-AI/Claude-Mux"
 PACKAGE="claude-mux"
 
 RED='\033[0;31m'
@@ -81,15 +81,6 @@ fi
 if ! command -v pm2 &>/dev/null; then
   warn "pm2 not found — needed for bearer/proxy providers (not required for Claude Max OAuth)"
   warn "Install with: npm install -g pm2"
-fi
-
-# --- Optional: heimsense ---
-HEIMSENSE_BIN="${HEIMSENSE_BIN:-$HOME/.local/bin/heimsense}"
-if [[ ! -x "$HEIMSENSE_BIN" ]]; then
-  warn "heimsense proxy binary not found at $HEIMSENSE_BIN"
-  warn "Bearer providers (DeepSeek, OpenAI, Gemini, Copilot) require heimsense to start."
-  warn "Claude Max (OAuth) works without it."
-  warn "Install heimsense: see $REPO#install-heimsense"
 fi
 
 # --- Optional: claude CLI ---

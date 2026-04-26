@@ -29,6 +29,7 @@ classifiers = [
 
 [project.scripts]
 claude-mux = "claude_mux.cli:main"
+cm = "claude_mux.cli:main"
 
 [project.urls]
 Repository = "https://github.com/Cura-Simple-AI/Claude-Mux"

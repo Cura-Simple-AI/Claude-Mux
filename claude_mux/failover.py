@@ -47,7 +47,7 @@ class FailoverManager:
         - direct: GET /v1/models against provider_url with API key
         - bearer: POST /v1/messages against localhost proxy
         """
-        target = sub_id or self.cm.default_instance
+        target = sub_id or self.sync.detect_active()
         if not target:
             return False, "No active subscription"
         sub = self.cm.get_subscription(target)
@@ -58,6 +58,7 @@ class FailoverManager:
         if auth_type in ("oauth", "direct"):
             return self._test_direct_http(sub)
         else:
+            # bearer, oauth_proxy, gh_token, x-goog-api-key — all go via local proxy
             port = self.cm.get_instance_port(target)
             if not port:
                 return False, "Proxy not running"
@@ -149,6 +150,9 @@ class FailoverManager:
                     return False, f"HTTP {code}"
                 return True, f"HTTP {code}"
         except HTTPError as e:
+            # 429 for oauth_proxy = auth is valid, just rate limited — report as OK
+            if e.code == 429 and auth_type == "oauth_proxy":
+                return True, "HTTP 429 — rate limited (auth OK)"
             if e.code in self.FAILOVER_CODES:
                 return False, f"HTTP {e.code} — {e.reason}"
             return True, f"HTTP {e.code} (non-fatal)"
@@ -192,7 +196,6 @@ class FailoverManager:
                 self.sync.sync_default(sub_id)
                 ok, health_reason = self.test_health(sub_id)
                 if ok:
-                    self.cm.set_default(sub_id)
                     log.info("Failover: %s works — switched to %s", sub["name"], sub_id)
                     self._log_failover_event(failed_sub, sub, reason)
                     return sub_id

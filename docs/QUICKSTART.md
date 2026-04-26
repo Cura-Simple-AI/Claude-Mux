@@ -22,8 +22,8 @@ claude-mux
 ### From source
 
 ```bash
-git clone https://github.com/cura-ai/claude-mux
-cd claude-mux
+git clone https://github.com/Cura-Simple-AI/Claude-Mux
+cd Claude-Mux
 pip install -e .
 claude-mux
 ```
