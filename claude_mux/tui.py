@@ -60,7 +60,7 @@ try:
     from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
     from textual.screen import ModalScreen, Screen
     from textual.widgets import Button, DataTable, Footer, Input, Label, ProgressBar, RichLog, Select, Static, TextArea
-    from textual.worker import Worker, WorkerState
+    from textual.worker import Worker
     from rich.text import Text
     from rich.markup import escape
     from rich.table import Table as RichTable
@@ -404,6 +404,90 @@ class ConfirmModal(ModalScreen):
             event.stop()
 
 
+# --- Test modal ---
+
+class TestModal(ModalScreen):
+    """Live test results for all three model tiers.
+
+    Opens immediately so the user sees progress. Each tier row updates
+    as the result arrives. Close with Enter/Escape/q or the Close button.
+    """
+
+    CSS = """
+    TestModal {
+        align: center middle;
+    }
+    TestModal > Vertical {
+        background: $surface;
+        border: solid $accent;
+        padding: 1 2;
+        width: 70;
+        height: auto;
+        max-height: 24;
+    }
+    .test-row {
+        height: 3;
+        margin: 0;
+        padding: 0 1;
+        border: solid $panel;
+    }
+    """
+
+    def __init__(self, sub_name: str, tiers: list[tuple[str, str]]):
+        super().__init__()
+        self._sub_name = sub_name
+        self._tiers = tiers  # [(tier, model), ...]
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Static(f"[bold]Testing {self._sub_name}[/bold]", id="test-modal-title")
+            for tier, model in self._tiers:
+                with Horizontal(classes="test-row", id=f"test-row-{tier}"):
+                    yield Static(
+                        f"[dim]{tier:6s}[/dim]  [dim]{model}[/dim]",
+                        id=f"test-status-{tier}",
+                    )
+            with Horizontal():
+                yield Button("Close", id="close-test", variant="primary")
+
+    def on_button_pressed(self, event: Button.Pressed):
+        if event.button.id == "close-test":
+            self.dismiss()
+
+    def on_key(self, event):
+        if event.key in ("enter", "escape", "q"):
+            self.dismiss()
+            event.stop()
+
+    def set_running(self, tier: str):
+        """Mark tier as running (spinner-like indicator)."""
+        try:
+            self.query_one(f"#test-status-{tier}", Static).update(
+                f"[yellow]⏳[/yellow] [dim]{tier:6s}[/dim]  [yellow]testing…[/yellow]"
+            )
+        except Exception:
+            pass
+
+    def set_result(self, tier: str, model: str, result: dict):
+        """Update tier row with OK/FAIL result."""
+        try:
+            code = result.get("code", 0)
+            elapsed = result.get("elapsed", 0)
+            body = result.get("body", "")[:80]
+            if code == 200:
+                self.query_one(f"#test-status-{tier}", Static).update(
+                    f"[green]✓ OK[/green]  [dim]{tier:6s}[/dim]  {model}  [dim]{elapsed}ms[/dim]\n"
+                    f"[dim]{body}[/dim]"
+                )
+            else:
+                self.query_one(f"#test-status-{tier}", Static).update(
+                    f"[red]✖ {code}[/red]  [dim]{tier:6s}[/dim]  {model}  [dim]{elapsed}ms[/dim]\n"
+                    f"[red]{body}[/red]"
+                )
+        except Exception:
+            pass
+
+
 # --- Help modal ---
 
 class HelpModal(ModalScreen):
@@ -743,10 +827,9 @@ class AddWizard(ModalScreen):
         eid = event.input.id
         if eid == "wiz-name":
             if self.query_one("#wiz-name", Input).value.strip():
-                # Edit-mode OAuth: jump directly to models
-                if self._edit_mode and self._existing and self._existing.get("auth_type") == "oauth":
+                # Edit-mode: provider is locked — always jump directly to models
+                if self._edit_mode and self._existing:
                     self._data["name"] = self.query_one("#wiz-name", Input).value.strip()
-                    self._data["auth_type"] = "oauth"
                     self._data["provider_key"] = self._existing.get("provider_key", "")
                     self._skip_to_models_edit()
                 else:
@@ -793,9 +876,9 @@ class AddWizard(ModalScreen):
         if eid == "cancel":
             self.dismiss()
         elif eid == "next-name":
-            if self._edit_mode and self._existing and self._existing.get("auth_type") == "oauth":
+            # Edit-mode: provider is locked — always jump directly to models
+            if self._edit_mode and self._existing:
                 self._data["name"] = self.query_one("#wiz-name", Input).value.strip()
-                self._data["auth_type"] = "oauth"
                 self._data["provider_key"] = self._existing.get("provider_key", "")
                 self._skip_to_models_edit()
             else:
@@ -839,8 +922,10 @@ class AddWizard(ModalScreen):
             event.stop()
 
     def _skip_to_models_edit(self):
-        """Edit-mode OAuth: jump to models (step 4)."""
+        """Edit-mode: jump directly to models (step 4), locking provider fields."""
         self._data["api_key"] = self._existing.get("api_key", "") if self._existing else ""
+        self._data["provider_url"] = self._existing.get("provider_url", "") if self._existing else ""
+        self._data["auth_type"] = self._existing.get("auth_type", "bearer") if self._existing else "bearer"
         self._show_side(4)
         self.query_one("#wiz-title", Static).update("[bold]Edit Model Maps[/bold]")
         self.query_one("#wiz-key-label", Label).display = False
@@ -2294,35 +2379,10 @@ class HeimsenseApp(App):
             model = self.sync.resolve_model_for_tier(sub, tier) or TIER_FALLBACK_MODELS[tier]
             tiers_to_test.append((tier, model))
 
-        self.notify(f"Testing {sub['name']} ({len(tiers_to_test)} tiers)…", title="Test", timeout=3)
+        modal = TestModal(sub["name"], tiers_to_test)
 
-        def _do_tests():
-            results = []
-            for tier, model in tiers_to_test:
-                result = self._run_proxy_inference(sub, model, auth_type)
-                results.append((tier, model, result))
-            return results
-
-        def _on_done(results):
-            any_fail = False
-            last_result = None
-            for tier, model, result in results:
-                ok = result["code"] == 200
-                if not ok:
-                    any_fail = True
-                last_result = result
-                title = f"{sub['name']} [{tier}]"
-                if ok:
-                    self.notify(
-                        f"{model} — OK ({result['elapsed']}ms)\n{result['body'][:100]}",
-                        title=title, timeout=8
-                    )
-                else:
-                    self.notify(
-                        f"{model} — FAIL (HTTP {result['code']}): {result['body'][:80]}",
-                        title=title, severity="error", timeout=10
-                    )
-            # Save aggregate result
+        def _save_results(results: list):
+            """Called from thread when all tiers are done — update table on UI thread."""
             best = next((r for _, _, r in results if r["code"] == 200), None) or (results[-1][2] if results else {})
             self._test_results[sub_id] = {
                 "code": best.get("code", 0),
@@ -2332,10 +2392,18 @@ class HeimsenseApp(App):
             self._refresh_table()
             self._show_detail()
 
-        worker = self.run_worker(_do_tests, thread=True, description=f"test-{sub['name']}")
-        await worker.wait()
-        if worker.result:
-            _on_done(worker.result)
+        def _do_tests():
+            results = []
+            for tier, model in tiers_to_test:
+                self.call_from_thread(modal.set_running, tier)
+                result = self._run_proxy_inference(sub, model, auth_type)
+                self.call_from_thread(modal.set_result, tier, model, result)
+                results.append((tier, model, result))
+            self.call_from_thread(_save_results, results)
+            return results
+
+        self.run_worker(_do_tests, thread=True, description=f"test-{sub['name']}")
+        await self.push_screen(modal)
 
     def action_start(self):
         """Start claude-mux for selected subscription."""
@@ -2924,13 +2992,13 @@ class HeimsenseApp(App):
 
     # --- Button handlers ---
 
-    def on_button_pressed(self, event: Button.Pressed):
+    async def on_button_pressed(self, event: Button.Pressed):
         if event.button.id == "toggle":
             self.action_toggle()
         elif event.button.id == "launch":
             self.action_launch()
         elif event.button.id == "test":
-            self.action_test()
+            await self.action_test()
         elif event.button.id == "force_model":
             self.action_force_model()
         elif event.button.id == "logs":
