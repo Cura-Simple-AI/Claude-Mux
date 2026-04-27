@@ -129,19 +129,39 @@ class FailoverManager:
             return False, f"Connection error: {e}"
 
     def _test_proxy_http(self, port: int, auth_type: str, sub: dict) -> tuple[bool, str]:
-        """Test proxy endpoint direkte via HTTP."""
+        """Test proxy endpoint directly via HTTP.
+
+        oauth_proxy: OAuth tokens require Authorization: Bearer + claude-code beta
+                     header + 'You are Claude Code...' system prompt. Sending as
+                     x-api-key returns 401; missing system prompt returns 429
+                     (out_of_credits) on premium models.
+        bearer/other: Standard x-api-key header.
+        """
         from urllib.request import Request, urlopen
         from urllib.error import URLError, HTTPError
         api_key = sub.get("api_key") or os.environ.get(sub.get("api_key_env", ""), "")
         url = f"http://localhost:{port}/v1/messages"
-        body = json.dumps({
-            "model": "claude-haiku-4-5", "max_tokens": 5,
+
+        body_dict: dict = {
+            "model": "claude-haiku-4-5",
+            "max_tokens": 5,
             "messages": [{"role": "user", "content": "OK"}],
-        }).encode()
+        }
+        if auth_type == "oauth_proxy":
+            body_dict["system"] = [{
+                "type": "text",
+                "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+            }]
+        body = json.dumps(body_dict).encode()
+
         req = Request(url, data=body, method="POST")
         req.add_header("Content-Type", "application/json")
         req.add_header("anthropic-version", "2023-06-01")
-        if api_key:
+        if auth_type == "oauth_proxy":
+            req.add_header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
+            if api_key:
+                req.add_header("Authorization", f"Bearer {api_key}")
+        elif api_key:
             req.add_header("x-api-key", api_key)
         try:
             with urlopen(req, timeout=10) as resp:

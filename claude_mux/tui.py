@@ -692,6 +692,7 @@ class AddWizard(ModalScreen):
         # Step 5: OAuth (only for Claude Max)
         with Vertical(id="step5", classes="hidden"):
             yield Static("", id="oauth-info")
+            yield TextArea("", id="oauth-url-display", classes="hidden", disabled=True)
             with Horizontal(id="oauth-url-row"):
                 yield Button("Authenticate in browser", id="oauth-open-url", variant="primary")
             yield Static("", id="oauth-status")
@@ -1102,8 +1103,15 @@ class AddWizard(ModalScreen):
                 with open(log_path) as f:
                     for line in f:
                         if "https://claude.com/cai/oauth/authorize" in line:
-                            # Strip ANSI escapes: OSC-8 hyperlinks, CSI codes, BEL characters
-                            full_url = re.sub(r'\x1b\[[?\s>][0-9;]*[a-zA-Z]|\x1b\[[0-9;]*[a-zA-Z]|\x1b\][0-9;]*[^\x1b]*(?:\x1b\\|[\x07])', '', line).strip()
+                            # Strip ANSI escapes, extract visible URL after OSC 8 hyperlink
+                            # Line format: ESC]8;id=X;URL\x07URL\x1b]8;;\x07
+                            # The visible URL is the second BEL-delimited chunk
+                            parts = line.split("\x07")
+                            visible = parts[1] if len(parts) > 1 else parts[0]
+                            # Strip remaining CSI/OSC ANSI escapes from visible URL
+                            cleaned = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*', '', visible)
+                            if cleaned.startswith("https://claude.com/cai/oauth/authorize"):
+                                full_url = cleaned.strip()
                             log.info("OAuth poll: found URL in log (len=%s)", len(full_url))
             except FileNotFoundError:
                 log.info("OAuth poll: log file not found yet")
@@ -1114,7 +1122,7 @@ class AddWizard(ModalScreen):
             if not full_url:
                 self.query_one("#oauth-info", Static).update("[yellow]⏳ Waiting for authorization URL...[/yellow]")
                 output = subprocess.run(
-                    ["tmux", "capture-pane", "-S", "-500", "-J", "-t", self._oauth_state["session"], "-p"],
+                    ["tmux", "capture-pane", "-S", "-500", "-J", "-t", "--", self._oauth_state["session"], "-p"],
                     capture_output=True, text=True, timeout=5,
                 ).stdout
                 lines = output.splitlines()
@@ -1127,8 +1135,13 @@ class AddWizard(ModalScreen):
                                 break
                             parts.append(nl)
                         raw = "".join(parts)
-                        # Strip ANSI escapes
-                        full_url = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\][0-9;]*[^\x1b]*(?:\x1b\\|[\x07])', '', raw)
+                        # BEL-delimited format: ESC]8;id=X;URL\x07URL\x07ESC]8;;\x07
+                        # Take second BEL-delimited part (the visible URL)
+                        bel_parts = raw.split("\x07")
+                        visible_url = bel_parts[1] if len(bel_parts) > 1 else bel_parts[0]
+                        full_url = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*', '', visible_url).strip()
+                        if full_url.startswith("https://claude.com/cai/oauth/authorize"):
+                            break
             if full_url:
                 self._oauth_state["step"] = "awaiting_code"
                 # Stop URL poll timer if running
@@ -1141,12 +1154,24 @@ class AddWizard(ModalScreen):
                     self._oauth_state["_timer_url"] = None
                 self.query_one("#oauth-info", Static).update(
                     "[bold]Authenticate with Claude Max[/bold]\n\n"
-                    "Click the button below to open the authorization page in your browser.\n"
+                    "Click the button below to open the authorization page in your browser."
                 )
                 self._oauth_state["url"] = full_url
-                self.query_one("#oauth-url-row", Horizontal).display = True
-                self.query_one("#oauth-open-url", Button).display = True
-                self.query_one("#oauth-open-url", Button).focus()
+                in_tmux = "TMUX" in os.environ
+                if in_tmux:
+                    self.query_one("#oauth-open-url", Button).display = False
+                    self.query_one("#oauth-url-row", Horizontal).display = False
+                    self.query_one("#oauth-info", Static).update(
+                        "[bold]Authenticate with Claude Max[/bold]\n\n"
+                        "Open this URL in your browser, then paste the authorization code below."
+                    )
+                    self.query_one("#oauth-url-display", TextArea).disabled = False
+                    self.query_one("#oauth-url-display", TextArea).text = full_url
+                    self.query_one("#oauth-url-display", TextArea).display = True
+                else:
+                    self.query_one("#oauth-url-row", Horizontal).display = True
+                    self.query_one("#oauth-open-url", Button).display = True
+                    self.query_one("#oauth-open-url", Button).focus()
                 self.query_one("#oauth-nav-row", Horizontal).display = True
                 self.query_one("#wiz-oauth-code", Input).display = True
                 self.query_one("#back-oauth", Button).display = True
@@ -1307,9 +1332,30 @@ class AddWizard(ModalScreen):
 
     def _open_oauth_url(self):
         url = self._get_oauth_url()
-        if url:
-            import webbrowser
-            webbrowser.open(url)
+        if not url:
+            return
+        import webbrowser
+        in_tmux = "TMUX" in os.environ
+        if not in_tmux:
+            try:
+                webbrowser.open(url)
+            except Exception:
+                in_tmux = True
+        if in_tmux:
+            self.query_one("#oauth-open-url", Button).display = False
+            self.query_one("#oauth-url-row", Horizontal).display = False
+            self.query_one("#oauth-info", Static).update(
+                "[bold]Authenticate with Claude Max[/bold]\n\n"
+                "Open this URL in your browser, then paste the authorization code below."
+            )
+            self.query_one("#oauth-url-display", TextArea).disabled = False
+            self.query_one("#oauth-url-display", TextArea).text = url
+            self.query_one("#oauth-url-display", TextArea).display = True
+        else:
+            self.query_one("#oauth-info", Static).update(
+                "[bold]Authenticate with Claude Max[/bold]\n\n"
+                "Click the button below to open the authorization page in your browser."
+            )
         self._oauth_focus_paste_delayed()
 
     def _oauth_focus_paste_delayed(self):
@@ -1469,6 +1515,13 @@ class HeimsenseApp(App):
     Button {
         margin: 0 1;
         min-width: 12;
+    }
+    #oauth-url-display {
+        margin: 0;
+        padding: 0;
+        border: none;
+        max-height: 12;
+        min-height: 3;
     }
     ModalScreen {
         align: center middle;

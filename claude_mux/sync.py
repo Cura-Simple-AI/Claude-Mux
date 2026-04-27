@@ -334,7 +334,7 @@ class SyncManager:
                 req = Request(url, method="GET")
                 req.add_header("Authorization", f"Bearer {api_key}")
                 req.add_header("anthropic-version", "2023-06-01")
-                req.add_header("anthropic-beta", "oauth-2025-04-20")
+                req.add_header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
             elif auth_type == "direct":
                 base = sub.get("provider_url", "").rstrip("/")
                 if not base:
@@ -355,7 +355,12 @@ class SyncManager:
                 url = f"http://localhost:{port}/v1/models"
                 req = Request(url, method="GET")
                 req.add_header("anthropic-version", "2023-06-01")
-                if api_key:
+                if auth_type == "oauth_proxy":
+                    # OAuth tokens require Bearer + claude-code beta header
+                    if api_key:
+                        req.add_header("Authorization", f"Bearer {api_key}")
+                    req.add_header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
+                elif api_key:
                     req.add_header("x-api-key", api_key)
 
             with urlopen(req, timeout=10) as resp:
@@ -428,19 +433,27 @@ class SyncManager:
         auth_type = sub.get("auth_type", "bearer")
         api_key = self._resolve_api_key(sub)
 
-        payload = _json.dumps({
+        payload_dict = {
             "model": model,
             "max_tokens": 100,
             "stream": False,
             "messages": [{"role": "user", "content": "Tell me a fun fact about the universe in 2 sentences."}],
-        }).encode()
+        }
+        # OAuth tokens (oauth, oauth_proxy) require the Claude Code system prompt
+        # to access premium models — without it, opus/sonnet return 429 (out_of_credits).
+        if auth_type in ("oauth", "oauth_proxy"):
+            payload_dict["system"] = [{
+                "type": "text",
+                "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+            }]
+        payload = _json.dumps(payload_dict).encode()
 
         headers = {"Content-Type": "application/json", "anthropic-version": "2023-06-01"}
 
         if auth_type == "oauth":
             url = "https://api.anthropic.com/v1/messages"
             headers["Authorization"] = f"Bearer {api_key}"
-            headers["anthropic-beta"] = "oauth-2025-04-20"
+            headers["anthropic-beta"] = "claude-code-20250219,oauth-2025-04-20"
         elif auth_type == "direct":
             base = sub.get("provider_url", "").rstrip("/")
             url = f"{base}/v1/messages"
@@ -450,7 +463,12 @@ class SyncManager:
             if not port:
                 return {"code": 0, "body": "Proxy not running (no port assigned)", "elapsed": 0, "model": model}
             url = f"http://localhost:{port}/v1/messages"
-            if api_key:
+            if auth_type == "oauth_proxy":
+                # OAuth tokens must use Bearer; x-api-key returns 401.
+                if api_key:
+                    headers["Authorization"] = f"Bearer {api_key}"
+                headers["anthropic-beta"] = "claude-code-20250219,oauth-2025-04-20"
+            elif api_key:
                 headers["x-api-key"] = api_key
 
         t0 = _time.time()
