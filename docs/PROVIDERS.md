@@ -11,6 +11,7 @@ Claude Mux supports 8 AI providers. All are used as a proxy for Claude Code.
 | 3 | OpenAI/ChatGPT | Bearer token | Yes (pm2) | https://api.openai.com/v1 |
 | 4 | GitHub Copilot | gh auth token | Yes (pm2) | https://api.githubcopilot.com |
 | 5 | Claude Max (OAuth) | OAuth token | No | api.anthropic.com (direct) |
+| 5b | Claude Max (OAuth via proxy) | OAuth token | Yes (pm2) | localhost → api.anthropic.com |
 | 6 | Gemini (Google) | API key | Yes (pm2) | https://generativelanguage.googleapis.com/... |
 | 7 | z.ai | Bearer token | Yes (pm2) | https://api.z.ai/v1 |
 | 8 | Custom | Bearer token | Yes (pm2) | (your URL) |
@@ -114,6 +115,41 @@ Available models are updated automatically when the subscription is added.
 **Token expired?**
 - Press `R` (Reauth) to renew the token via OAuth flow
 - Happens automatically on 401 OAuth error
+
+---
+
+## 5b. Claude Max (OAuth via proxy)
+
+Same OAuth token as #5, but traffic is routed through a local pm2 proxy instead of going directly to `api.anthropic.com`. This gives you request logging, failover, and the same subscription-management workflow as other proxy-based providers.
+
+**When to use this instead of #5:**
+- You want to log all API traffic (see `cm logs <name>`)
+- You want automatic failover to another provider if Claude Max is down
+- You need to inspect requests for debugging
+
+**Requirements:** Claude Max subscription + OAuth token from `#5` already set up.
+
+**Setup in TUI:**
+1. `+` → name: e.g. `claude-max-proxy` → select `5b Claude (OAuth via proxy)`
+2. API Key env: the same env var holding your OAuth token (e.g. `CLAUDE_CODE_OAUTH_TOKEN`)
+3. Press Enter / Activate — proxy starts automatically via pm2
+
+**How it works:**
+
+```
+Claude Code → http://localhost:<port> → proxy → api.anthropic.com
+                                           ↑
+                              Injects: Authorization: Bearer <oauth_token>
+                              Forwards: all Claude Code headers unchanged
+```
+
+The proxy forwards all request headers from Claude Code transparently (including `anthropic-beta`, `anthropic-version`, etc.) and injects `Authorization: Bearer <token>` if the client doesn't supply auth.
+
+**View logs:**
+```bash
+claude-mux logs claude-max-proxy
+pm2 logs claude-max-proxy
+```
 
 ---
 

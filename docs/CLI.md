@@ -178,6 +178,8 @@ Exit code `4` if health check fails.
 
 Edit a subscription's settings interactively or via flags.
 
+Provider URL and auth type are **locked after creation** — they define what the subscription is. To use a different provider, add a new subscription.
+
 ```bash
 # Interactive
 claude-mux edit deepseek
@@ -186,6 +188,16 @@ claude-mux edit deepseek
 claude-mux edit deepseek --api-key-env NEW_KEY_VAR
 claude-mux edit deepseek --port 18090
 ```
+
+**Editable flags:**
+| Flag | Description |
+|---|---|
+| `--name NAME` | Rename the subscription |
+| `--api-key-env VAR` | Change API key env variable |
+| `--port PORT` | Change proxy port |
+| `--model-haiku MODEL` | Override haiku model alias |
+| `--model-sonnet MODEL` | Override sonnet model alias |
+| `--model-opus MODEL` | Override opus model alias |
 
 **TUI equivalent:** `e` (Edit)
 
@@ -317,6 +329,34 @@ claude-mux active --json   # {"active": "deepseek", "id": "de3a7e01-..."}
 
 ---
 
+### `claude-mux statusline`
+
+Read a JSON status payload from Claude Code on stdin and print a formatted status line.
+
+This command is called by the statusline script installed by `claude-mux init`. It is not normally invoked directly.
+
+```bash
+# Claude Code pipes JSON to this command automatically via statusLine setting
+echo '{"model":"claude-sonnet-4-6","rate_limits":[...]}' | claude-mux statusline
+```
+
+**Output format:**
+```
+🔌 claude-max · claude-sonnet-4-6 · 5h 23% · 7d 41% · ctx 12%
+```
+
+- **Subscription name** — active subscription
+- **Model** — model currently in use
+- **5h %** — input token usage in the 5-hour window
+- **7d %** — input token usage in the 7-day window
+- **ctx %** — context window used this turn
+
+Usage is color-coded: green < 50%, yellow 50–79%, red ≥ 80%.
+
+**TUI equivalent:** Status bar (bottom of TUI)
+
+---
+
 ### `claude-mux init`
 
 First-time setup: installs the Claude Code status line integration.
@@ -399,6 +439,7 @@ claude-mux test || claude-mux failover
 | `q` | (exit TUI) | — |
 | — | `claude-mux active` | Print active subscription name |
 | — | `claude-mux init` | Install Claude Code status line |
+| — | `claude-mux statusline` | Format status line from Claude Code JSON (called by statusline.sh) |
 
 ---
 
