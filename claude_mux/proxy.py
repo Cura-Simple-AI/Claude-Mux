@@ -76,23 +76,20 @@ def _handle(conn, addr):
             upstream += "?" + qs
         t0 = time.time()
 
-        req_headers = {"Content-Type": "application/json"}
+        # Forward ALL client headers transparently — only inject auth if missing.
+        req_headers = {}
+        skip = {"host", "content-length", "connection", "transfer-encoding"}
+        for k, v in headers.items():
+            if k not in skip:
+                req_headers[k] = v
 
-        # Forward x-api-key AS-IS if client sent it (OAuth tokens use this).
-        if "x-api-key" in headers:
-            req_headers["x-api-key"] = headers["x-api-key"]
-        elif "authorization" in headers:
-            req_headers["Authorization"] = headers["authorization"]
-        elif AUTH_TOKEN:
-            # Fallback: PROXY_AUTH_TOKEN (for non-OAuth providers)
+        # Inject auth: prefer client-supplied auth; fall back to PROXY_AUTH_TOKEN.
+        if "authorization" not in req_headers and "x-api-key" not in req_headers and AUTH_TOKEN:
             req_headers["Authorization"] = f"Bearer {AUTH_TOKEN}"
 
-        # Forward ALL client headers that Anthropic needs — proxy is transparent
-        for hdr in ("anthropic-version", "anthropic-beta",
-                    "anthropic-dangerous-direct-browser-access", "x-app",
-                    "accept", "accept-encoding", "user-agent"):
-            if hdr in headers:
-                req_headers[hdr] = headers[hdr]
+        # Ensure Content-Type is set for requests with a body.
+        if body and "content-type" not in req_headers:
+            req_headers["content-type"] = "application/json"
 
         if DEBUG:
             # Write debug directly to stdout so PM2 captures it in out.log
