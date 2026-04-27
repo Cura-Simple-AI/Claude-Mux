@@ -78,7 +78,8 @@ def _handle(conn, addr):
 
         # Forward ALL client headers transparently — only inject auth if missing.
         req_headers = {}
-        skip = {"host", "content-length", "connection", "transfer-encoding"}
+        # Strip hop-by-hop + accept-encoding (proxy doesn't decompress gzip)
+        skip = {"host", "content-length", "connection", "transfer-encoding", "accept-encoding"}
         for k, v in headers.items():
             if k not in skip:
                 req_headers[k] = v
