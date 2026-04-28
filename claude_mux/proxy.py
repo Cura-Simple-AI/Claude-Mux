@@ -27,6 +27,58 @@ AUTH_TOKEN = os.environ.get("PROXY_AUTH_TOKEN", "")
 # When set, log full request/response headers and bodies to stdout
 DEBUG = os.environ.get("PROXY_DEBUG", "") == "1"
 
+_CLAUDE_MUX_DIR = os.path.join(os.path.expanduser("~"), ".claude-mux")
+_USAGE_LOG = os.path.join(_CLAUDE_MUX_DIR, "usage.log")
+_RATE_LIMITS_FILE = os.path.join(_CLAUDE_MUX_DIR, "rate-limits.json")
+
+
+def _record_usage(input_tokens: int, output_tokens: int, model: str) -> None:
+    """Append a token-usage entry to usage.log for 5h/7d window tracking."""
+    if not input_tokens and not output_tokens:
+        return
+    entry = {
+        "ts": int(time.time()),
+        "in": input_tokens,
+        "out": output_tokens,
+        "model": model,
+    }
+    try:
+        os.makedirs(_CLAUDE_MUX_DIR, exist_ok=True)
+        with open(_USAGE_LOG, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass
+
+
+def _record_rate_limits(resp_headers) -> None:
+    """Cache Anthropic rate-limit headers to rate-limits.json."""
+    rl: dict = {}
+    for header, key in [
+        ("anthropic-ratelimit-tokens-limit", "tokens_limit"),
+        ("anthropic-ratelimit-tokens-remaining", "tokens_remaining"),
+        ("anthropic-ratelimit-tokens-reset", "tokens_reset"),
+        ("anthropic-ratelimit-requests-limit", "requests_limit"),
+        ("anthropic-ratelimit-requests-remaining", "requests_remaining"),
+        ("anthropic-ratelimit-input-tokens-limit", "input_tokens_limit"),
+        ("anthropic-ratelimit-input-tokens-remaining", "input_tokens_remaining"),
+        ("anthropic-ratelimit-output-tokens-limit", "output_tokens_limit"),
+        ("anthropic-ratelimit-output-tokens-remaining", "output_tokens_remaining"),
+    ]:
+        val = resp_headers.get(header)
+        if val is not None:
+            try:
+                rl[key] = int(val)
+            except ValueError:
+                rl[key] = val
+    if rl:
+        rl["ts"] = int(time.time())
+        try:
+            os.makedirs(_CLAUDE_MUX_DIR, exist_ok=True)
+            with open(_RATE_LIMITS_FILE, "w") as f:
+                json.dump(rl, f)
+        except OSError:
+            pass
+
 logging.basicConfig(
     filename=LOG_FILE,
     level=logging.DEBUG if DEBUG else logging.INFO,
@@ -114,13 +166,22 @@ def _handle(conn, addr):
             status = upstream_resp.status
             elapsed = int((time.time() - t0) * 1000)
 
-            # Extract model from response if present
+            # Extract model + token usage from response if present
             model = ""
             try:
                 resp_json = json.loads(resp_body)
                 model = resp_json.get("model", "")
+                usage = resp_json.get("usage", {})
+                _record_usage(
+                    usage.get("input_tokens", 0),
+                    usage.get("output_tokens", 0),
+                    model,
+                )
             except (json.JSONDecodeError, UnicodeDecodeError):
                 pass
+
+            # Cache rate-limit headers if Anthropic returns them
+            _record_rate_limits(upstream_resp.headers)
 
             if DEBUG:
                 _dbg(f"UPSTREAM→PROXY status={status} headers={json.dumps(dict(upstream_resp.headers))}")

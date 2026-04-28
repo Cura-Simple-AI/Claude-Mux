@@ -983,6 +983,76 @@ exec claude-mux statusline
 
 
 # ---------------------------------------------------------------------------
+# statusline helpers
+# ---------------------------------------------------------------------------
+
+def _compute_usage_windows(claude_mux_dir) -> list[str]:
+    """Compute 5h and 7d token-usage summaries from usage.log.
+
+    Returns list of strings like ["5h 12%", "7d 34%"] using cached rate-limit
+    headers as denominator. Falls back to raw token counts ("5h 45k") if no
+    limit is known.
+    """
+    import json as _json
+    import time as _time
+    from pathlib import Path as _Path
+
+    usage_log = _Path(claude_mux_dir) / "usage.log"
+    rl_file = _Path(claude_mux_dir) / "rate-limits.json"
+
+    if not usage_log.exists():
+        return []
+
+    now = int(_time.time())
+    w5h = now - 5 * 3600
+    w7d = now - 7 * 24 * 3600
+
+    tokens_5h = tokens_7d = 0
+    try:
+        with open(usage_log) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = _json.loads(line)
+                    ts = e.get("ts", 0)
+                    total = e.get("in", 0) + e.get("out", 0)
+                    if ts >= w5h:
+                        tokens_5h += total
+                    if ts >= w7d:
+                        tokens_7d += total
+                except (_json.JSONDecodeError, TypeError):
+                    continue
+    except OSError:
+        return []
+
+    # Try to get limit from cached rate-limit headers (API key users)
+    # Fall back to configurable defaults (OAuth/Max users)
+    # Defaults: Claude Max ≈ 2M tokens/5h, 30M tokens/7d
+    DEFAULT_LIMIT_5H = 2_000_000
+    DEFAULT_LIMIT_7D = 30_000_000
+
+    limit_5h = DEFAULT_LIMIT_5H
+    limit_7d = DEFAULT_LIMIT_7D
+    try:
+        rl = _json.loads(rl_file.read_text())
+        # Anthropic rate-limit headers give per-minute limit — scale to windows
+        per_min = rl.get("tokens_limit", 0)
+        if per_min:
+            limit_5h = per_min * 300   # 5h = 300 minutes
+            limit_7d = per_min * 10080  # 7d = 10080 minutes
+    except (OSError, _json.JSONDecodeError, TypeError):
+        pass
+
+    parts = []
+    for label, used, limit in [("5h", tokens_5h, limit_5h), ("7d", tokens_7d, limit_7d)]:
+        pct = round(used / limit * 100) if limit > 0 else 0
+        parts.append(f"{label} {pct}%")
+    return parts
+
+
+# ---------------------------------------------------------------------------
 # statusline
 # ---------------------------------------------------------------------------
 
@@ -1023,26 +1093,41 @@ def cmd_statusline():
             click.echo(active_name)
         return
 
-    model = data.get("model", "")
+    # model: either a string (old format) or {"id": "...", "display_name": "..."} (new format)
+    model_raw = data.get("model", "")
+    if isinstance(model_raw, dict):
+        model = model_raw.get("id", "")
+    else:
+        model = model_raw
+
     ctx = data.get("context_window", {})
     rate_limits = data.get("rate_limits", [])
 
-    # Context window usage
+    # Context window usage — support both old and new format
     ctx_pct = ""
-    total = ctx.get("total_tokens", 0)
-    used = ctx.get("used_tokens", 0)
-    if total and total > 0:
-        ctx_pct = f"{round(used / total * 100)}%"
+    if "used_percentage" in ctx:
+        # New format (Claude Code 2.1.110+): used_percentage is already computed
+        ctx_pct = f"{ctx['used_percentage']}%"
+    else:
+        total = ctx.get("total_tokens", 0)
+        used = ctx.get("used_tokens", 0)
+        if total and total > 0:
+            ctx_pct = f"{round(used / total * 100)}%"
 
-    # Rate limit windows (5h and 7d)
+    # Rate limit windows — prefer cached headers, else compute from usage.log
     window_parts = []
-    for rl in rate_limits:
-        window = rl.get("window", "")
-        remaining = rl.get("tokens_remaining", 0)
-        limit = rl.get("tokens_limit", 0)
-        if window and limit and limit > 0:
-            used_pct = round((1 - remaining / limit) * 100)
-            window_parts.append(f"{window} {used_pct}%")
+    if rate_limits:
+        # Old Claude Code format: rate_limits array in stdin JSON
+        for rl in rate_limits:
+            window = rl.get("window", "")
+            remaining = rl.get("tokens_remaining", 0)
+            limit = rl.get("tokens_limit", 0)
+            if window and limit and limit > 0:
+                used_pct = round((1 - remaining / limit) * 100)
+                window_parts.append(f"{window} {used_pct}%")
+    else:
+        # New format: build windows from usage.log + optional rate-limits.json
+        window_parts = _compute_usage_windows(CLAUDE_MUX_DIR)
 
     # Build output parts
     parts = []
