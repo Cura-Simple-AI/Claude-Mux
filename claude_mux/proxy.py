@@ -16,6 +16,7 @@ import logging
 import os
 import socket
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -109,8 +110,11 @@ def _parse_sse_usage(body: bytes) -> tuple:
     """Parse SSE event stream and extract model + token counts.
 
     Anthropic streaming responses contain:
-      message_start → message.model + message.usage.input_tokens
+      message_start → message.model + message.usage (input + cache tokens)
       message_delta → usage.output_tokens (final cumulative count)
+
+    Cache tokens are included in input_tokens so OAuth/Max users (who use
+    prompt caching heavily) get accurate usage tracking.
 
     Returns (model, input_tokens, output_tokens).
     """
@@ -134,7 +138,11 @@ def _parse_sse_usage(body: bytes) -> tuple:
                 msg = data.get("message", {})
                 model = msg.get("model", model)
                 usage = msg.get("usage", {})
-                input_tokens = usage.get("input_tokens", 0)
+                input_tokens = (
+                    usage.get("input_tokens", 0)
+                    + usage.get("cache_creation_input_tokens", 0)
+                    + usage.get("cache_read_input_tokens", 0)
+                )
             elif t == "message_delta":
                 usage = data.get("usage", {})
                 output_tokens = usage.get("output_tokens", output_tokens)
@@ -166,16 +174,20 @@ def _handle(conn, addr):
             upstream += "?" + qs
         t0 = time.time()
 
-        # Forward ALL client headers transparently — only inject auth if missing.
+        # Forward ALL client headers transparently — except auth.
+        # Proxy always injects its own PROXY_AUTH_TOKEN; client auth is
+        # irrelevant (Claude Code 2.1.118+ sends its own OAuth token which
+        # would override the proxy's upstream auth).
         req_headers = {}
         # Strip hop-by-hop + accept-encoding (proxy doesn't decompress gzip)
-        skip = {"host", "content-length", "connection", "transfer-encoding", "accept-encoding"}
+        skip = {"host", "content-length", "connection", "transfer-encoding",
+                "accept-encoding", "authorization", "x-api-key"}
         for k, v in headers.items():
-            if k not in skip:
+            if k.lower() not in skip:
                 req_headers[k] = v
 
-        # Inject auth: prefer client-supplied auth; fall back to PROXY_AUTH_TOKEN.
-        if "authorization" not in req_headers and "x-api-key" not in req_headers and AUTH_TOKEN:
+        # Always inject proxy auth token (never forward client auth)
+        if AUTH_TOKEN:
             req_headers["Authorization"] = f"Bearer {AUTH_TOKEN}"
 
         # Ensure Content-Type is set for requests with a body.
@@ -188,14 +200,14 @@ def _handle(conn, addr):
                 sys.stdout.write(f"[DEBUG] {msg}\n")
                 sys.stdout.flush()
             client_hdrs_safe = {k: v for k, v in headers.items() if k != "authorization"}
-            _dbg(f"CLIENT→PROXY headers={json.dumps(client_hdrs_safe)}")
-            _dbg(f"CLIENT→PROXY body={((body or '')[:2000])}")
+            _dbg(f"CLIENT->PROXY headers={json.dumps(client_hdrs_safe)}")
+            _dbg(f"CLIENT->PROXY body={body[:2000]!r}")
             upstream_hdrs_safe = {k: ("Bearer [REDACTED]" if k == "Authorization" else v)
                                    for k, v in req_headers.items()}
-            _dbg(f"PROXY→UPSTREAM url={upstream} headers={json.dumps(upstream_hdrs_safe)}")
-            _dbg(f"PROXY→UPSTREAM body={((body or '')[:2000])}")
+            _dbg(f"PROXY->UPSTREAM url={upstream} headers={json.dumps(upstream_hdrs_safe)}")
+            _dbg(f"PROXY->UPSTREAM body={body[:2000]!r}")
 
-        data = body.encode() if body else None
+        data = body if body else None
         upstream_req = urllib.request.Request(upstream, data=data, headers=req_headers, method=method)
 
         try:
@@ -248,8 +260,8 @@ def _handle(conn, addr):
                 _record_usage(input_tokens, output_tokens, model)
 
                 if DEBUG:
-                    _dbg(f"UPSTREAM→PROXY SSE status={status} chunks={len(chunks)}")
-                    _dbg(f"UPSTREAM→PROXY body={resp_body[:2000].decode('utf-8', errors='replace')}")
+                    _dbg(f"UPSTREAM->PROXY SSE status={status} chunks={len(chunks)}")
+                    _dbg(f"UPSTREAM->PROXY body={resp_body[:2000].decode('utf-8', errors='replace')}")
                 _log_request(method, path, status, elapsed, model)
                 # Connection already closed via chunked — skip _send_response
                 try:
@@ -275,8 +287,8 @@ def _handle(conn, addr):
                     pass
 
                 if DEBUG:
-                    _dbg(f"UPSTREAM→PROXY status={status} headers={json.dumps(dict(upstream_resp.headers))}")
-                    _dbg(f"UPSTREAM→PROXY body={resp_body[:2000].decode('utf-8', errors='replace')}")
+                    _dbg(f"UPSTREAM->PROXY status={status} headers={json.dumps(dict(upstream_resp.headers))}")
+                    _dbg(f"UPSTREAM->PROXY body={resp_body[:2000].decode('utf-8', errors='replace')}")
 
                 _log_request(method, path, status, elapsed, model)
                 _send_response(conn, status, resp_body, ctype=ctype)
@@ -285,8 +297,8 @@ def _handle(conn, addr):
             elapsed = int((time.time() - t0) * 1000)
             err_body = e.read()
             if DEBUG:
-                _dbg(f"UPSTREAM→PROXY error={e.code} headers={json.dumps(dict(e.headers))}")
-                _dbg(f"UPSTREAM→PROXY body={err_body[:2000].decode('utf-8', errors='replace')}")
+                _dbg(f"UPSTREAM->PROXY error={e.code} headers={json.dumps(dict(e.headers))}")
+                _dbg(f"UPSTREAM->PROXY body={err_body[:2000].decode('utf-8', errors='replace')}")
             _log_request(method, path, e.code, elapsed)
             _send_response(conn, e.code, err_body, ctype="application/json")
 
@@ -301,7 +313,7 @@ def _handle(conn, addr):
 
 
 def _parse_request(conn):
-    """Read and parse HTTP/1.1 request from socket. Returns (method, path, headers, body, qs)."""
+    """Read and parse HTTP/1.1 request from socket."""
     try:
         data = b""
         while b"\r\n\r\n" not in data:
@@ -329,16 +341,16 @@ def _parse_request(conn):
                 k, v = line.split(":", 1)
                 headers[k.strip().lower()] = v.strip()
 
-        # Read body
-        body = ""
+        # Read body — stay in bytes to avoid UTF-8 length mismatch with Content-Length
+        body = b""
         content_len = int(headers.get("content-length", 0))
         if content_len > 0:
-            body = rest.decode("utf-8", errors="replace")
-            while len(body.encode()) < content_len:
+            body = rest
+            while len(body) < content_len:
                 chunk = conn.recv(65536)
                 if not chunk:
                     break
-                body += chunk.decode("utf-8", errors="replace")
+                body += chunk
 
         return method, path, headers, body, qs
     except Exception:
@@ -388,7 +400,7 @@ def main():
     s.listen(128)
     s.settimeout(1.0)
 
-    log.info("proxy listening on %s → %s", LISTEN_ADDR, TARGET_URL)
+    log.info("proxy listening on %s -> %s", LISTEN_ADDR, TARGET_URL)
 
     try:
         while True:
@@ -396,7 +408,7 @@ def main():
                 conn, addr = s.accept()
             except socket.timeout:
                 continue
-            _handle(conn, addr)
+            threading.Thread(target=_handle, args=(conn, addr), daemon=True).start()
     except KeyboardInterrupt:
         log.info("shutting down")
     finally:

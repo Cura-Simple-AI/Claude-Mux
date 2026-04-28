@@ -1071,8 +1071,11 @@ def cmd_statusline():
 
     CLAUDE_MUX_DIR = Path.home() / ".claude-mux"
 
-    # Read JSON from stdin (may be empty if Claude Code doesn't pipe anything)
-    raw = sys.stdin.read().strip()
+    raw = ""
+    # Non-blocking read: select(1) with 0 timeout — only read if data available
+    import select as _sel
+    if _sel.select([sys.stdin], [], [], 0)[0]:
+        raw = sys.stdin.read(65536).strip()
 
     # Active subscription name from cache file
     active_name = ""
@@ -1101,7 +1104,8 @@ def cmd_statusline():
         model = model_raw
 
     ctx = data.get("context_window", {})
-    rate_limits = data.get("rate_limits", [])
+    # Coerce null → [] (Claude Code 2.1.121 sends rate_limits: null)
+    rate_limits = data.get("rate_limits") or []
 
     # Context window usage — support both old and new format
     ctx_pct = ""
@@ -1114,10 +1118,10 @@ def cmd_statusline():
         if total and total > 0:
             ctx_pct = f"{round(used / total * 100)}%"
 
-    # Rate limit windows — prefer cached headers, else compute from usage.log
+    # Rate limit windows — only from Claude Code stdin JSON (rate_limits array)
+    # OAuth/Max/DeepSeek users get null → no 5h/7d shown
     window_parts = []
     if rate_limits:
-        # Old Claude Code format: rate_limits array in stdin JSON
         for rl in rate_limits:
             window = rl.get("window", "")
             remaining = rl.get("tokens_remaining", 0)
@@ -1125,9 +1129,6 @@ def cmd_statusline():
             if window and limit and limit > 0:
                 used_pct = round((1 - remaining / limit) * 100)
                 window_parts.append(f"{window} {used_pct}%")
-    else:
-        # New format: build windows from usage.log + optional rate-limits.json
-        window_parts = _compute_usage_windows(CLAUDE_MUX_DIR)
 
     # Build output parts
     parts = []
