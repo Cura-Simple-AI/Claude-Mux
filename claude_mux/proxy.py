@@ -200,37 +200,86 @@ def _handle(conn, addr):
 
         try:
             upstream_resp = urllib.request.urlopen(upstream_req, timeout=120)
-            resp_body = upstream_resp.read()
             status = upstream_resp.status
-            elapsed = int((time.time() - t0) * 1000)
+            ctype = upstream_resp.headers.get("Content-Type", "application/json")
+            is_sse = "text/event-stream" in ctype
 
-            # Extract model + token usage from response if present.
-            # Anthropic returns SSE (text/event-stream) for streaming requests and
-            # plain JSON for non-streaming. Try JSON first, fall back to SSE parsing.
-            model = ""
-            try:
-                resp_json = json.loads(resp_body)
-                model = resp_json.get("model", "")
-                usage = resp_json.get("usage", {})
-                _record_usage(
-                    usage.get("input_tokens", 0),
-                    usage.get("output_tokens", 0),
-                    model,
-                )
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                # SSE streaming response — parse event lines
+            # Cache rate-limit headers immediately (available before body)
+            _record_rate_limits(upstream_resp.headers)
+
+            if is_sse:
+                # Streaming: forward chunks as they arrive so Claude Code
+                # gets tokens immediately (no buffering delay).
+                # Collect chunks in parallel for usage tracking.
+                status_text = {200: "OK", 429: "Too Many Requests",
+                               500: "Internal Server Error"}.get(status, "Unknown")
+                header = (
+                    f"HTTP/1.1 {status} {status_text}\r\n"
+                    f"Content-Type: {ctype}\r\n"
+                    f"Transfer-Encoding: chunked\r\n"
+                    f"Connection: close\r\n"
+                    f"Access-Control-Allow-Origin: *\r\n"
+                    f"\r\n"
+                ).encode()
+                try:
+                    conn.sendall(header)
+                except OSError:
+                    return
+
+                chunks: list = []
+                while True:
+                    chunk = upstream_resp.read(4096)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    # HTTP/1.1 chunked encoding
+                    try:
+                        conn.sendall(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
+                    except OSError:
+                        break
+                try:
+                    conn.sendall(b"0\r\n\r\n")  # chunked terminator
+                except OSError:
+                    pass
+
+                elapsed = int((time.time() - t0) * 1000)
+                resp_body = b"".join(chunks)
                 model, input_tokens, output_tokens = _parse_sse_usage(resp_body)
                 _record_usage(input_tokens, output_tokens, model)
 
-            # Cache rate-limit headers if Anthropic returns them
-            _record_rate_limits(upstream_resp.headers)
+                if DEBUG:
+                    _dbg(f"UPSTREAM→PROXY SSE status={status} chunks={len(chunks)}")
+                    _dbg(f"UPSTREAM→PROXY body={resp_body[:2000].decode('utf-8', errors='replace')}")
+                _log_request(method, path, status, elapsed, model)
+                # Connection already closed via chunked — skip _send_response
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+            else:
+                # Non-streaming: buffer + send
+                resp_body = upstream_resp.read()
+                elapsed = int((time.time() - t0) * 1000)
 
-            if DEBUG:
-                _dbg(f"UPSTREAM→PROXY status={status} headers={json.dumps(dict(upstream_resp.headers))}")
-                _dbg(f"UPSTREAM→PROXY body={resp_body[:2000].decode('utf-8', errors='replace')}")
+                model = ""
+                try:
+                    resp_json = json.loads(resp_body)
+                    model = resp_json.get("model", "")
+                    usage = resp_json.get("usage", {})
+                    _record_usage(
+                        usage.get("input_tokens", 0),
+                        usage.get("output_tokens", 0),
+                        model,
+                    )
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    pass
 
-            _log_request(method, path, status, elapsed, model)
-            _send_response(conn, status, resp_body, ctype=upstream_resp.headers.get("Content-Type", "application/json"))
+                if DEBUG:
+                    _dbg(f"UPSTREAM→PROXY status={status} headers={json.dumps(dict(upstream_resp.headers))}")
+                    _dbg(f"UPSTREAM→PROXY body={resp_body[:2000].decode('utf-8', errors='replace')}")
+
+                _log_request(method, path, status, elapsed, model)
+                _send_response(conn, status, resp_body, ctype=ctype)
 
         except urllib.error.HTTPError as e:
             elapsed = int((time.time() - t0) * 1000)
