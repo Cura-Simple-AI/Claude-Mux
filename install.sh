@@ -93,6 +93,16 @@ fi
 if command -v claude-mux &>/dev/null; then
   VERSION=$(claude-mux --version 2>/dev/null || echo "unknown")
   info "✓ claude-mux installed: $VERSION"
+
+  # --- Init: install statusline integration ---
+  if command -v claude &>/dev/null; then
+    info "Running: claude-mux init"
+    claude-mux init || warn "claude-mux init failed — run manually to set up the Claude Code status line"
+  else
+    warn "claude CLI not found — skipping claude-mux init"
+    warn "Run 'claude-mux init' manually after installing Claude Code"
+  fi
+
   info ""
   info "Run: claude-mux"
   info "Docs: $REPO/docs/QUICKSTART.md"
