@@ -105,6 +105,44 @@ def _log_request(method: str, path: str, status: int, elapsed_ms: int, model: st
     sys.stdout.flush()
 
 
+def _parse_sse_usage(body: bytes) -> tuple:
+    """Parse SSE event stream and extract model + token counts.
+
+    Anthropic streaming responses contain:
+      message_start → message.model + message.usage.input_tokens
+      message_delta → usage.output_tokens (final cumulative count)
+
+    Returns (model, input_tokens, output_tokens).
+    """
+    model = ""
+    input_tokens = 0
+    output_tokens = 0
+    try:
+        text = body.decode("utf-8", errors="replace")
+        for line in text.split("\n"):
+            if not line.startswith("data: "):
+                continue
+            payload = line[6:].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                data = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            t = data.get("type", "")
+            if t == "message_start":
+                msg = data.get("message", {})
+                model = msg.get("model", model)
+                usage = msg.get("usage", {})
+                input_tokens = usage.get("input_tokens", 0)
+            elif t == "message_delta":
+                usage = data.get("usage", {})
+                output_tokens = usage.get("output_tokens", output_tokens)
+    except Exception:
+        pass
+    return model, input_tokens, output_tokens
+
+
 def _handle(conn, addr):
     """Handle one connection — read request, forward, stream response."""
     try:
@@ -166,7 +204,9 @@ def _handle(conn, addr):
             status = upstream_resp.status
             elapsed = int((time.time() - t0) * 1000)
 
-            # Extract model + token usage from response if present
+            # Extract model + token usage from response if present.
+            # Anthropic returns SSE (text/event-stream) for streaming requests and
+            # plain JSON for non-streaming. Try JSON first, fall back to SSE parsing.
             model = ""
             try:
                 resp_json = json.loads(resp_body)
@@ -178,7 +218,9 @@ def _handle(conn, addr):
                     model,
                 )
             except (json.JSONDecodeError, UnicodeDecodeError):
-                pass
+                # SSE streaming response — parse event lines
+                model, input_tokens, output_tokens = _parse_sse_usage(resp_body)
+                _record_usage(input_tokens, output_tokens, model)
 
             # Cache rate-limit headers if Anthropic returns them
             _record_rate_limits(upstream_resp.headers)
