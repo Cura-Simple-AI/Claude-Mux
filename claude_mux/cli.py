@@ -975,10 +975,88 @@ def cmd_test_tui():
 
 _STATUSLINE_SCRIPT = """\
 #!/bin/sh
-# claude-mux statusline — reads cached active subscription name.
+# claude-mux statusline — rich status line via `cm statusline`.
+# Reads JSON from Claude Code on stdin (model, rate_limits, context_window, cost).
 # Installed by: claude-mux init
-cat "$HOME/.claude-mux/active-name" 2>/dev/null
+exec claude-mux statusline
 """
+
+
+# ---------------------------------------------------------------------------
+# statusline
+# ---------------------------------------------------------------------------
+
+@cli.command("statusline")
+def cmd_statusline():
+    """Format Claude Code status JSON from stdin into a compact status line.
+
+    Claude Code pipes a JSON payload to this command via the statusLine setting.
+    Output: active-sub · model · 5h XX% · 7d XX% · ctx XX%
+
+    Installed automatically by: claude-mux init
+    """
+    import sys
+    import json as _json
+    from pathlib import Path
+
+    CLAUDE_MUX_DIR = Path.home() / ".claude-mux"
+
+    # Read JSON from stdin (may be empty if Claude Code doesn't pipe anything)
+    raw = sys.stdin.read().strip()
+
+    # Active subscription name from cache file
+    active_name = ""
+    active_file = CLAUDE_MUX_DIR / "active-name"
+    if active_file.exists():
+        active_name = active_file.read_text().strip()
+
+    if not raw:
+        # No JSON — fall back to just the subscription name
+        if active_name:
+            click.echo(active_name)
+        return
+
+    try:
+        data = _json.loads(raw)
+    except _json.JSONDecodeError:
+        if active_name:
+            click.echo(active_name)
+        return
+
+    model = data.get("model", "")
+    ctx = data.get("context_window", {})
+    rate_limits = data.get("rate_limits", [])
+
+    # Context window usage
+    ctx_pct = ""
+    total = ctx.get("total_tokens", 0)
+    used = ctx.get("used_tokens", 0)
+    if total and total > 0:
+        ctx_pct = f"{round(used / total * 100)}%"
+
+    # Rate limit windows (5h and 7d)
+    window_parts = []
+    for rl in rate_limits:
+        window = rl.get("window", "")
+        remaining = rl.get("tokens_remaining", 0)
+        limit = rl.get("tokens_limit", 0)
+        if window and limit and limit > 0:
+            used_pct = round((1 - remaining / limit) * 100)
+            window_parts.append(f"{window} {used_pct}%")
+
+    # Build output parts
+    parts = []
+    if active_name:
+        parts.append(f"🔌 {active_name}")
+    if model:
+        # Shorten model name: claude-sonnet-4-6 → sonnet-4-6
+        short_model = model.replace("claude-", "")
+        parts.append(short_model)
+    parts.extend(window_parts)
+    if ctx_pct:
+        parts.append(f"ctx {ctx_pct}")
+
+    click.echo(" · ".join(parts))
 
 _STATUSLINE_SETTINGS_KEY = "statusLine"
 
