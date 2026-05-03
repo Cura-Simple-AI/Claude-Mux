@@ -9,7 +9,7 @@
 set -euo pipefail
 
 REPO="https://github.com/Cura-Simple-AI/Claude-Mux"
-PACKAGE="claude-mux"
+PACKAGE="git+https://github.com/Cura-Simple-AI/Claude-Mux.git"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -66,14 +66,14 @@ if $USE_PIPX; then
     info "Installing in editable mode with pipx..."
     pipx install --editable .
   else
-    info "Installing $PACKAGE with pipx..."
+    info "Installing claude-mux with pipx..."
     pipx install "$PACKAGE"
   fi
 elif $DEV_MODE; then
   info "Installing in editable mode with pip..."
   $PYTHON -m pip install -e ".[dev]"
 else
-  info "Installing $PACKAGE with pip..."
+  info "Installing claude-mux with pip..."
   $PYTHON -m pip install --upgrade "$PACKAGE"
 fi
 
