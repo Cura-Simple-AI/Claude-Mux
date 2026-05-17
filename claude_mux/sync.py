@@ -115,7 +115,14 @@ class SyncManager:
                 break
 
         if not base_url or base_url == "https://api.anthropic.com/v1":
-            # Ingen base URL eller Anthropic direct = OAuth / Claude Max
+            # Ingen base URL eller Anthropic direct = OAuth / Claude Max.
+            # Match on token first — multiple OAuth subs may exist.
+            token_match = self._match_from_settings()
+            if token_match:
+                sub = self.cm.get_subscription(token_match)
+                if sub and sub.get("auth_type") == "oauth":
+                    return token_match
+            # Fallback: first oauth sub
             for sub in self.cm.subscriptions:
                 if sub.get("auth_type") == "oauth":
                     return sub["id"]
