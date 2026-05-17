@@ -173,3 +173,95 @@ class TestDetectActiveMixedAuth:
         # Settings has a different localhost port
         _write_settings(sync, {"ANTHROPIC_BASE_URL": "http://localhost:19999"})
         assert sync.detect_active() is None
+
+
+def _make_claude_auth_output(base_url: str = "") -> str:
+    """Build a minimal `claude auth status --text` output."""
+    lines = ["Logged in as: test@example.com"]
+    if base_url:
+        lines.append(f"Anthropic base URL: {base_url}")
+    return "\n".join(lines)
+
+
+def _mock_claude_run(output: str):
+    """Return a mock subprocess.run that succeeds with the given stdout."""
+    return lambda *a, **kw: type("R", (), {"returncode": 0, "stdout": output})()
+
+
+class TestDetectActiveViaClaudeAuthStatus:
+    """Strategy 1 path — claude auth status succeeds."""
+
+    def test_multi_oauth_matches_by_token_not_first(self, cm, tmp_path, monkeypatch):
+        """When two OAuth subs exist, detect_active picks the one whose token
+        matches settings.json — NOT simply the first in the list."""
+        import claude_mux.sync as _sync_mod
+
+        sub_first = cm.add_subscription("troels", "", "", auth_type="oauth")
+        cm.update_subscription(sub_first["id"], api_key="sk-ant-TROELS")
+        sub_second = cm.add_subscription("ada", "", "", auth_type="oauth")
+        cm.update_subscription(sub_second["id"], api_key="sk-ant-ADA")
+
+        sync = SyncManager(cm)
+        monkeypatch.setattr(SyncManager, "SETTINGS_PATH", tmp_path / "settings.json")
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+
+        # Activate ada: write ada's token to settings.json
+        _write_settings(sync, {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-ADA"})
+
+        # claude auth status returns no base URL → OAuth path
+        monkeypatch.setattr(_sync_mod.subprocess, "run",
+                            _mock_claude_run(_make_claude_auth_output()))
+
+        assert sync.detect_active() == sub_second["id"]
+
+    def test_multi_oauth_first_sub_also_works(self, cm, tmp_path, monkeypatch):
+        """Token-match also works when the active sub happens to be first."""
+        import claude_mux.sync as _sync_mod
+
+        sub_first = cm.add_subscription("troels", "", "", auth_type="oauth")
+        cm.update_subscription(sub_first["id"], api_key="sk-ant-TROELS")
+        cm.add_subscription("ada", "", "", auth_type="oauth")  # second, not activated
+
+        sync = SyncManager(cm)
+        monkeypatch.setattr(SyncManager, "SETTINGS_PATH", tmp_path / "settings.json")
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+
+        _write_settings(sync, {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-TROELS"})
+        monkeypatch.setattr(_sync_mod.subprocess, "run",
+                            _mock_claude_run(_make_claude_auth_output()))
+
+        assert sync.detect_active() == sub_first["id"]
+
+    def test_no_token_in_settings_falls_back_to_first_oauth(self, cm, tmp_path, monkeypatch):
+        """No token in settings → fallback: return first oauth sub (pre-fix behaviour)."""
+        import claude_mux.sync as _sync_mod
+
+        sub_first = cm.add_subscription("troels", "", "", auth_type="oauth")
+        cm.add_subscription("ada", "", "", auth_type="oauth")
+
+        sync = SyncManager(cm)
+        monkeypatch.setattr(SyncManager, "SETTINGS_PATH", tmp_path / "settings.json")
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+
+        _write_settings(sync, {})  # no token
+        monkeypatch.setattr(_sync_mod.subprocess, "run",
+                            _mock_claude_run(_make_claude_auth_output()))
+
+        assert sync.detect_active() == sub_first["id"]
+
+    def test_bearer_sub_matched_via_claude_auth_output(self, cm, tmp_path, monkeypatch):
+        """Bearer sub matched by localhost port from claude auth status output."""
+        import claude_mux.sync as _sync_mod
+
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        sub = cm.add_subscription("ds", "https://api.deepseek.com/v1", "DS_KEY", auth_type="bearer")
+        cm.set_instance_port(sub["id"], 18082)
+
+        sync = SyncManager(cm)
+        monkeypatch.setattr(SyncManager, "SETTINGS_PATH", tmp_path / "settings.json")
+        _write_settings(sync, {})
+
+        monkeypatch.setattr(_sync_mod.subprocess, "run",
+                            _mock_claude_run(_make_claude_auth_output("http://localhost:18082")))
+
+        assert sync.detect_active() == sub["id"]
