@@ -16,6 +16,7 @@ from claude_mux.config import (
     CLAUDE_MUX_DIR,
     SETTINGS_KEYS_TO_REMOVE,
     ConfigManager,
+    fetch_copilot_models,
     _atomic_write,
 )
 
@@ -334,6 +335,47 @@ class SyncManager:
 
         auth_type = sub.get("auth_type", "bearer")
         api_key = self._resolve_api_key(sub, allow_subprocess=(auth_type == "gh_token"))
+        provider_url = sub.get("provider_url", "").rstrip("/")
+
+        # Copilot model discovery is a special case: Heimsense serves inference
+        # well, but does not expose /v1/models locally. Query Copilot directly.
+        if auth_type == "gh_token":
+            try:
+                models = [m["id"] for m in fetch_copilot_models(api_key) if m.get("id")][:200]
+                log.info("fetch_available_models: %s → %d models", sub["name"], len(models))
+                self.cm.update_subscription_models(sub_id, models, _time.time())
+                return models
+            except Exception as e:
+                log.warning("fetch_available_models: unexpected Copilot error for %s: %s", sub.get("name", sub_id), e)
+                self.cm.update_subscription_models(sub_id, [], None)
+                return []
+
+        # OpenAI model discovery must also bypass the local proxy. Heimsense
+        # currently returns 404 on GET /v1/models for OpenAI-backed instances.
+        if auth_type == "bearer" and provider_url.startswith("https://api.openai.com/"):
+            try:
+                url = f"{provider_url}/models"
+                req = Request(url, method="GET")
+                if api_key:
+                    req.add_header("Authorization", f"Bearer {api_key}")
+                with urlopen(req, timeout=10) as resp:
+                    raw = resp.read().decode("utf-8", errors="replace")
+                data = _json.loads(raw)
+                models = [
+                    m["id"] for m in data.get("data", [])
+                    if isinstance(m, dict) and m.get("id")
+                ][:200]
+                log.info("fetch_available_models: %s → %d models", sub["name"], len(models))
+                self.cm.update_subscription_models(sub_id, models, _time.time())
+                return models
+            except (HTTPError, URLError, OSError) as e:
+                log.warning("fetch_available_models: %s failed: %s", sub.get("name", sub_id), e)
+                self.cm.update_subscription_models(sub_id, [], None)
+                return []
+            except Exception as e:
+                log.warning("fetch_available_models: unexpected error for %s: %s", sub.get("name", sub_id), e)
+                self.cm.update_subscription_models(sub_id, [], None)
+                return []
 
         try:
             if auth_type == "oauth":

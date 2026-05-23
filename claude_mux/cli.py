@@ -58,7 +58,7 @@ def _sub_status(cm: ConfigManager, im: InstanceManager, sub: dict) -> str:
     if not port:
         return "stopped"
     try:
-        info = im.status(sub["id"])
+        info = im.get_status(sub["id"])
         return info.get("status", "stopped")
     except Exception:
         return "unknown"

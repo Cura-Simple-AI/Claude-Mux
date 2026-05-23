@@ -2,6 +2,7 @@
 import tempfile
 import shutil
 import os
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,8 +16,9 @@ def tmp_setup():
     cm = hs.ConfigManager(data_file=d / "subs.json")
     # Patch CLAUDE_MUX_DIR så instans-mapper skrives til tmp
     with patch.object(hs, "CLAUDE_MUX_DIR", d / "claude-mux"):
-        im = hs.InstanceManager(cm)
-        yield cm, im, d
+        with patch("claude_mux.instance.CLAUDE_MUX_DIR", d / "claude-mux"):
+            im = hs.InstanceManager(cm)
+            yield cm, im, d
     shutil.rmtree(d, ignore_errors=True)
 
 
@@ -184,3 +186,39 @@ class TestConfigManagerEdgeCases:
             assert len(cm.subscriptions) == 1
         finally:
             shutil.rmtree(d, ignore_errors=True)
+
+
+class TestInstanceStart:
+    def test_start_uses_heimsense_run_for_proxy_subscriptions(self, tmp_setup):
+        cm, im, d = tmp_setup
+        sub = cm.add_subscription("openai", "https://api.openai.com/v1", "OPENAI_API_KEY", auth_type="bearer")
+        env_path = d / "openai.env"
+        env_path.write_text("ANTHROPIC_API_KEY=test\n")
+        inst_dir = d / "claude-mux" / "instances" / "openai"
+        inst_dir.mkdir(parents=True, exist_ok=True)
+        (inst_dir / "out.log").write_text("old out\n")
+        (inst_dir / "error.log").write_text("old err\n")
+
+        calls = []
+
+        def fake_run(args, capture_output=False, text=False, **kwargs):
+            calls.append(args)
+            if args[:2] == ["pm2", "start"]:
+                return subprocess.CompletedProcess(args, 0, stdout="started", stderr="")
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        with patch.object(hs.InstanceManager, "HEIMSENSE_BIN", "/usr/local/bin/heimsense"):
+            with patch.object(hs.InstanceManager, "generate_env", return_value=env_path):
+                with patch("claude_mux.instance._port_is_available", return_value=True):
+                    with patch("claude_mux.instance.Path.exists", return_value=True):
+                        with patch("claude_mux.instance.subprocess.run", side_effect=fake_run):
+                            with patch.object(hs.InstanceManager, "_regenerate_ecosystem"):
+                                with patch.object(hs.InstanceManager, "_pm2_save"):
+                                    result = im.start(sub["id"])
+
+        assert result["status"] == "started"
+        pm2_start = next(args for args in calls if args[:2] == ["pm2", "start"])
+        cmd = pm2_start[-1]
+        assert "exec /usr/local/bin/heimsense run" in cmd
+        assert (inst_dir / "out.log").read_text() == ""
+        assert (inst_dir / "error.log").read_text() == ""
