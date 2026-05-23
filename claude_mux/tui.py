@@ -757,14 +757,14 @@ class AddWizard(ModalScreen):
             yield Label("Name:")
             yield Input(placeholder="e.g. my-deepseek", id="wiz-name")
             yield Static("", id="wiz-name-hint")
-            with Horizontal():
+            with Horizontal(classes="button-row"):
                 yield Button("Cancel", id="cancel", variant="default")
                 yield Button("Next →", id="next-name", variant="primary", disabled=True)
         # Step 2: Provider list (numbered)
         with Vertical(id="step2", classes="hidden"):
             yield Static("Select provider (type 1-8):", id="wiz-provider-prompt")
             yield Static("", id="wiz-provider-list")
-            with Horizontal():
+            with Horizontal(classes="button-row"):
                 yield Button("← Back", id="back-provider", variant="default")
         # Step 3: API Key + URL (hidden for OAuth)
         with Vertical(id="step3", classes="hidden"):
@@ -772,7 +772,7 @@ class AddWizard(ModalScreen):
             yield Input(placeholder="e.g. MY_API_KEY or sk-...", id="wiz-key", password=True)
             yield Label("Base URL (auto-filled for presets):", id="wiz-url-label")
             yield Input(placeholder="https://api.example.com/v1", id="wiz-url")
-            with Horizontal():
+            with Horizontal(classes="button-row"):
                 yield Button("← Back", id="back-key", variant="default")
                 yield Button("Next →", id="next-key", variant="primary")
         # Step 4: Model maps (skipped for OAuth)
@@ -805,7 +805,7 @@ class AddWizard(ModalScreen):
                 yield Button("Authenticate in browser", id="oauth-open-url", variant="primary")
             yield Static("", id="oauth-status")
             yield Input(placeholder="paste code here", id="wiz-oauth-code", classes="hidden")
-            with Horizontal(id="oauth-nav-row"):
+            with Horizontal(id="oauth-nav-row", classes="button-row"):
                 yield Button("Back", id="back-oauth", variant="default")
                 yield Button("Next", id="oauth-next", variant="primary", disabled=True)
             yield Static("", id="oauth-result", classes="hidden")
