@@ -719,10 +719,13 @@ class AddWizard(ModalScreen):
     .model-row > Label {
         width: 12;
         padding: 0 1 0 0;
-        content-align: right middle;
+        content-align: left middle;
     }
     .model-row > Input, .model-row > Select {
         width: 1fr;
+    }
+    .button-row {
+        margin-top: 1;
     }
     """
 
@@ -770,7 +773,6 @@ class AddWizard(ModalScreen):
         # Step 4: Model maps (skipped for OAuth)
         with VerticalScroll(id="step4", classes="hidden"):
             yield Static("", id="wiz-models-status")
-            yield Label("Model Maps:")
             with Horizontal(classes="model-row"):
                 yield Label("Haiku:")
                 yield Input(placeholder="model name", id="wiz-haiku")
@@ -786,10 +788,7 @@ class AddWizard(ModalScreen):
             with Horizontal(classes="model-row"):
                 yield Label("Force:")
                 yield Select([("No force", "__none__")], id="wiz-force", prompt="No force", allow_blank=False)
-            with Horizontal(classes="model-row"):
-                yield Label("Notes:")
-                yield Input(placeholder="notes", id="wiz-notes")
-            with Horizontal():
+            with Horizontal(classes="button-row"):
                 yield Button("← Back", id="back-models", variant="default")
                 btn_label = "Save" if self._edit_mode else "Create"
                 yield Button(Text.from_markup(f"[bold yellow]{btn_label[0]}[/bold yellow]{btn_label[1:]}"), id="create", variant="primary")
@@ -825,7 +824,8 @@ class AddWizard(ModalScreen):
             self.query_one("#wiz-haiku", Input).value = models.get("haiku", "")
             self.query_one("#wiz-sonnet", Input).value = models.get("sonnet", "")
             self.query_one("#wiz-opus", Input).value = models.get("opus", "")
-            self.query_one("#wiz-notes", Input).value = sub.get("notes", "")
+            # Notes field removed from UI — preserve existing notes value
+            # (no UI update needed)
             self._validate_step1()
             # Reauth: jump directly to OAuth flow
             if self._reauth and sub.get("auth_type") == "oauth":
@@ -1052,7 +1052,8 @@ class AddWizard(ModalScreen):
             "sonnet": self._get_model_value("sonnet"),
             "opus": self._get_model_value("opus"),
         }
-        notes = self.query_one("#wiz-notes", Input).value.strip().replace("[", "\\[").replace("]", "\\]")
+        # Notes field removed from UI — preserve existing value if editing
+        notes = self._existing.get("notes", "") if self._edit_mode and self._existing else ""
         # Force model: read from select (may not exist for oauth skip)
         try:
             force_sel = self.query_one("#wiz-force", Select)
@@ -1482,7 +1483,8 @@ class AddWizard(ModalScreen):
             "sonnet": self._get_model_value("sonnet") or "claude-sonnet-4-6",
             "opus": self._get_model_value("opus") or "claude-opus-4-7",
         }
-        notes = self.query_one("#wiz-notes", Input).value.strip().replace("[", "\\[").replace("]", "\\]")
+        # Notes field removed from UI — preserve existing value if editing
+        notes = self._existing.get("notes", "") if self._edit_mode and self._existing else ""
         api_key_env = "CLAUDE_CODE_OAUTH_TOKEN"
         if self._edit_mode and self._existing:
             sub_id = self._existing["id"]
