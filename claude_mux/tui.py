@@ -962,6 +962,18 @@ class AddWizard(ModalScreen):
         self._data["api_key"] = self._existing.get("api_key", "") if self._existing else ""
         self._data["provider_url"] = self._existing.get("provider_url", "") if self._existing else ""
         self._data["auth_type"] = self._existing.get("auth_type", "bearer") if self._existing else "bearer"
+        # Set provider from existing subscription
+        if self._existing:
+            self._selected_provider = self._existing.get("provider_key", "")
+            # If Copilot: fetch models and apply selects
+            if self._selected_provider == "copilot":
+                self._start_copilot_fetch()
+                # Apply immediately if models already cached, otherwise poll
+                if self._copilot_fetch_done:
+                    self._apply_copilot_model_selects()
+                else:
+                    self.query_one("#wiz-models-status", Static).update("[yellow]Fetching models from Copilot...[/yellow]")
+                    self.set_interval(0.5, self._poll_copilot_models)
         self._show_side(4)
         self.query_one("#wiz-title", Static).update("[bold]Edit Model Maps[/bold]")
         self.query_one("#wiz-key-label", Label).display = False
