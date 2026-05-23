@@ -721,8 +721,13 @@ class AddWizard(ModalScreen):
         padding: 0 1 0 0;
         content-align: left middle;
     }
-    .model-row > Input, .model-row > Select {
+    .model-row > Input {
         width: 1fr;
+        border: tall $primary;
+    }
+    .model-row > Select {
+        width: 1fr;
+        border: tall $primary;
     }
     .button-row {
         margin-top: 1;
