@@ -792,7 +792,8 @@ class AddWizard(ModalScreen):
                 yield Select([], id="wiz-opus-sel", prompt="Select model...", classes="hidden")
             with Horizontal(classes="model-row"):
                 yield Label("Force:")
-                yield Select([("No force", "__none__")], id="wiz-force", prompt="No force", allow_blank=False)
+                yield Input(placeholder="optional: force all to one model", id="wiz-force-input")
+                yield Select([("No force", "__none__")], id="wiz-force", prompt="No force", allow_blank=False, classes="hidden")
             with Horizontal(classes="button-row"):
                 yield Button("← Back", id="back-models", variant="default")
                 btn_label = "Save" if self._edit_mode else "Create"
@@ -829,6 +830,10 @@ class AddWizard(ModalScreen):
             self.query_one("#wiz-haiku", Input).value = models.get("haiku", "")
             self.query_one("#wiz-sonnet", Input).value = models.get("sonnet", "")
             self.query_one("#wiz-opus", Input).value = models.get("opus", "")
+            # Force model: pre-fill input (Select will be populated if Copilot)
+            force_val = sub.get("force_model", "")
+            if force_val and force_val != "__none__":
+                self.query_one("#wiz-force-input", Input).value = force_val
             # Notes field removed from UI — preserve existing notes value
             # (no UI update needed)
             self._validate_step1()
@@ -1032,7 +1037,7 @@ class AddWizard(ModalScreen):
             if not self._copilot_fetch_done:
                 self.query_one("#wiz-models-status", Static).update("[yellow]Fetching models from Copilot...[/yellow]")
                 self.set_interval(0.5, self._poll_copilot_models)
-        self._populate_force_select()
+        # For non-Copilot: all fields remain as Input (default)
         self.query_one("#create", Button).focus()
 
     def _populate_force_select(self):
@@ -1065,10 +1070,16 @@ class AddWizard(ModalScreen):
         }
         # Notes field removed from UI — preserve existing value if editing
         notes = self._existing.get("notes", "") if self._edit_mode and self._existing else ""
-        # Force model: read from select (may not exist for oauth skip)
+        # Force model: read from select or input depending on visibility
         try:
             force_sel = self.query_one("#wiz-force", Select)
-            force_model = str(force_sel.value) if force_sel.value not in (Select.BLANK, None) else "__none__"
+            force_inp = self.query_one("#wiz-force-input", Input)
+            if force_sel.display:
+                # Select is visible (Copilot or other provider with model list)
+                force_model = str(force_sel.value) if force_sel.value not in (Select.BLANK, None) else "__none__"
+            else:
+                # Input is visible (free text)
+                force_model = force_inp.value.strip() or "__none__"
         except Exception:
             force_model = "__none__"
         if self._edit_mode and self._existing:
@@ -1158,6 +1169,21 @@ class AddWizard(ModalScreen):
                 pass
             sel.display = True
             inp.display = False
+        # Force field: populate with "No force" + all models
+        force_sel = self.query_one("#wiz-force", Select)
+        force_inp = self.query_one("#wiz-force-input", Input)
+        force_options = [("No force", "__none__")] + options
+        force_sel.set_options(force_options)
+        # Preserve existing force value if set
+        current_force = force_inp.value.strip() if force_inp.value else "__none__"
+        if self._edit_mode and self._existing:
+            current_force = self._existing.get("force_model", "__none__")
+        try:
+            force_sel.value = current_force
+        except Exception:
+            pass
+        force_sel.display = True
+        force_inp.display = False
         self.query_one("#wiz-models-status", Static).update(
             f"[green]{len(self._copilot_models)} models available[/green]"
         )
