@@ -700,7 +700,7 @@ class AddWizard(ModalScreen):
     """Multi-step wizard for adding/editing subscriptions."""
 
     CSS = """
-    AddWizard > Vertical, AddWizard > Horizontal {
+    AddWizard > Vertical, AddWizard > Horizontal, AddWizard > VerticalScroll {
         width: 70;
     }
     .oauth-url {
@@ -721,7 +721,7 @@ class AddWizard(ModalScreen):
         padding: 0 1 0 0;
         content-align: right middle;
     }
-    .model-row > Vertical {
+    .model-row > Input, .model-row > Select {
         width: 1fr;
     }
     """
@@ -768,32 +768,27 @@ class AddWizard(ModalScreen):
                 yield Button("← Back", id="back-key", variant="default")
                 yield Button("Next →", id="next-key", variant="primary")
         # Step 4: Model maps (skipped for OAuth)
-        with Vertical(id="step4", classes="hidden"):
+        with VerticalScroll(id="step4", classes="hidden"):
             yield Static("", id="wiz-models-status")
             yield Label("Model Maps:")
             with Horizontal(classes="model-row"):
                 yield Label("Haiku:")
-                with Vertical():
-                    yield Input(placeholder="model name", id="wiz-haiku")
-                    yield Select([], id="wiz-haiku-sel", prompt="Select model...", classes="hidden")
+                yield Input(placeholder="model name", id="wiz-haiku")
+                yield Select([], id="wiz-haiku-sel", prompt="Select model...", classes="hidden")
             with Horizontal(classes="model-row"):
                 yield Label("Sonnet:")
-                with Vertical():
-                    yield Input(placeholder="model name", id="wiz-sonnet")
-                    yield Select([], id="wiz-sonnet-sel", prompt="Select model...", classes="hidden")
+                yield Input(placeholder="model name", id="wiz-sonnet")
+                yield Select([], id="wiz-sonnet-sel", prompt="Select model...", classes="hidden")
             with Horizontal(classes="model-row"):
                 yield Label("Opus:")
-                with Vertical():
-                    yield Input(placeholder="model name", id="wiz-opus")
-                    yield Select([], id="wiz-opus-sel", prompt="Select model...", classes="hidden")
+                yield Input(placeholder="model name", id="wiz-opus")
+                yield Select([], id="wiz-opus-sel", prompt="Select model...", classes="hidden")
             with Horizontal(classes="model-row"):
                 yield Label("Force:")
-                with Vertical():
-                    yield Select([("No force", "__none__")], id="wiz-force", prompt="No force", allow_blank=False)
+                yield Select([("No force", "__none__")], id="wiz-force", prompt="No force", allow_blank=False)
             with Horizontal(classes="model-row"):
                 yield Label("Notes:")
-                with Vertical():
-                    yield Input(placeholder="notes", id="wiz-notes")
+                yield Input(placeholder="notes", id="wiz-notes")
             with Horizontal():
                 yield Button("← Back", id="back-models", variant="default")
                 btn_label = "Save" if self._edit_mode else "Create"
@@ -815,7 +810,7 @@ class AddWizard(ModalScreen):
     def on_mount(self):
         # Hide all steps except step1
         for s in ("step2", "step3", "step4", "step5"):
-            self.query_one(f"#{s}", Vertical).display = False
+            self.query_one(f"#{s}").display = False
         # Build provider index map
         self._provider_index_map = {}
         for i, key in enumerate(PROVIDER_PRESETS, start=1):
@@ -843,8 +838,8 @@ class AddWizard(ModalScreen):
 
     def _show_side(self, n: int):
         for s in ("step1", "step2", "step3", "step4", "step5"):
-            self.query_one(f"#{s}", Vertical).display = False
-        self.query_one(f"#step{n}", Vertical).display = True
+            self.query_one(f"#{s}").display = False
+        self.query_one(f"#step{n}").display = True
         self._step = n
 
     def on_input_submitted(self, event: Input.Submitted):
