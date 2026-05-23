@@ -777,6 +777,10 @@ class AddWizard(ModalScreen):
         # Step 4: Model maps (skipped for OAuth)
         with VerticalScroll(id="step4", classes="hidden"):
             yield Static("", id="wiz-models-status")
+            # Name field (only shown in edit mode)
+            with Horizontal(classes="model-row", id="wiz-name-row-edit"):
+                yield Label("Name:")
+                yield Input(placeholder="subscription name", id="wiz-name-edit")
             with Horizontal(classes="model-row"):
                 yield Label("Haiku:")
                 yield Input(placeholder="model name", id="wiz-haiku")
@@ -977,13 +981,13 @@ class AddWizard(ModalScreen):
         self.query_one("#wiz-key", Input).display = False
         self.query_one("#wiz-url-label", Label).display = False
         self.query_one("#wiz-url", Input).display = False
-        # Focus first visible field (Select if models available, else Input)
-        haiku_sel = self.query_one("#wiz-haiku-sel", Select)
-        haiku_inp = self.query_one("#wiz-haiku", Input)
-        if haiku_sel.display:
-            haiku_sel.focus()
-        else:
-            haiku_inp.focus()
+        # Show and populate name field in edit mode
+        name_row = self.query_one("#wiz-name-row-edit", Horizontal)
+        name_input = self.query_one("#wiz-name-edit", Input)
+        name_row.display = True
+        name_input.value = self._existing.get("name", "") if self._existing else ""
+        # Focus name field first, then tab to model fields
+        name_input.focus()
 
     def _go_to_providers(self):
         """From step 1 → push ProviderSelectScreen."""
@@ -1047,6 +1051,8 @@ class AddWizard(ModalScreen):
         self._data["provider_url"] = self.query_one("#wiz-url", Input).value.strip()
         self._show_side(4)
         self.query_one("#wiz-title", Static).update("[bold]Model Maps[/bold]")
+        # Hide name field in add mode (only shown in edit mode)
+        self.query_one("#wiz-name-row-edit", Horizontal).display = False
         # Copilot: show Select if models are ready
         if self._selected_provider == "copilot":
             self._apply_copilot_model_selects()
@@ -1075,6 +1081,11 @@ class AddWizard(ModalScreen):
 
     def _do_create(self):
         """Create or update subscription."""
+        # In edit mode: read updated name from edit field
+        if self._edit_mode:
+            name_edit = self.query_one("#wiz-name-edit", Input)
+            if name_edit.display:
+                self._data["name"] = name_edit.value.strip()
         name = self._data.get("name", "")
         provider_url = self._data.get("provider_url", "")
         api_key = self._data.get("api_key", "")
