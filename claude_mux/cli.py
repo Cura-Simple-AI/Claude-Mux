@@ -20,7 +20,7 @@ from claude_mux.tui import (
     FailoverManager,
     CLAUDE_MUX_DIR,
 )
-from claude_mux.sync import TIER_FALLBACK_MODELS, extract_response_body
+from claude_mux.sync import TIER_FALLBACK_MODELS, extract_response_body, build_inference_test_payload
 
 
 # ---------------------------------------------------------------------------
@@ -534,12 +534,7 @@ def cmd_probe(name, model, as_json):
                    or sub.get("model_maps", {}).get("sonnet")
                    or TIER_FALLBACK_MODELS["haiku"])
     url = f"http://localhost:{port}/v1/messages"
-    payload = json.dumps({
-        "model": probe_model,
-        "max_tokens": 100,
-        "stream": False,
-        "messages": [{"role": "user", "content": "Tell me a fun fact about the universe in 2 sentences."}],
-    }).encode()
+    payload = json.dumps(build_inference_test_payload(probe_model, sub.get("auth_type", ""))).encode()
 
     t0 = _time.time()
     try:

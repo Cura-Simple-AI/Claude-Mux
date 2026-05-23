@@ -31,7 +31,7 @@ from claude_mux.config import (  # noqa: E402
     ConfigManager,
 )
 from claude_mux.instance import InstanceManager, _format_duration  # noqa: E402
-from claude_mux.sync import SyncManager, TIER_FALLBACK_MODELS, extract_response_body  # noqa: E402
+from claude_mux.sync import SyncManager, TIER_FALLBACK_MODELS, extract_response_body, build_inference_test_payload  # noqa: E402
 from claude_mux.failover import FailoverManager  # noqa: E402
 
 import json
@@ -2317,12 +2317,7 @@ class HeimsenseApp(App):
         code=0 means connection error.
         """
         test_url = f"http://localhost:{port}/v1/messages"
-        payload = json.dumps({
-            "model": model,
-            "max_tokens": 100,
-            "stream": False,
-            "messages": [{"role": "user", "content": "Tell me a fun fact about the universe in 2 sentences."}],
-        })
+        payload = json.dumps(build_inference_test_payload(model))
         start_ts = time.time()
         try:
             req = urllib.request.Request(
@@ -3162,4 +3157,3 @@ if __name__ == "__main__":
         cm.delete_subscription(sub["id"])
         assert len(cm.subscriptions) == initial_count
         print("OK: Smoke test passed")
-

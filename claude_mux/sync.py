@@ -39,6 +39,32 @@ def extract_response_body(raw: str, code: int, max_len: int = 500) -> str:
     return raw[:max_len]
 
 
+def build_inference_test_payload(model: str, auth_type: str = "") -> dict:
+    """Build a small inference payload suitable for provider smoke tests.
+
+    Newer GPT-5-family models reject ``max_tokens`` and require
+    ``max_completion_tokens`` instead. Keep the rest of the payload identical
+    so CLI/TUI smoke tests stay comparable across providers.
+    """
+    payload = {
+        "model": model,
+        "stream": False,
+        "messages": [{"role": "user", "content": "Tell me a fun fact about the universe in 2 sentences."}],
+    }
+    if model.startswith("gpt-5") or model.startswith(("o1", "o3", "o4")):
+        payload["max_completion_tokens"] = 100
+    else:
+        payload["max_tokens"] = 100
+
+    if auth_type in ("oauth", "oauth_proxy"):
+        payload["system"] = [{
+            "type": "text",
+            "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+        }]
+
+    return payload
+
+
 # Plain-text file caching the active subscription name for fast statusline reads.
 ACTIVE_NAME_FILE = CLAUDE_MUX_DIR / "active-name"
 
@@ -482,19 +508,7 @@ class SyncManager:
         auth_type = sub.get("auth_type", "bearer")
         api_key = self._resolve_api_key(sub)
 
-        payload_dict = {
-            "model": model,
-            "max_tokens": 100,
-            "stream": False,
-            "messages": [{"role": "user", "content": "Tell me a fun fact about the universe in 2 sentences."}],
-        }
-        # OAuth tokens (oauth, oauth_proxy) require the Claude Code system prompt
-        # to access premium models — without it, opus/sonnet return 429 (out_of_credits).
-        if auth_type in ("oauth", "oauth_proxy"):
-            payload_dict["system"] = [{
-                "type": "text",
-                "text": "You are Claude Code, Anthropic's official CLI for Claude.",
-            }]
+        payload_dict = build_inference_test_payload(model, auth_type)
         payload = _json.dumps(payload_dict).encode()
 
         headers = {"Content-Type": "application/json", "anthropic-version": "2023-06-01"}

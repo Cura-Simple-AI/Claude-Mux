@@ -60,3 +60,24 @@ class TestSyncManagerBearer:
         env = settings.get("env", {})
         assert "localhost:18080" in env.get("ANTHROPIC_BASE_URL", "")
         assert env.get("ANTHROPIC_AUTH_TOKEN") == "test-key"
+
+
+class TestInferencePayload:
+    def test_gpt5_uses_max_completion_tokens(self):
+        payload = hs.build_inference_test_payload("gpt-5.5")
+        assert payload["max_completion_tokens"] == 100
+        assert "max_tokens" not in payload
+
+    def test_non_gpt5_uses_max_tokens(self):
+        payload = hs.build_inference_test_payload("gpt-4o-mini")
+        assert payload["max_tokens"] == 100
+        assert "max_completion_tokens" not in payload
+
+    def test_openai_reasoning_models_use_max_completion_tokens(self):
+        payload = hs.build_inference_test_payload("o3")
+        assert payload["max_completion_tokens"] == 100
+        assert "max_tokens" not in payload
+
+    def test_oauth_payload_adds_system_prompt(self):
+        payload = hs.build_inference_test_payload("claude-sonnet-4-6", "oauth")
+        assert "system" in payload
