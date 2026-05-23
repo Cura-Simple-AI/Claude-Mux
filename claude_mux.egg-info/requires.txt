@@ -1,0 +1,7 @@
+textual>=0.80.0
+rich>=13.0.0
+psutil>=5.9.0
+click>=8.0
+
+[dev]
+pytest>=8.0
