@@ -700,6 +700,9 @@ class AddWizard(ModalScreen):
     """Multi-step wizard for adding/editing subscriptions."""
 
     CSS = """
+    AddWizard > Vertical, AddWizard > Horizontal {
+        width: 70;
+    }
     .oauth-url {
         border: solid $accent;
         padding: 1;
@@ -708,6 +711,18 @@ class AddWizard(ModalScreen):
         overflow-x: auto;
         overflow-y: hidden;
         width: 100%;
+    }
+    .model-row {
+        width: 100%;
+        height: auto;
+    }
+    .model-row > Label {
+        width: 12;
+        padding: 0 1 0 0;
+        content-align: right middle;
+    }
+    .model-row > Vertical {
+        width: 1fr;
     }
     """
 
@@ -756,19 +771,29 @@ class AddWizard(ModalScreen):
         with Vertical(id="step4", classes="hidden"):
             yield Static("", id="wiz-models-status")
             yield Label("Model Maps:")
-            yield Label("Haiku:")
-            yield Input(placeholder="model name", id="wiz-haiku")
-            yield Select([], id="wiz-haiku-sel", prompt="Select model...", classes="hidden")
-            yield Label("Sonnet:")
-            yield Input(placeholder="model name", id="wiz-sonnet")
-            yield Select([], id="wiz-sonnet-sel", prompt="Select model...", classes="hidden")
-            yield Label("Opus:")
-            yield Input(placeholder="model name", id="wiz-opus")
-            yield Select([], id="wiz-opus-sel", prompt="Select model...", classes="hidden")
-            yield Label("Force all aliases to one model (optional):")
-            yield Select([("No force", "__none__")], id="wiz-force", prompt="No force", allow_blank=False)
-            yield Label("Notes (optional):")
-            yield Input(placeholder="notes", id="wiz-notes")
+            with Horizontal(classes="model-row"):
+                yield Label("Haiku:")
+                with Vertical():
+                    yield Input(placeholder="model name", id="wiz-haiku")
+                    yield Select([], id="wiz-haiku-sel", prompt="Select model...", classes="hidden")
+            with Horizontal(classes="model-row"):
+                yield Label("Sonnet:")
+                with Vertical():
+                    yield Input(placeholder="model name", id="wiz-sonnet")
+                    yield Select([], id="wiz-sonnet-sel", prompt="Select model...", classes="hidden")
+            with Horizontal(classes="model-row"):
+                yield Label("Opus:")
+                with Vertical():
+                    yield Input(placeholder="model name", id="wiz-opus")
+                    yield Select([], id="wiz-opus-sel", prompt="Select model...", classes="hidden")
+            with Horizontal(classes="model-row"):
+                yield Label("Force:")
+                with Vertical():
+                    yield Select([("No force", "__none__")], id="wiz-force", prompt="No force", allow_blank=False)
+            with Horizontal(classes="model-row"):
+                yield Label("Notes:")
+                with Vertical():
+                    yield Input(placeholder="notes", id="wiz-notes")
             with Horizontal():
                 yield Button("← Back", id="back-models", variant="default")
                 btn_label = "Save" if self._edit_mode else "Create"
