@@ -723,11 +723,15 @@ class AddWizard(ModalScreen):
     }
     .model-row > Input {
         width: 1fr;
-        border: tall $primary;
+        height: 1;
+        border: round $primary;
+        padding: 0;
     }
     .model-row > Select {
         width: 1fr;
-        border: tall $primary;
+        height: 1;
+        border: round $primary;
+        padding: 0;
     }
     .button-row {
         margin-top: 1;
