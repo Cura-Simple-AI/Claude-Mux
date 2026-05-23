@@ -961,6 +961,7 @@ class AddWizard(ModalScreen):
 
     def _skip_to_models_edit(self):
         """Edit-mode: jump directly to models (step 4), locking provider fields."""
+        self._data["name"] = self._existing.get("name", "") if self._existing else ""
         self._data["api_key"] = self._existing.get("api_key", "") if self._existing else ""
         self._data["provider_url"] = self._existing.get("provider_url", "") if self._existing else ""
         self._data["auth_type"] = self._existing.get("auth_type", "bearer") if self._existing else "bearer"
