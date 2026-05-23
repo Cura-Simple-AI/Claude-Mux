@@ -1633,7 +1633,7 @@ class HeimsenseApp(App):
     ModalScreen {
         align: center middle;
     }
-    ModalScreen > Vertical, ModalScreen > Static, ModalScreen > Horizontal {
+    ModalScreen > Vertical, ModalScreen > Static, ModalScreen > Horizontal, ModalScreen > VerticalScroll {
         width: 50;
         padding: 1 2;
         border: solid $primary;
