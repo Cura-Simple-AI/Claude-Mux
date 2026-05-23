@@ -1,0 +1,3 @@
+[console_scripts]
+claude-mux = claude_mux.cli:main
+cm = claude_mux.cli:main

@@ -727,7 +727,6 @@ class AddWizard(ModalScreen):
     }
     .model-row > Select {
         width: 1fr;
-        border: round $primary;
     }
     .button-row {
         margin-top: 1;
@@ -845,6 +844,9 @@ class AddWizard(ModalScreen):
                 self._data["provider_url"] = sub.get("provider_url", "")
                 self.query_one("#wiz-title", Static).update("[bold]Reauthenticate Claude Max[/bold]")
                 self._start_oauth_flow(self._data["name"])
+            # Edit mode (non-reauth): jump to model maps
+            elif not self._reauth:
+                self._skip_to_models_edit()
 
     def _show_side(self, n: int):
         for s in ("step1", "step2", "step3", "step4", "step5"):
@@ -974,6 +976,13 @@ class AddWizard(ModalScreen):
         self.query_one("#wiz-key", Input).display = False
         self.query_one("#wiz-url-label", Label).display = False
         self.query_one("#wiz-url", Input).display = False
+        # Focus first visible field (Select if models available, else Input)
+        haiku_sel = self.query_one("#wiz-haiku-sel", Select)
+        haiku_inp = self.query_one("#wiz-haiku", Input)
+        if haiku_sel.display:
+            haiku_sel.focus()
+        else:
+            haiku_inp.focus()
 
     def _go_to_providers(self):
         """From step 1 → push ProviderSelectScreen."""
@@ -1176,7 +1185,9 @@ class AddWizard(ModalScreen):
             except Exception:
                 sel.value = ""
             sel.display = True
+            sel.can_focus = True
             inp.display = False
+            inp.can_focus = False
         # Force field: populate with "No force" + all models
         force_sel = self.query_one("#wiz-force", Select)
         force_inp = self.query_one("#wiz-force-input", Input)
@@ -1191,10 +1202,11 @@ class AddWizard(ModalScreen):
         except Exception:
             pass
         force_sel.display = True
+        force_sel.can_focus = True
         force_inp.display = False
-        self.query_one("#wiz-models-status", Static).update(
-            f"[green]{len(self._copilot_models)} models available[/green]"
-        )
+        force_inp.can_focus = False
+        # Hide models status line
+        self.query_one("#wiz-models-status", Static).update("")
 
     def _poll_copilot_models(self):
         """Poll until fetch is done, then update UI and stop."""
