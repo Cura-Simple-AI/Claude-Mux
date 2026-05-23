@@ -177,19 +177,32 @@ class InstanceManager:
 
         inst_dir = CLAUDE_MUX_DIR / "instances" / sub["name"]
         inst_dir.mkdir(parents=True, exist_ok=True)
+        out_log = inst_dir / "out.log"
+        err_log = inst_dir / "error.log"
+
+        # Clear prior logs before a fresh start so pm2 logs reflect only the
+        # current launch and don't mix old crash/help output with new runtime.
+        out_log.write_text("")
+        err_log.write_text("")
 
         # Delete existing PM2 instance (new port requires new process)
         subprocess.run(["pm2", "delete", pm2_name], capture_output=True, text=True)
 
-        # Start via PM2 — bash sources .env explicitly so shell-env doesn't contaminate
-        exec_cmd = self.HEIMSENSE_BIN if not is_oauth_proxy else f"{sys.executable} -m claude_mux.proxy"
+        # Start via PM2 — bash sources .env explicitly so shell-env doesn't contaminate.
+        # Heimsense must be launched with the `run` subcommand; bare `heimsense`
+        # drops into its setup/help flow and PM2 will restart-loop on exit.
+        exec_cmd = (
+            f"{self.HEIMSENSE_BIN} run"
+            if not is_oauth_proxy
+            else f"{sys.executable} -m claude_mux.proxy"
+        )
         cmd = f"set -a; source {env_path}; set +a; exec {exec_cmd}"
         result = subprocess.run(
             [
                 "pm2", "start", "bash",
                 "--name", pm2_name,
-                "--output", str(inst_dir / "out.log"),
-                "--error", str(inst_dir / "error.log"),
+                "--output", str(out_log),
+                "--error", str(err_log),
                 "--", "-c", cmd,
             ],
             capture_output=True, text=True,

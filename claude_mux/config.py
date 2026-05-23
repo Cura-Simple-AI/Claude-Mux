@@ -119,7 +119,7 @@ PROVIDER_PRESETS = {
         "provider_url": "https://api.openai.com/v1",
         "auth_type": "bearer",
         "api_key_env": "OPENAI_API_KEY",
-        "model_maps": {"haiku": "gpt-4o-mini", "sonnet": "gpt-4o", "opus": "o1-mini"},
+        "model_maps": {"haiku": "gpt-4o-mini", "sonnet": "gpt-4o", "opus": "gpt-4.1"},
     },
     "copilot": {
         "label": "GitHub Copilot",

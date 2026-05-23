@@ -14,6 +14,7 @@ from claude_mux.tui import (
     CLAUDE_MUX_DIR,
     SUBSCRIPTIONS_FILE,
 )
+from claude_mux.sync import build_inference_test_payload
 
 __all__ = [
     "__version__",
@@ -26,6 +27,7 @@ __all__ = [
     "_time_ago",
     "_status_char",
     "_status_color",
+    "build_inference_test_payload",
     "CLAUDE_MUX_DIR",
     "SUBSCRIPTIONS_FILE",
 ]

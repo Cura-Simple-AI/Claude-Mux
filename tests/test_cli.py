@@ -164,7 +164,7 @@ class TestStatus:
         cm = _cm(tmp_dir)
         cm.add_subscription("deepseek", "https://api.deepseek.com/v1", "DS_KEY")
         im_mock = MagicMock()
-        im_mock.status.return_value = {"status": "stopped"}
+        im_mock.get_status.return_value = {"status": "stopped"}
         with _patch_cm(tmp_dir):
             with patch("claude_mux.cli.InstanceManager", return_value=im_mock):
                 with patch("claude_mux.cli.SyncManager"):
@@ -174,6 +174,21 @@ class TestStatus:
         data = json.loads(result.output)
         assert isinstance(data, list)
         assert data[0]["name"] == "deepseek"
+
+    def test_status_reads_instance_manager_get_status(self, runner, tmp_dir):
+        cm = _cm(tmp_dir)
+        sub = cm.add_subscription("deepseek", "https://api.deepseek.com/v1", "DS_KEY")
+        cm.set_instance_port(sub["id"], 18082)
+        im_mock = MagicMock()
+        im_mock.get_status.return_value = {"status": "online"}
+        with _patch_cm(tmp_dir):
+            with patch("claude_mux.cli.InstanceManager", return_value=im_mock):
+                with patch("claude_mux.cli.SyncManager"):
+                    with patch("claude_mux.cli.FailoverManager"):
+                        result = runner.invoke(cli, ["status"])
+        assert result.exit_code == 0
+        assert "online" in result.output
+        im_mock.get_status.assert_called_once_with(sub["id"])
 
 
 class TestTest:

@@ -198,6 +198,49 @@ class TestFetchAvailableModels:
         assert len(captured_reqs) == 1
         assert "api.anthropic.com" in captured_reqs[0].full_url
 
+    def test_openai_bearer_fetches_models_directly(self, tmp_dir):
+        cm = _cm(tmp_dir)
+        sub = cm.add_subscription(
+            "openai", "https://api.openai.com/v1", "OPENAI_API_KEY",
+            auth_type="bearer", api_key="sk-test",
+        )
+        cm.set_instance_port(sub["id"], 18080)
+        sync = SyncManager(cm)
+        body = _make_models_response(["gpt-4o-mini", "gpt-4o", "gpt-5.5"])
+        mock_resp = self._make_urlopen(body)
+        captured_reqs = []
+
+        def _fake_urlopen(req, timeout=10):
+            captured_reqs.append(req)
+            return mock_resp
+
+        with patch("urllib.request.urlopen", side_effect=_fake_urlopen):
+            models = sync.fetch_available_models(sub["id"])
+
+        assert models == ["gpt-4o-mini", "gpt-4o", "gpt-5.5"]
+        assert len(captured_reqs) == 1
+        assert captured_reqs[0].full_url == "https://api.openai.com/v1/models"
+        assert captured_reqs[0].headers["Authorization"] == "Bearer sk-test"
+
+    def test_copilot_fetches_models_directly(self, tmp_dir):
+        cm = _cm(tmp_dir)
+        sub = cm.add_subscription(
+            "copilot", "https://api.githubcopilot.com", "GH_TOKEN",
+            auth_type="gh_token", api_key="gh-token",
+        )
+        cm.set_instance_port(sub["id"], 18081)
+        sync = SyncManager(cm)
+
+        with patch("claude_mux.sync.fetch_copilot_models", return_value=[
+            {"id": "claude-haiku-4.5"},
+            {"id": "claude-sonnet-4.6"},
+            {"id": "claude-opus-4.7"},
+        ]) as mock_fetch:
+            models = sync.fetch_available_models(sub["id"])
+
+        assert models == ["claude-haiku-4.5", "claude-sonnet-4.6", "claude-opus-4.7"]
+        mock_fetch.assert_called_once_with("gh-token")
+
     def test_unknown_sub_returns_empty(self, tmp_dir):
         cm = _cm(tmp_dir)
         sync = SyncManager(cm)
