@@ -916,8 +916,14 @@ class AddWizard(ModalScreen):
             self.query_one("#wiz-title", Static).update("[bold]Select Provider[/bold]")
             self._render_provider_list()
         elif eid == "back-models":
-            self._show_side(3)
-            self.query_one("#wiz-title", Static).update("[bold]API Key[/bold]")
+            if self._edit_mode:
+                # Edit mode: skip API key step, go back to name
+                self._show_side(1)
+                self.query_one("#wiz-title", Static).update("[bold]Edit Subscription[/bold]")
+                self.query_one("#wiz-name", Input).focus()
+            else:
+                self._show_side(3)
+                self.query_one("#wiz-title", Static).update("[bold]API Key[/bold]")
         elif eid == "back-oauth":
             self._show_side(1)
             self.query_one("#wiz-title", Static).update("[bold]Add Subscription[/bold]")
