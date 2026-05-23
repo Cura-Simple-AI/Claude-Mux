@@ -1164,7 +1164,7 @@ class AddWizard(ModalScreen):
         """Switch haiku/sonnet/opus to Select dropdowns if models are ready."""
         if not self._copilot_models:
             return
-        options = [(f"{m['name']} ({m['vendor']})", m["id"]) for m in self._copilot_models]
+        model_options = [(f"{m['name']} ({m['vendor']})", m["id"]) for m in self._copilot_models]
         preset_maps = PROVIDER_PRESETS["copilot"]["model_maps"]
         for alias, sel_id, inp_id in [
             ("haiku", "wiz-haiku-sel", "wiz-haiku"),
@@ -1173,18 +1173,20 @@ class AddWizard(ModalScreen):
         ]:
             sel = self.query_one(f"#{sel_id}", Select)
             inp = self.query_one(f"#{inp_id}", Input)
+            # Add "None selected" option first
+            options = [("None selected", "")] + model_options
             sel.set_options(options)
             current = inp.value.strip() or preset_maps.get(alias, "")
             try:
-                sel.value = current
+                sel.value = current if current else ""
             except Exception:
-                pass
+                sel.value = ""
             sel.display = True
             inp.display = False
         # Force field: populate with "No force" + all models
         force_sel = self.query_one("#wiz-force", Select)
         force_inp = self.query_one("#wiz-force-input", Input)
-        force_options = [("No force", "__none__")] + options
+        force_options = [("No force", "__none__")] + model_options
         force_sel.set_options(force_options)
         # Preserve existing force value if set
         current_force = force_inp.value.strip() if force_inp.value else "__none__"
