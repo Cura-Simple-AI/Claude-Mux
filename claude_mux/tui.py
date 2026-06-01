@@ -721,7 +721,11 @@ class AddWizard(ModalScreen):
         padding: 0 1 0 0;
         content-align: left middle;
     }
-    .model-row > Input, .model-row > Select {
+    .model-row > Input {
+        width: 1fr;
+        border: round $primary;
+    }
+    .model-row > Select {
         width: 1fr;
     }
     .button-row {
@@ -752,14 +756,14 @@ class AddWizard(ModalScreen):
             yield Label("Name:")
             yield Input(placeholder="e.g. my-deepseek", id="wiz-name")
             yield Static("", id="wiz-name-hint")
-            with Horizontal():
+            with Horizontal(classes="button-row"):
                 yield Button("Cancel", id="cancel", variant="default")
                 yield Button("Next →", id="next-name", variant="primary", disabled=True)
         # Step 2: Provider list (numbered)
         with Vertical(id="step2", classes="hidden"):
             yield Static("Select provider (type 1-8):", id="wiz-provider-prompt")
             yield Static("", id="wiz-provider-list")
-            with Horizontal():
+            with Horizontal(classes="button-row"):
                 yield Button("← Back", id="back-provider", variant="default")
         # Step 3: API Key + URL (hidden for OAuth)
         with Vertical(id="step3", classes="hidden"):
@@ -767,12 +771,16 @@ class AddWizard(ModalScreen):
             yield Input(placeholder="e.g. MY_API_KEY or sk-...", id="wiz-key", password=True)
             yield Label("Base URL (auto-filled for presets):", id="wiz-url-label")
             yield Input(placeholder="https://api.example.com/v1", id="wiz-url")
-            with Horizontal():
+            with Horizontal(classes="button-row"):
                 yield Button("← Back", id="back-key", variant="default")
                 yield Button("Next →", id="next-key", variant="primary")
         # Step 4: Model maps (skipped for OAuth)
         with VerticalScroll(id="step4", classes="hidden"):
             yield Static("", id="wiz-models-status")
+            # Name field (only shown in edit mode)
+            with Horizontal(classes="model-row", id="wiz-name-row-edit"):
+                yield Label("Name:")
+                yield Input(placeholder="subscription name", id="wiz-name-edit")
             with Horizontal(classes="model-row"):
                 yield Label("Haiku:")
                 yield Input(placeholder="model name", id="wiz-haiku")
@@ -787,7 +795,8 @@ class AddWizard(ModalScreen):
                 yield Select([], id="wiz-opus-sel", prompt="Select model...", classes="hidden")
             with Horizontal(classes="model-row"):
                 yield Label("Force:")
-                yield Select([("No force", "__none__")], id="wiz-force", prompt="No force", allow_blank=False)
+                yield Input(placeholder="optional: force all to one model", id="wiz-force-input")
+                yield Select([("No force", "__none__")], id="wiz-force", prompt="No force", allow_blank=False, classes="hidden")
             with Horizontal(classes="button-row"):
                 yield Button("← Back", id="back-models", variant="default")
                 btn_label = "Save" if self._edit_mode else "Create"
@@ -800,7 +809,7 @@ class AddWizard(ModalScreen):
                 yield Button("Authenticate in browser", id="oauth-open-url", variant="primary")
             yield Static("", id="oauth-status")
             yield Input(placeholder="paste code here", id="wiz-oauth-code", classes="hidden")
-            with Horizontal(id="oauth-nav-row"):
+            with Horizontal(id="oauth-nav-row", classes="button-row"):
                 yield Button("Back", id="back-oauth", variant="default")
                 yield Button("Next", id="oauth-next", variant="primary", disabled=True)
             yield Static("", id="oauth-result", classes="hidden")
@@ -824,6 +833,10 @@ class AddWizard(ModalScreen):
             self.query_one("#wiz-haiku", Input).value = models.get("haiku", "")
             self.query_one("#wiz-sonnet", Input).value = models.get("sonnet", "")
             self.query_one("#wiz-opus", Input).value = models.get("opus", "")
+            # Force model: pre-fill input (Select will be populated if Copilot)
+            force_val = sub.get("force_model", "")
+            if force_val and force_val != "__none__":
+                self.query_one("#wiz-force-input", Input).value = force_val
             # Notes field removed from UI — preserve existing notes value
             # (no UI update needed)
             self._validate_step1()
@@ -835,6 +848,9 @@ class AddWizard(ModalScreen):
                 self._data["provider_url"] = sub.get("provider_url", "")
                 self.query_one("#wiz-title", Static).update("[bold]Reauthenticate Claude Max[/bold]")
                 self._start_oauth_flow(self._data["name"])
+            # Edit mode (non-reauth): jump to model maps
+            elif not self._reauth:
+                self._skip_to_models_edit()
 
     def _show_side(self, n: int):
         for s in ("step1", "step2", "step3", "step4", "step5"):
@@ -916,8 +932,14 @@ class AddWizard(ModalScreen):
             self.query_one("#wiz-title", Static).update("[bold]Select Provider[/bold]")
             self._render_provider_list()
         elif eid == "back-models":
-            self._show_side(3)
-            self.query_one("#wiz-title", Static).update("[bold]API Key[/bold]")
+            if self._edit_mode:
+                # Edit mode: skip API key step, go back to name
+                self._show_side(1)
+                self.query_one("#wiz-title", Static).update("[bold]Edit Subscription[/bold]")
+                self.query_one("#wiz-name", Input).focus()
+            else:
+                self._show_side(3)
+                self.query_one("#wiz-title", Static).update("[bold]API Key[/bold]")
         elif eid == "back-oauth":
             self._show_side(1)
             self.query_one("#wiz-title", Static).update("[bold]Add Subscription[/bold]")
@@ -943,15 +965,29 @@ class AddWizard(ModalScreen):
 
     def _skip_to_models_edit(self):
         """Edit-mode: jump directly to models (step 4), locking provider fields."""
+        self._data["name"] = self._existing.get("name", "") if self._existing else ""
         self._data["api_key"] = self._existing.get("api_key", "") if self._existing else ""
         self._data["provider_url"] = self._existing.get("provider_url", "") if self._existing else ""
         self._data["auth_type"] = self._existing.get("auth_type", "bearer") if self._existing else "bearer"
+        # If subscription has available_models: populate Select dropdowns
+        if self._existing and self._existing.get("available_models"):
+            self._copilot_models = self._existing.get("available_models", [])
+            self._copilot_models = [{"name": m, "vendor": "Claude", "id": m} for m in self._copilot_models]
+            self._copilot_fetch_done = True
+            self._apply_copilot_model_selects()
         self._show_side(4)
         self.query_one("#wiz-title", Static).update("[bold]Edit Model Maps[/bold]")
         self.query_one("#wiz-key-label", Label).display = False
         self.query_one("#wiz-key", Input).display = False
         self.query_one("#wiz-url-label", Label).display = False
         self.query_one("#wiz-url", Input).display = False
+        # Show and populate name field in edit mode
+        name_row = self.query_one("#wiz-name-row-edit", Horizontal)
+        name_input = self.query_one("#wiz-name-edit", Input)
+        name_row.display = True
+        name_input.value = self._existing.get("name", "") if self._existing else ""
+        # Focus name field first, then tab to model fields
+        name_input.focus()
 
     def _go_to_providers(self):
         """From step 1 → push ProviderSelectScreen."""
@@ -1015,13 +1051,15 @@ class AddWizard(ModalScreen):
         self._data["provider_url"] = self.query_one("#wiz-url", Input).value.strip()
         self._show_side(4)
         self.query_one("#wiz-title", Static).update("[bold]Model Maps[/bold]")
+        # Hide name field in add mode (only shown in edit mode)
+        self.query_one("#wiz-name-row-edit", Horizontal).display = False
         # Copilot: show Select if models are ready
         if self._selected_provider == "copilot":
             self._apply_copilot_model_selects()
             if not self._copilot_fetch_done:
                 self.query_one("#wiz-models-status", Static).update("[yellow]Fetching models from Copilot...[/yellow]")
                 self.set_interval(0.5, self._poll_copilot_models)
-        self._populate_force_select()
+        # For non-Copilot: all fields remain as Input (default)
         self.query_one("#create", Button).focus()
 
     def _populate_force_select(self):
@@ -1043,6 +1081,11 @@ class AddWizard(ModalScreen):
 
     def _do_create(self):
         """Create or update subscription."""
+        # In edit mode: read updated name from edit field
+        if self._edit_mode:
+            name_edit = self.query_one("#wiz-name-edit", Input)
+            if name_edit.display:
+                self._data["name"] = name_edit.value.strip()
         name = self._data.get("name", "")
         provider_url = self._data.get("provider_url", "")
         api_key = self._data.get("api_key", "")
@@ -1054,10 +1097,16 @@ class AddWizard(ModalScreen):
         }
         # Notes field removed from UI — preserve existing value if editing
         notes = self._existing.get("notes", "") if self._edit_mode and self._existing else ""
-        # Force model: read from select (may not exist for oauth skip)
+        # Force model: read from select or input depending on visibility
         try:
             force_sel = self.query_one("#wiz-force", Select)
-            force_model = str(force_sel.value) if force_sel.value not in (Select.BLANK, None) else "__none__"
+            force_inp = self.query_one("#wiz-force-input", Input)
+            if force_sel.display:
+                # Select is visible (Copilot or other provider with model list)
+                force_model = str(force_sel.value) if force_sel.value not in (Select.BLANK, None) else "__none__"
+            else:
+                # Input is visible (free text)
+                force_model = force_inp.value.strip() or "__none__"
         except Exception:
             force_model = "__none__"
         if self._edit_mode and self._existing:
@@ -1130,7 +1179,7 @@ class AddWizard(ModalScreen):
         """Switch haiku/sonnet/opus to Select dropdowns if models are ready."""
         if not self._copilot_models:
             return
-        options = [(f"{m['name']} ({m['vendor']})", m["id"]) for m in self._copilot_models]
+        model_options = [(f"{m['name']} ({m['vendor']})", m["id"]) for m in self._copilot_models]
         preset_maps = PROVIDER_PRESETS["copilot"]["model_maps"]
         for alias, sel_id, inp_id in [
             ("haiku", "wiz-haiku-sel", "wiz-haiku"),
@@ -1139,17 +1188,37 @@ class AddWizard(ModalScreen):
         ]:
             sel = self.query_one(f"#{sel_id}", Select)
             inp = self.query_one(f"#{inp_id}", Input)
+            # Add "None selected" option first
+            options = [("None selected", "")] + model_options
             sel.set_options(options)
             current = inp.value.strip() or preset_maps.get(alias, "")
             try:
-                sel.value = current
+                sel.value = current if current else ""
             except Exception:
-                pass
+                sel.value = ""
             sel.display = True
+            sel.can_focus = True
             inp.display = False
-        self.query_one("#wiz-models-status", Static).update(
-            f"[green]{len(self._copilot_models)} models available[/green]"
-        )
+            inp.can_focus = False
+        # Force field: populate with "No force" + all models
+        force_sel = self.query_one("#wiz-force", Select)
+        force_inp = self.query_one("#wiz-force-input", Input)
+        force_options = [("No force", "__none__")] + model_options
+        force_sel.set_options(force_options)
+        # Preserve existing force value if set
+        current_force = force_inp.value.strip() if force_inp.value else "__none__"
+        if self._edit_mode and self._existing:
+            current_force = self._existing.get("force_model", "__none__")
+        try:
+            force_sel.value = current_force
+        except Exception:
+            pass
+        force_sel.display = True
+        force_sel.can_focus = True
+        force_inp.display = False
+        force_inp.can_focus = False
+        # Hide models status line
+        self.query_one("#wiz-models-status", Static).update("")
 
     def _poll_copilot_models(self):
         """Poll until fetch is done, then update UI and stop."""
