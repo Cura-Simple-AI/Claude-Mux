@@ -96,6 +96,9 @@ class FakeHost:
         self.resume_session_override: str | None = None
         self.busy_polls: dict[str, int] = {}
         self.attach_survives_respawn = False
+        self.respawn_argvs: list[list[str]] = []
+        self.respawn_rc = 0
+        self.after_exit: dict[str, object] = {}
 
     # -- setup helpers -----------------------------------------------------
     def add_proc(self, pid, argv, children=()):
@@ -131,13 +134,19 @@ class FakeHost:
                               "dead": False, "screen": screen, "mode": "direct",
                               "claude": claude_pid, "remain": False}
 
-    def add_attach_pane(self, target, attach_pid, bg_pid, session_id):
-        self.add_proc(attach_pid, [CLAUDE, "attach", session_id[:8]])
+    def add_attach_pane(self, target, attach_pid, bg_pid, session_id, head=(CLAUDE,),
+                        shell=False):
+        self.add_proc(attach_pid, [*head, "attach", session_id[:8]])
         self.add_proc(bg_pid, ["claude", "bg-spare", "--bg-spare", "/tmp/x.sock"])
         self.register(bg_pid, session_id, kind="bg", jobId=session_id[:8])
+        pane_pid = attach_pid
+        if shell:
+            pane_pid = attach_pid - 1
+            self.add_proc(pane_pid, ["-bash"], children=[attach_pid])
         self.panes[target] = {"target": target, "pane_id": f"%{len(self.panes)}",
-                              "pane_pid": attach_pid, "command": "claude", "path": "/work",
-                              "dead": False, "screen": STATUS, "mode": "direct",
+                              "pane_pid": pane_pid, "command": "claude", "path": "/work",
+                              "dead": False, "screen": STATUS,
+                              "mode": "shell" if shell else "direct",
                               "claude": attach_pid, "remain": False, "bg": bg_pid}
 
     # -- Host API ----------------------------------------------------------
@@ -170,16 +179,24 @@ class FakeHost:
     def now(self):
         return self.t
 
+    def find(self, target):
+        """Pane by target (sess:win.pane) or pane id (%N), as tmux resolves -t."""
+        for pane in self.panes.values():
+            if target in (pane["target"], pane["pane_id"]):
+                return pane
+        return None
+
     def run(self, argv):
-        if argv[1:2] == ["respawn"]:
-            return self._claude_respawn(argv[2])
+        if "respawn" in argv[:3]:
+            self.respawn_argvs.append(argv)
+            return self._claude_respawn(argv[argv.index("respawn") + 1])
         assert argv[0] == "tmux", argv
         self.calls.append(argv[1:])
         cmd, args = argv[1], argv[2:]
         if cmd == "list-panes":
             return 0, "\n".join(self._fmt(p) for p in self.panes.values()) + "\n"
         target = args[args.index("-t") + 1] if "-t" in args else None
-        pane = self.panes.get(target)
+        pane = self.find(target) if target else None
         if cmd == "run-shell":
             return 0, ""
         if pane is None:
@@ -192,8 +209,11 @@ class FakeHost:
             self._send(pane, args[args.index("-t") + 2:])
             return 0, ""
         if cmd == "set-option":
-            pane["remain"] = "-u" not in args
+            pane["remain_opt"] = None if "-u" in args else args[-1]
+            pane["remain"] = pane["remain_opt"] == "on"
             return 0, ""
+        if cmd == "show-options":
+            return 0, (pane.get("remain_opt") or "") + "\n"
         if cmd == "respawn-pane":
             assert pane["dead"], "respawn on a live pane"
             self._launch(pane, shlex.split(args[-1]), args[args.index("-c") + 1])
@@ -209,6 +229,9 @@ class FakeHost:
                           p["path"], "1" if p["dead"] else "0"])
 
     def _exit_claude(self, pane):
+        hook = self.after_exit.pop(pane["target"], None)
+        if hook:
+            hook()
         self.remove_proc(pane["claude"])
         if pane["mode"] == "shell":
             self.files[f"/proc/{pane['pane_pid']}/task/{pane['pane_pid']}/children"] = ""
@@ -271,6 +294,8 @@ class FakeHost:
         """`claude respawn <job>`: new background pid, same session; the attach
         client exits unless ``attach_survives_respawn`` is set."""
         self.calls.append(["claude-respawn", job])
+        if self.respawn_rc:
+            return self.respawn_rc, ""
         for rpid, raw in list(self.files.items()):
             if not rpid.startswith(REG + "/") or not rpid.endswith(".json"):
                 continue
@@ -293,7 +318,9 @@ class FakeHost:
         return 1, ""
 
     def sends(self, target):
-        return [c for c in self.calls if c[0] == "send-keys" and target in c]
+        pane = self.find(target) or {}
+        ids = {target, pane.get("target"), pane.get("pane_id")}
+        return [c for c in self.calls if c[0] == "send-keys" and c[c.index("-t") + 1] in ids]
 
 
 @pytest.fixture()
@@ -528,7 +555,7 @@ class TestRestartTraps:
         host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid", screen=WORKING)
         r = restarter(host).restart("a:0.0", force=True, nudge=None)
         assert r.status == "OK", r.message
-        assert host.sends("a:0.0")[0] == ["send-keys", "-t", "a:0.0", "Escape"]
+        assert host.sends("a:0.0")[0] == ["send-keys", "-t", "%0", "Escape"]
 
     def test_keep_worktree_dialog_answers_keep(self, host):
         host.add_shell_pane("a:0.0", 101, AGENT_ARGV, "sid")
@@ -715,6 +742,52 @@ class TestRestartTraps:
         r = restarter(host).restart("a:0.0")
         assert r.status == "FAILED" and "registry" in r.message
         assert host.sends("a:0.0") == []
+
+    def test_targets_the_pane_id_when_windows_are_renumbered(self, host):
+        # With renumber-windows on, closing window 0 during the restart moves
+        # our window to index 0. sess:win.pane would then miss (or hit
+        # another pane); the pane id %N stays the same.
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "other")
+        host.add_shell_pane("a:1.0", 201, [CLAUDE], "sid")
+
+        def renumber():
+            del host.panes["a:0.0"]
+            host.panes["a:1.0"]["target"] = "a:0.0"
+        host.after_exit["a:1.0"] = renumber
+        r = restarter(host).restart("a:1.0", nudge="hi")
+        assert r.status == "OK", r.message
+        assert host.panes["a:1.0"]["received"] == ["hi"]
+        targets = {c[c.index("-t") + 1] for c in host.calls if "-t" in c}
+        assert targets <= {"a:1.0", "%1"}
+
+    def test_background_session_respawn_uses_the_node_head(self, host):
+        head = ("/usr/bin/node", "/opt/claude-code/cli.js")
+        host.add_attach_pane("bg:0.0", 400, 401, "cbf58c04-aaaa", head=head)
+        r = restarter(host).restart("bg:0.0", nudge=None)
+        assert r.status == "OK", r.message
+        assert host.respawn_argvs == [[*head, "respawn", "cbf58c04"]]
+
+    @pytest.mark.parametrize("prior", ["on", "off", "failed"])
+    def test_direct_pane_restores_users_remain_on_exit(self, host, prior):
+        host.add_direct_pane("d:0.0", 700, [CLAUDE], "sid-d")
+        host.panes["d:0.0"]["remain_opt"] = prior
+        r = restarter(host).restart("d:0.0", nudge=None)
+        assert r.status == "OK", r.message
+        assert host.panes["d:0.0"]["remain_opt"] == prior
+
+    @pytest.mark.parametrize("shell", [False, True])
+    def test_failed_background_restart_restores_remain_on_exit(self, host, shell):
+        host.add_attach_pane("bg:0.0", 400, 401, "cbf58c04-aaaa", shell=shell)
+        host.respawn_rc = 1
+        r = restarter(host).restart("bg:0.0", nudge=None)
+        assert r.status == "FAILED" and "respawn" in r.message
+        assert host.panes["bg:0.0"].get("remain_opt") is None
+
+    def test_skipped_restart_leaves_remain_on_exit_untouched(self, host):
+        host.add_direct_pane("d:0.0", 700, [CLAUDE], "sid-d", screen=KEEP_DIALOG)
+        r = restarter(host).restart("d:0.0", nudge=None)
+        assert r.status == "SKIPPED"
+        assert not [c for c in host.calls if c[0] == "set-option"]
 
 
 # ---------------------------------------------------------------------------

@@ -27,6 +27,11 @@ Format: [Semantic Versioning](https://semver.org/). Dates in ISO 8601.
 - `session restart --self`: every `#` in the helper command is escaped for `tmux run-shell`,
   which expands formats (`#S`, `#{...}`) and runs `#(...)` — a `--nudge` containing them was
   altered or executed. The helper now prepends the package to `PYTHONPATH` instead of replacing it.
+- `session restart`: the pane is addressed by its pane id (`%N`) instead of `sess:win.pane`,
+  which can point to another pane after windows are renumbered. `claude respawn` uses the same
+  executable as the session (`node cli.js` for node installs, not `node respawn`).
+  `remain-on-exit` is restored to the pane's own previous value — also for attached panes and
+  after failures — instead of being unset.
 
 ---
 

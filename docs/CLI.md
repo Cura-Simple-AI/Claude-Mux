@@ -467,6 +467,11 @@ claude-mux session restart --all --match '^agent-'     # one at a time
 
 Worktrees are never removed.
 
+Once resolved, the pane is addressed by its pane id (`%N`) for the whole restart, so it is never
+confused with another pane when windows are renumbered. `remain-on-exit` is restored to the
+pane's previous value after the restart, also when it fails or is skipped; a pane that is already
+dead is left open so the session can be relaunched by hand.
+
 **Model aliases.** A short alias such as `opus` can resolve to an older model under a different
 profile, so aliases are expanded to full ids before relaunch (this also applies to an alias in the
 original command line). Defaults: `opus` → `claude-opus-5-5`, `sonnet` → `claude-sonnet-5-5`,

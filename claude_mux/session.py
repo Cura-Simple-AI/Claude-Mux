@@ -264,11 +264,16 @@ class Tmux:
         """Send named keys in ONE send-keys call (e.g. ``C-c C-c``)."""
         self._run("send-keys", "-t", target, *keys)
 
-    def set_remain_on_exit(self, target: str, on: bool) -> None:
-        if on:
-            self._run("set-option", "-p", "-t", target, "remain-on-exit", "on")
-        else:
+    def get_remain_on_exit(self, target: str) -> str | None:
+        """The pane's own remain-on-exit value, or None when it is not set on the pane."""
+        return self._run("show-options", "-p", "-v", "-t", target, "remain-on-exit").strip() or None
+
+    def set_remain_on_exit(self, target: str, value: str | None) -> None:
+        """Set the pane's remain-on-exit; None removes the pane-level value."""
+        if value is None:
             self._run("set-option", "-p", "-u", "-t", target, "remain-on-exit")
+        else:
+            self._run("set-option", "-p", "-t", target, "remain-on-exit", value)
 
     def respawn(self, target: str, cwd: str, command: str) -> None:
         self._run("respawn-pane", "-t", target, "-c", cwd, command)
@@ -666,6 +671,8 @@ class Restarter:
         self.timeout = timeout
         self.poll = poll
         self.log = log or (lambda msg: None)
+        #: pane id -> the pane's own remain-on-exit value before the restart
+        self._remain_prior: dict[str, str | None] = {}
 
     def _wait(self, predicate, what: str, timeout: float | None = None):
         deadline = self.host.now() + (self.timeout if timeout is None else timeout)
@@ -694,7 +701,7 @@ class Restarter:
     def _wait_idle(self, info: SessionInfo) -> None:
         def idle():
             status = self._registry().get(info.session_pid or -1, {}).get("status")
-            state = pane_state(self.tmux.capture(info.target), status)
+            state = pane_state(self.tmux.capture(info.pane_id), status)
             if state == "dialog":
                 raise _DialogVisible()
             return state == "idle"
@@ -703,30 +710,50 @@ class Restarter:
     def _exited(self, info: SessionInfo) -> bool:
         if self._alive(info.claude_pid):
             return False
-        pane = self.tmux.pane(info.target)
+        pane = self.tmux.pane(info.pane_id)
         return pane["dead"] if info.mode == "direct" else pane["command"] in SHELLS
 
     def _exit_interactive(self, info: SessionInfo) -> None:
         # Text and Enter are sent in separate send-keys calls.
-        self.tmux.send_literal(info.target, "/exit")
-        self.tmux.send_keys(info.target, "Enter")
+        self.tmux.send_literal(info.pane_id, "/exit")
+        self.tmux.send_keys(info.pane_id, "Enter")
         seen: dict[str, int] = {}
 
         def exited():
             if self._exited(info):
                 return True
-            screen = self.tmux.capture(info.target)
+            screen = self.tmux.capture(info.pane_id)
             if has_dialog(screen):
                 choice = choose_dialog_answer(screen)
                 key = screen.strip()
                 seen[key] = seen.get(key, 0) + 1
                 if seen[key] == 1:
-                    self.log(f"{info.target}: answering exit dialog with option {choice}")
-                    self.tmux.send_literal(info.target, str(choice))
+                    self.log(f"{info.pane_id}: answering exit dialog with option {choice}")
+                    self.tmux.send_literal(info.pane_id, str(choice))
                 elif seen[key] > 5:
                     raise SessionError("exit dialog did not accept the answer")
             return False
         self._wait(exited, "Claude Code to exit")
+
+    def _hold_pane(self, info: SessionInfo) -> None:
+        """Keep the pane open when its process exits (remain-on-exit on)."""
+        if info.pane_id not in self._remain_prior:
+            self._remain_prior[info.pane_id] = self.tmux.get_remain_on_exit(info.pane_id)
+        self.tmux.set_remain_on_exit(info.pane_id, "on")
+
+    def _release_pane(self, info: SessionInfo | None) -> None:
+        """Restore remain-on-exit to its value before the restart.
+
+        A dead pane is left as it is: with remain-on-exit it stays visible, so
+        the session can be relaunched by hand (see the logged command).
+        """
+        if not info or info.pane_id not in self._remain_prior:
+            return
+        try:
+            if not self.tmux.pane(info.pane_id)["dead"]:
+                self.tmux.set_remain_on_exit(info.pane_id, self._remain_prior.pop(info.pane_id))
+        except SessionError:
+            pass
 
     def _respawn_attached(self, info: SessionInfo) -> int:
         """Restart a background session with ``claude respawn <job>``.
@@ -739,8 +766,8 @@ class Restarter:
         job = (_claude_args(info.argv)[1:2] or [""])[0]
         if not job:
             raise SessionError("cannot tell the background job id from `claude attach`")
-        self.tmux.set_remain_on_exit(info.target, True)
-        rc, _ = self.host.run([info.argv[0], "respawn", job])
+        self._hold_pane(info)
+        rc, _ = self.host.run([*claude_head(info.argv), "respawn", job])
         if rc != 0:
             raise SessionError(f"claude respawn {job} failed (exit {rc})")
 
@@ -751,45 +778,45 @@ class Restarter:
                     return rpid
             return None
         new_pid = self._wait(respawned, "the background session to come back")
-        if self.tmux.pane(info.target)["dead"]:
-            self.tmux.respawn(info.target, info.cwd or self.host.home(), shlex.join(info.argv))
-        self.tmux.set_remain_on_exit(info.target, False)
-        self._wait(lambda: _STATUS_LINE_RE.search(self.tmux.capture(info.target)),
+        if self.tmux.pane(info.pane_id)["dead"]:
+            self.tmux.respawn(info.pane_id, info.cwd or self.host.home(), shlex.join(info.argv))
+        self._release_pane(info)
+        self._wait(lambda: _STATUS_LINE_RE.search(self.tmux.capture(info.pane_id)),
                    "the re-attached session (status line)")
         return new_pid
 
     def _relaunch(self, info: SessionInfo, argv: list[str], *, cd: bool = False) -> None:
         command = shlex.join(argv)
         if info.mode == "direct":
-            self.tmux.respawn(info.target, info.cwd or self.host.home(), command)
-            self.tmux.set_remain_on_exit(info.target, False)
+            self.tmux.respawn(info.pane_id, info.cwd or self.host.home(), command)
+            self._release_pane(info)
         else:
             if cd:
                 # The shell is still in the launch dir, not in the worktree.
                 command = f"cd {shlex.quote(info.cwd)} && {command}"
-            self.tmux.send_literal(info.target, command)
-            self.tmux.send_keys(info.target, "Enter")
+            self.tmux.send_literal(info.pane_id, command)
+            self.tmux.send_keys(info.pane_id, "Enter")
 
     def _verify(self, info: SessionInfo) -> int:
         def resumed():
-            found = find_claude_in_pane(self.host, self.tmux.pane(info.target))
+            found = find_claude_in_pane(self.host, self.tmux.pane(info.pane_id))
             if not found or found[1] == info.claude_pid:
                 return None
             if self._registry().get(found[1], {}).get("sessionId") != info.session_id:
                 return None
-            if not _STATUS_LINE_RE.search(self.tmux.capture(info.target)):
+            if not _STATUS_LINE_RE.search(self.tmux.capture(info.pane_id)):
                 return None
             return found[1]
         return self._wait(resumed, "the resumed session (new pid, same sessionId, status line)")
 
     def _nudge(self, info: SessionInfo, text: str) -> None:
         def ready():
-            screen = self.tmux.capture(info.target)
+            screen = self.tmux.capture(info.pane_id)
             return not has_dialog(screen) and _STATUS_LINE_RE.search(screen)
         self._wait(ready, "the resumed session to accept the nudge")
         # Text and Enter in separate calls.
-        self.tmux.send_literal(info.target, text)
-        self.tmux.send_keys(info.target, "Enter")
+        self.tmux.send_literal(info.pane_id, text)
+        self.tmux.send_keys(info.pane_id, "Enter")
 
     def restart(self, target: str, *, model: str | None = None,
                 aliases: dict[str, str] | None = None,
@@ -815,7 +842,7 @@ class Restarter:
                 result.status, result.message = "SKIPPED", "dialog open (Enter to select/confirm)"
                 return result
             if force:
-                self.tmux.send_keys(info.target, "Escape")
+                self.tmux.send_keys(info.pane_id, "Escape")
             else:
                 self._wait_idle(info)
             if info.attached:
@@ -828,7 +855,7 @@ class Restarter:
                 argv = build_relaunch_argv(info.argv, info.session_id, model,
                                            drop_worktree=info.mode == "direct" or bare_worktree)
                 if info.mode == "direct":
-                    self.tmux.set_remain_on_exit(info.target, True)
+                    self._hold_pane(info)
                 self._exit_interactive(info)
                 self._relaunch(info, argv, cd=bare_worktree)
                 result.new_pid = self._verify(info)
@@ -840,18 +867,9 @@ class Restarter:
             result.status, result.message = "SKIPPED", "dialog open (Enter to select/confirm)"
         except SessionError as exc:
             result.status, result.message = "FAILED", str(exc)
-            self._restore_pane(info)
+        finally:
+            self._release_pane(info)
         return result
-
-    def _restore_pane(self, info: SessionInfo | None) -> None:
-        """After a failure, undo remain-on-exit on a pane that is still alive."""
-        if not info or info.mode != "direct":
-            return
-        try:
-            if not self.tmux.pane(info.target)["dead"]:
-                self.tmux.set_remain_on_exit(info.target, False)
-        except SessionError:
-            pass
 
 
 def self_restart_command(python: str, target: str, *, delay: float, extra: list[str]) -> str:
