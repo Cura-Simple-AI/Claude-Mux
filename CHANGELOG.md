@@ -20,6 +20,11 @@ Format: [Semantic Versioning](https://semver.org/). Dates in ISO 8601.
   panes (it would create a new worktree); the session resumes in its existing worktree cwd.
 
 ### Fixed
+- `session restart --nudge` on background (`claude attach`) panes (#16): the nudge was typed but
+  Enter was never sent. Long wrapped or clipped text is now matched by its prefix (stable for
+  four captures), attach panes get 15 s instead of 3 s to redraw, and a nudge that cannot be
+  confirmed after a successful restart is reported as `OK (nudge not submitted)` with the
+  `tmux send-keys -t %N C-m` command instead of `SKIPPED`. Dialogs still block Enter.
 - `session restart`: Enter is sent only after the prompt line shows the typed `/exit` or nudge.
   Claude Code renders typed text ~75 ms after `send-keys`, and the immediate re-check failed
   every restart of an idle session, leaving `/exit` in the prompt line. The prompt line is now

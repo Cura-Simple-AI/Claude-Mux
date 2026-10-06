@@ -481,9 +481,15 @@ claude-mux session restart --all --match '^agent-'     # one at a time
 9. **Verify:** a new pid, the same `sessionId` in the registry and a visible status line.
 10. **Nudge:** the text, then Enter in a separate call, with the same checks as for `/exit`.
    Session-scoped cron jobs do not survive a resume, so the default nudge asks the agent to
-   recreate its scheduled loops. If the nudge cannot be sent safely — text in the prompt line,
-   copy/view mode, a dialog, or the typed text not shown in time — the result is `SKIPPED`, not
-   `FAILED`: the session itself was restarted, and the message says so (`pid a -> b, …; nudge: …`).
+   recreate its scheduled loops. Enter is sent once the prompt line shows the typed text — the
+   whole text, or (for long text that an attach view wraps or clips) its first 32 non-space
+   characters, unchanged for four captures. Background (`claude attach`) panes are given 15 s to
+   redraw, other panes 3 s. A dialog still blocks Enter.
+   If the nudge cannot be sent safely — text in the prompt line, copy/view mode, a dialog — the
+   result is `SKIPPED`, not `FAILED`: the session itself was restarted, and the message says so
+   (`pid a -> b, …; nudge: …`). If the typed text is simply not shown in time, the result is
+   `OK (nudge not submitted)` (exit code `0`), and when the text may still sit in the prompt line
+   the message ends with the command to submit it: `tmux send-keys -t %N C-m`.
 
 Worktrees are never removed.
 
@@ -516,7 +522,7 @@ becomes idle.
 **`--all` output:** one line per session — `OK`, `SKIPPED` (dialog / own pane) or `FAILED`.
 
 Exit codes: `0` OK, `1` failed (any session with `--all`), `2` usage, `4` skipped (dialog open,
-draft, copy/view mode, or nudge not sent after a successful restart).
+draft, copy/view mode, or a nudge blocked by a dialog or draft after a successful restart).
 
 **Known limitation.** A pane whose process is a non-interactive shell that waits for Claude Code
 (e.g. `tmux new-session 'cd dir && claude'`, i.e. `sh -c …`) is treated like a pane running an

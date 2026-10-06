@@ -1099,22 +1099,63 @@ class TestLateRendering:
         assert r.status == "OK" and "not submitted" not in r.line(), r.line()
         assert host.panes["bg:0.0"]["received"] == [nudge]
 
-    def test_nudge_never_rendered_after_successful_restart_is_skipped(self, host):
+    def test_nudge_never_rendered_after_successful_restart_is_ok_not_submitted(self, host):
+        # The restart worked, so the result is OK (not SKIPPED) -- scripts and
+        # `--all` summaries must not read a successful restart as a skip.
         host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid")
         _never_render_after_launch(host)
         r = restarter(host).restart("a:0.0", nudge="hi")
-        assert r.status == "SKIPPED", r.message
+        assert r.status == "OK" and r.nudge_submitted is False, r.message
+        assert r.line().startswith("OK (nudge not submitted)")
         assert "pid 101 ->" in r.message and "nudge" in r.message
         assert host.panes["a:0.0"]["claude"] != 101
         assert "received" not in host.panes["a:0.0"]
         assert host.panes["a:0.0"].get("typed", "") == ""
 
-    def test_nudge_timeout_exit_code_is_skipped_not_failed(self, host):
+    def test_nudge_timeout_exit_code_is_zero_with_not_submitted_label(self, host):
         host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid")
         _never_render_after_launch(host)
         r = _invoke(host, ["a:0.0", "--nudge", "hi"])
-        assert r.exit_code == 4, r.output
-        assert r.output.splitlines()[-1].startswith("SKIPPED")
+        assert r.exit_code == 0, r.output
+        assert r.output.splitlines()[-1].startswith("OK (nudge not submitted)")
+
+    def test_unconfirmable_nudge_prints_the_submit_command(self, host):
+        # After typing, no prompt box can be found in the (attach) view: the text may sit in
+        # the prompt line, so the exact command to submit it is printed.
+        host.add_attach_pane("bg:0.0", 400, 401, "cbf58c04-aaaa")
+        real_launch = host._launch
+
+        def launch(pane, argv, cwd):
+            real_launch(pane, argv, cwd)
+            pane["on_type"] = lambda p: p.update(
+                screen="attach view without a prompt box\n  main · Opus 5.5 ctx 17%\n")
+        host._launch = launch
+        r = restarter(host).restart("bg:0.0", nudge="hi")
+        assert r.status == "OK" and r.nudge_submitted is False, r.message
+        assert "tmux send-keys -t %0 C-m" in r.message
+        assert "received" not in host.panes["bg:0.0"]
+        assert ["send-keys", "-t", "%0", "Enter"] not in host.calls
+
+    def test_clipped_long_nudge_is_submitted_by_its_prefix(self, host):
+        nudge = "Re-create your scheduled loops after the restart. " * 5
+        host.add_attach_pane("bg:0.0", 400, 401, "cbf58c04-aaaa")
+        real_launch = host._launch
+        real_render = host._render_now
+
+        def launch(pane, argv, cwd):
+            real_launch(pane, argv, cwd)
+            pane["clip"] = True
+        host._launch = launch
+
+        def render(pane):
+            if pane.get("clip") and pane.get("typed"):
+                shown = dict(pane, typed=pane["typed"][:90] + "…")
+                return real_render(shown)
+            return real_render(pane)
+        host._render_now = render
+        r = restarter(host).restart("bg:0.0", nudge=nudge)
+        assert r.status == "OK" and r.nudge_submitted, r.line()
+        assert host.panes["bg:0.0"]["received"] == [nudge]
 
     @pytest.mark.parametrize("draft", ["half a thought", "line one\nline two"])
     def test_force_clear_rendered_late(self, host, draft):
