@@ -488,6 +488,22 @@ def prompt_text(screen: str) -> str | None:
     return " ".join("".join(c for c, dim, _ in cells if not dim).split())
 
 
+#: Capture lines kept in the log when the prompt box is not recognised.
+PROMPT_DIAG_LINES = 15
+
+
+def no_prompt_reason(screen: str) -> str:
+    """Why ``prompt_text`` found no prompt box (for diagnostics only)."""
+    plain = strip_ansi(screen).split("\n")
+    rules = [i for i, t in enumerate(plain) if _RULE_RE.match(t) or _BOX_RULE_RE.match(t)]
+    if len(rules) < 2:
+        return f"{len(rules)} horizontal rule(s) found, 2 needed"
+    if rules[-1] - rules[-2] < 2:
+        return "the last two rules are adjacent: no box content"
+    first = plain[rules[-2] + 1].lstrip()
+    return f"first line below the box's top rule does not start with a prompt marker: {first[:20]!r}"
+
+
 def _same_text(shown: str, typed: str) -> bool:
     """Does the prompt line show exactly ``typed`` (wrapped, or collapsed as a paste)?"""
     squash = "".join(shown.split())
@@ -784,11 +800,12 @@ class RestartResult:
     old_pid: int | None = None
     new_pid: int | None = None
     warnings: list[str] = field(default_factory=list)
-    #: False when the restart worked but the nudge was typed without Enter / not sent
-    nudge_submitted: bool = True
+    #: None: no nudge attempted (or it was skipped); True: Enter was sent after typing it;
+    #: False: the restart worked but the nudge could not be confirmed, so Enter was not sent
+    nudge_submitted: bool | None = None
 
     def line(self) -> str:
-        label = self.status if self.nudge_submitted else f"{self.status} (nudge not submitted)"
+        label = self.status if self.nudge_submitted is not False else f"{self.status} (nudge not submitted)"
         return f"{label:<8} {self.target}  {self.message}".rstrip()
 
     def to_dict(self) -> dict:
@@ -814,6 +831,7 @@ class Restarter:
         self.timeout = timeout
         self.poll = poll
         self.log = log or (lambda msg: None)
+        self._last_screen = ""
         #: pane id -> the pane's own remain-on-exit value before the restart
         self._remain_prior: dict[str, str | None] = {}
 
@@ -853,9 +871,21 @@ class Restarter:
     def _capture_prompt(self, info: SessionInfo) -> str | None:
         """Fresh capture: raise _Skip on a dialog, else return the prompt text."""
         screen = self.tmux.capture(info.pane_id, styled=True)
+        self._last_screen = screen
         if has_dialog(strip_ansi(screen)):
             raise _Skip(DIALOG_OPEN)
         return prompt_text(screen)
+
+    def _log_unparsed_prompt(self, info: SessionInfo, what: str) -> None:
+        """Keep the last capture when no prompt box was recognised after typing
+        (#16), so the next occurrence shows why instead of leaving a guess."""
+        screen = self._last_screen
+        plain = strip_ansi(screen)
+        tail = [line for line in plain.split("\n") if line.strip()][-PROMPT_DIAG_LINES:]
+        self.log(f"{info.pane_id}: no prompt box recognised after typing {what} "
+                 f"({no_prompt_reason(screen)}); last {len(tail)} non-empty capture lines:")
+        for line in tail:
+            self.log(f"{info.pane_id}:   {line!r}")
 
     def _poll_prompt(self, info: SessionInfo, done, timeout: float | None = None) -> str | None:
         """Capture the prompt line until ``done(text)`` or the timeout; return the last text."""
@@ -945,6 +975,8 @@ class Restarter:
         if shown and not typed.startswith(seen):
             raise SessionError(f"the prompt line changed while typing {what}; "
                                f"Enter not sent{removed}")
+        if shown is None:
+            self._log_unparsed_prompt(info, what)
         raise NudgeNotConfirmed(
             f"the prompt line did not show the typed {what} within {timeout:g}s; "
             f"Enter not sent{removed}", pending=not removed)
@@ -1138,9 +1170,10 @@ class Restarter:
             if nudge:
                 try:
                     self._nudge(info, nudge, force)
+                    result.nudge_submitted = True
                 except NudgeNotConfirmed as exc:
                     # Restarted, but the nudge cannot be confirmed: not a skip.
-                    hint = (f"; submit it with: tmux send-keys -t {info.pane_id} C-m"
+                    hint = (f"; check the pane, then submit with: tmux send-keys -t {info.pane_id} C-m"
                             if exc.pending else "")
                     result.status, result.nudge_submitted = "OK", False
                     result.message = f"{restarted}; nudge: {exc}{hint}"

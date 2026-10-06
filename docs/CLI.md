@@ -519,10 +519,12 @@ the log — because `tmux run-shell -b` shows a non-zero exit status in view mod
 pane, which would cover the restarted session. End the turn right after calling it so the session
 becomes idle.
 
-**`--all` output:** one line per session — `OK`, `SKIPPED` (dialog / own pane) or `FAILED`.
+**`--all` output:** one line per session — `OK`, `OK (nudge not submitted)` (restarted, but the nudge could not
+be confirmed and Enter was not sent), `SKIPPED` (dialog / own pane) or `FAILED`.
 
 Exit codes: `0` OK, `1` failed (any session with `--all`), `2` usage, `4` skipped (dialog open,
-draft, copy/view mode, or a nudge blocked by a dialog or draft after a successful restart).
+draft, copy/view mode, or a nudge blocked by a dialog or draft, or whose prompt line changed
+while typing, after a successful restart). An unconfirmed nudge is `OK (nudge not submitted)`: exit `0`.
 
 **Known limitation.** A pane whose process is a non-interactive shell that waits for Claude Code
 (e.g. `tmux new-session 'cd dir && claude'`, i.e. `sh -c …`) is treated like a pane running an
