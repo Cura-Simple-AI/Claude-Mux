@@ -50,10 +50,28 @@ DEFAULT_NUDGE = (
 SHELLS = {"bash", "zsh", "sh", "fish", "dash", "ksh", "-bash", "-zsh", "-sh"}
 
 #: Flags that tie a launch to a specific conversation; they are replaced by
-#: ``--resume <sessionId>`` on relaunch. Value: True if the flag takes a value.
-_SESSION_FLAGS = {
-    "--resume": True, "-r": True, "--session-id": True,
-    "--fork-session": False, "--continue": False, "-c": False,
+#: ``--resume <sessionId>`` on relaunch.
+_SESSION_FLAGS = {"--resume", "-r", "--session-id", "--fork-session", "--continue", "-c"}
+
+#: How Claude Code's options consume values (from ``claude --help``). Any other
+#: option is assumed to take exactly one value. Needed to tell option values
+#: from the positional prompt, which must not be replayed on resume.
+_BOOL_FLAGS = {
+    "--allow-dangerously-skip-permissions", "--ax-screen-reader", "--bg", "--background",
+    "--bare", "--brief", "--chrome", "--no-chrome", "-c", "--continue",
+    "--dangerously-skip-permissions", "--desktop", "--disable-slash-commands",
+    "--exclude-dynamic-system-prompt-sections", "--fork-session", "--forward-subagent-text",
+    "--ide", "--include-hook-events", "--include-partial-messages",
+    "--no-session-persistence", "-p", "--print", "--replay-user-messages", "--restricted",
+    "--safe-mode", "--strict-mcp-config", "--tmux", "--verbose", "-h", "--help",
+}
+_OPTIONAL_VALUE_FLAGS = {
+    "--cloud", "-d", "--debug", "--from-pr", "--prompt-suggestions", "--remote-control",
+    "-r", "--resume", "--teleport", "-w", "--worktree",
+}
+_VARIADIC_FLAGS = {
+    "--add-dir", "--allowedTools", "--allowed-tools", "--betas", "--disallowedTools",
+    "--disallowed-tools", "--file", "--mcp-config", "--tools",
 }
 
 #: Footer of a dialog. Exit and trust dialogs say "Enter to confirm", older
@@ -68,7 +86,11 @@ _CTX_RE = re.compile(r"ctx (\d+)%")
 _MODEL_RE = re.compile(r"\b((?:Opus|Sonnet|Haiku|Fable) \d+(?:\.\d+)?)\b")
 _OPTION_RE = re.compile(r"^\s*[❯>]?\s*(\d+)[.)]\s+(.*\S)\s*$")
 
-_PANE_FMT = "\t".join([
+#: Field separator for tmux formats. Printable on purpose: tmux replaces
+#: control characters such as tab with "_" in some environments (seen with
+#: ``docker exec`` without a UTF-8 locale).
+_FMT_SEP = "|~|"
+_PANE_FMT = _FMT_SEP.join([
     "#{session_name}:#{window_index}.#{pane_index}", "#{pane_id}", "#{pane_pid}",
     "#{pane_current_command}", "#{pane_current_path}", "#{pane_dead}",
 ])
@@ -126,13 +148,22 @@ class LocalHost:
 
 
 class DockerHost(LocalHost):
-    """Same operations, run inside a running container via ``docker exec``."""
+    """Same operations, run inside a running container via ``docker exec``.
 
-    def __init__(self, container: str):
+    tmux servers are per user, so ``user`` must be the user that owns the
+    sessions when it differs from the container's default user.
+    """
+
+    def __init__(self, container: str, user: str | None = None):
         self.container = container
+        self.user = user
+
+    def exec_argv(self, argv: list[str]) -> list[str]:
+        user = ["-u", self.user] if self.user else []
+        return ["docker", "exec", *user, self.container, *argv]
 
     def _in_container(self, argv: list[str]) -> tuple[int, str]:
-        return LocalHost.run(self, ["docker", "exec", self.container, *argv])
+        return LocalHost.run(self, self.exec_argv(argv))
 
     def run(self, argv: list[str]) -> tuple[int, str]:
         return self._in_container(argv)
@@ -153,8 +184,8 @@ class DockerHost(LocalHost):
         return out.strip() if rc == 0 and out.strip() else "/root"
 
 
-def make_host(container: str | None = None) -> LocalHost:
-    return DockerHost(container) if container else LocalHost()
+def make_host(container: str | None = None, user: str | None = None) -> LocalHost:
+    return DockerHost(container, user) if container else LocalHost()
 
 
 # ---------------------------------------------------------------------------
@@ -174,7 +205,7 @@ class Tmux:
     @staticmethod
     def _parse(line: str) -> dict:
         keys = ["target", "pane_id", "pane_pid", "command", "path", "dead"]
-        parts = line.split("\t")
+        parts = line.split(_FMT_SEP)
         d = dict(zip(keys, parts + [""] * (len(keys) - len(parts))))
         d["pane_pid"] = int(d["pane_pid"]) if d["pane_pid"].isdigit() else 0
         d["dead"] = d["dead"] == "1"
@@ -445,34 +476,61 @@ def resolve_model(model: str | None,
     return model, None
 
 
+def split_claude_args(args: list[str]) -> tuple[list[list[str]], list[str]]:
+    """Split Claude Code arguments into option groups and positional arguments.
+
+    Each group is the option followed by the values it consumes, e.g.
+    ``["--model", "x"]`` or ``["--add-dir", "a", "b"]``.
+    """
+    groups: list[list[str]] = []
+    positional: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            positional += args[i + 1:]
+            break
+        if not a.startswith("-") or a == "-":
+            positional.append(a)
+            i += 1
+            continue
+        flag = a.split("=", 1)[0]
+        group = [a]
+        i += 1
+        if "=" in a or flag in _BOOL_FLAGS:
+            pass
+        elif flag in _VARIADIC_FLAGS:
+            while i < len(args) and not args[i].startswith("-"):
+                group.append(args[i])
+                i += 1
+        elif flag in _OPTIONAL_VALUE_FLAGS:
+            if i < len(args) and not args[i].startswith("-"):
+                group.append(args[i])
+                i += 1
+        elif i < len(args):
+            group.append(args[i])
+            i += 1
+        groups.append(group)
+    return groups, positional
+
+
 def build_relaunch_argv(argv: list[str], session_id: str, model: str | None = None,
                         drop_worktree: bool = False) -> list[str]:
     """Original argv minus conversation flags, plus ``--resume <sessionId>``.
 
-    ``--model`` is replaced when ``model`` is given. ``--worktree`` is dropped
-    when relaunching inside the worktree directory itself (direct panes).
+    The positional prompt is dropped: with ``--resume`` it would be sent to the
+    agent again as a new message. ``--model`` is replaced when ``model`` is
+    given. ``--worktree`` is dropped when relaunching inside the worktree
+    directory itself (direct panes).
     """
     head = argv[:2] if os.path.basename(argv[0]) == "node" else argv[:1]
-    args = _claude_args(argv)
-    drop = dict(_SESSION_FLAGS)
+    groups, _prompt = split_claude_args(_claude_args(argv))
+    drop = set(_SESSION_FLAGS)
     if model:
-        drop["--model"] = True
+        drop.add("--model")
     if drop_worktree:
-        drop["--worktree"] = True
-        drop["-w"] = True
-    kept: list[str] = []
-    i = 0
-    while i < len(args):
-        a = args[i]
-        flag = a.split("=", 1)[0]
-        if flag in drop:
-            takes_value = drop[flag] and "=" not in a
-            if flag in ("--worktree", "-w") and (i + 1 >= len(args) or args[i + 1].startswith("-")):
-                takes_value = False  # --worktree may be given without a name
-            i += 2 if takes_value else 1
-            continue
-        kept.append(a)
-        i += 1
+        drop |= {"--worktree", "-w"}
+    kept = [x for g in groups if g[0].split("=", 1)[0] not in drop for x in g]
     if model:
         kept += ["--model", model]
     return head + kept + ["--resume", session_id]

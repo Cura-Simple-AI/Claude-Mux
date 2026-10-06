@@ -1215,10 +1215,10 @@ def cmd_init(force):
 # session
 # ---------------------------------------------------------------------------
 
-def _session_host(container):
+def _session_host(container, user=None):
     """Host used by `session` commands. Patched in tests with a fake tmux."""
     from claude_mux import session as sess
-    return sess.make_host(container)
+    return sess.make_host(container, user)
 
 
 def _session_aliases() -> dict:
@@ -1241,20 +1241,28 @@ def cmd_session():
 @cmd_session.command("list")
 @click.option("--container", default=None, metavar="NAME",
               help="Inspect tmux inside a running container (docker exec)")
+@click.option("--container-user", default=None, metavar="USER",
+              help="With --container: user owning the tmux server (docker exec -u)")
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON")
-def cmd_session_list(container, as_json):
+def cmd_session_list(container, container_user, as_json):
     """List Claude Code sessions in tmux panes.
 
     Shows pane, pid, session name and id, model, context %, state
     (idle / working / dialog) and the original command line. Read-only.
     """
     from claude_mux import session as sess
-    sessions = sess.list_sessions(_session_host(container))
+    if container_user and not container:
+        click.echo("Error: --container-user requires --container", err=True)
+        sys.exit(2)
+    sessions = sess.list_sessions(_session_host(container, container_user))
     if as_json:
         click.echo(json.dumps([s.to_dict() for s in sessions], indent=2))
         return
     if not sessions:
         click.echo("No Claude Code sessions found in tmux.")
+        if container and not container_user:
+            click.echo("(tmux servers are per user; try --container-user if the sessions "
+                       "belong to another user than the container's default)")
         return
     click.echo(f"{'TARGET':<24} {'PID':<9} {'STATE':<8} {'MODEL':<20} {'CTX':<5} "
                f"{'NAME':<26} SESSION")
@@ -1291,10 +1299,12 @@ def cmd_session_list(container, as_json):
               help="With --self: seconds before the helper starts")
 @click.option("--container", default=None, metavar="NAME",
               help="Operate on tmux inside a running container (docker exec)")
+@click.option("--container-user", default=None, metavar="USER",
+              help="With --container: user owning the tmux server (docker exec -u)")
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON")
 @click.pass_context
 def cmd_session_restart(ctx, target, self_, all_, match, model, profile, nudge, no_nudge,
-                        force, timeout, delay, container, as_json):
+                        force, timeout, delay, container, container_user, as_json):
     """Exit a Claude Code session and resume it in the same pane.
 
     \b
@@ -1329,7 +1339,10 @@ def cmd_session_restart(ctx, target, self_, all_, match, model, profile, nudge, 
     else:
         nudge_text = nudge if nudge is not None else sess.DEFAULT_NUDGE
 
-    host = _session_host(container)
+    if container_user and not container:
+        click.echo("Error: --container-user requires --container", err=True)
+        sys.exit(2)
+    host = _session_host(container, container_user)
 
     if self_:
         if container:

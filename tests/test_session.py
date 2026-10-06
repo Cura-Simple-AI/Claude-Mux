@@ -203,7 +203,7 @@ class FakeHost:
     # -- simulation --------------------------------------------------------
     @staticmethod
     def _fmt(p):
-        return "\t".join([p["target"], p["pane_id"], str(p["pane_pid"]), p["command"],
+        return sess._FMT_SEP.join([p["target"], p["pane_id"], str(p["pane_pid"]), p["command"],
                           p["path"], "1" if p["dead"] else "0"])
 
     def _exit_claude(self, pane):
@@ -346,6 +346,30 @@ class TestList:
         assert r.exit_code == 0, r.output
         assert json.loads(r.output)[0]["session_id"] == "sid-a"
 
+    def test_docker_host_runs_as_container_user(self):
+        h = sess.make_host("box", "vscode")
+        assert h.exec_argv(["tmux", "ls"]) == ["docker", "exec", "-u", "vscode", "box",
+                                               "tmux", "ls"]
+        assert sess.make_host("box").exec_argv(["tmux"]) == ["docker", "exec", "box", "tmux"]
+
+    def test_cli_passes_container_user(self, host):
+        with patch("claude_mux.cli._session_host", return_value=host) as mk:
+            r = CliRunner().invoke(cli, ["session", "list", "--container", "box",
+                                         "--container-user", "vscode"])
+        assert r.exit_code == 0, r.output
+        mk.assert_called_once_with("box", "vscode")
+
+    def test_cli_container_user_requires_container(self, host):
+        with patch("claude_mux.cli._session_host", return_value=host):
+            r = CliRunner().invoke(cli, ["session", "list", "--container-user", "vscode"])
+        assert r.exit_code == 2
+
+    def test_pane_format_has_no_control_characters(self):
+        # tmux may print control characters (tab) as "_", which broke parsing
+        # of every pane when run through `docker exec`.
+        assert all(c.isprintable() for c in sess._PANE_FMT)
+        assert sess.Tmux._parse("a:0.0|~|%1|~|12|~|claude|~|/p q|~|0")["path"] == "/p q"
+
     def test_cli_list_is_read_only(self, host):
         host.add_shell_pane("a:0.0", 101, AGENT_ARGV, "sid-a")
         with patch("claude_mux.cli._session_host", return_value=host):
@@ -368,6 +392,30 @@ class TestArgvAndModel:
         argv = sess.build_relaunch_argv([CLAUDE, "--session-id", "x", "--model=opus", "-c"],
                                         "sid", "claude-sonnet-5-5")
         assert argv == [CLAUDE, "--model", "claude-sonnet-5-5", "--resume", "sid"]
+
+    @pytest.mark.parametrize("args, kept", [
+        (["do the task", "--model", "m"], ["--model", "m"]),
+        (["--model", "m", "do the task"], ["--model", "m"]),
+        (["--verbose", "do the task", "--model", "m"], ["--verbose", "--model", "m"]),
+        (["--model", "m", "--", "do the task"], ["--model", "m"]),
+    ])
+    def test_initial_prompt_is_not_replayed_on_resume(self, args, kept):
+        # Seen live: `claude "prompt" ... --resume <id>` sends the prompt again.
+        assert sess.build_relaunch_argv([CLAUDE, *args], "sid") == [CLAUDE, *kept,
+                                                                     "--resume", "sid"]
+
+    def test_variadic_and_optional_values_are_kept(self):
+        argv = [CLAUDE, "--add-dir", "/a", "/b", "--worktree", "--debug", "api",
+                "--permission-mode", "plan", "prompt"]
+        assert sess.build_relaunch_argv(argv, "sid") == [
+            CLAUDE, "--add-dir", "/a", "/b", "--worktree", "--debug", "api",
+            "--permission-mode", "plan", "--resume", "sid"]
+
+    def test_restart_does_not_resend_initial_prompt(self, host):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE, "--agent", "dev", "fix the bug"], "sid")
+        r = restarter(host).restart("a:0.0", nudge=None)
+        assert r.status == "OK", r.message
+        assert host.panes["a:0.0"]["launched"] == [CLAUDE, "--agent", "dev", "--resume", "sid"]
 
     def test_short_alias_expanded_to_full_id(self):
         assert sess.resolve_model("opus") == ("claude-opus-5-5", None)

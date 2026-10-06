@@ -381,6 +381,7 @@ Lists Claude Code sessions running in tmux panes. Read-only.
 claude-mux session list                    # table
 claude-mux session list --json             # machine-readable
 claude-mux session list --container dev    # tmux inside a running container (docker exec)
+claude-mux session list --container dev --container-user vscode   # tmux server of another user
 ```
 
 Each session is mapped **tmux pane → claude pid → `~/.claude/sessions/<pid>.json`** and shows
@@ -422,6 +423,7 @@ claude-mux session restart --all --match '^agent-'     # one at a time
 | `--all` | Restart every session, one at a time. The caller's own pane is skipped |
 | `--match REGEX` | With `--all`: only sessions whose target, name or cwd matches |
 | `--container NAME` | Operate on tmux inside a running container |
+| `--container-user USER` | With `--container`: the user owning the tmux server (`docker exec -u`); tmux servers are per user |
 | `--json` | Output as JSON |
 
 **Sequence and safety rules:**
@@ -441,6 +443,8 @@ claude-mux session restart --all --match '^agent-'     # one at a time
    do not apply, and `--model` is refused because `claude respawn` keeps the session's settings.
 5. **Relaunch** with the original argv (`--agent`, `--worktree`, `--permission-mode`, `--model`, …)
    minus `--resume`, `--session-id`, `--fork-session` and `--continue`, plus `--resume <sessionId>`.
+   A positional prompt from the original command line is dropped — with `--resume` it would be
+   sent to the agent again as a new message.
    - Pane runs a shell: wait for the shell, then type the command.
    - Claude Code is the pane process itself: `remain-on-exit` is set before exit and the pane is
      relaunched with `tmux respawn-pane` in the session's cwd (`--worktree` is dropped because
