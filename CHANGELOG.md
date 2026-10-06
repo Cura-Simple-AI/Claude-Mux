@@ -39,6 +39,8 @@ Format: [Semantic Versioning](https://semver.org/). Dates in ISO 8601.
   exactly the typed text, stops the restart without Enter (also after the `--force` Escape).
 - `session restart`: the relaunch command is logged before `/exit` is sent, so an interrupted
   restart (for example a `--self` helper that dies) can be finished by hand.
+- `session restart`: in fish shell panes the relaunch command is quoted for fish, which treats
+  backslashes inside single quotes differently from POSIX shells.
 
 ---
 

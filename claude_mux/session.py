@@ -47,7 +47,16 @@ DEFAULT_NUDGE = (
     "continue where you left off."
 )
 
-SHELLS = {"bash", "zsh", "sh", "fish", "dash", "ksh", "-bash", "-zsh", "-sh"}
+SHELLS = {"bash", "zsh", "sh", "fish", "dash", "ksh", "-bash", "-zsh", "-sh", "-fish"}
+
+_FISH_SAFE_RE = re.compile(r"[\w@+=:,./-]+")
+
+
+def fish_quote(value: str) -> str:
+    """Quote for fish: inside single quotes, fish treats \\ and \' as escapes."""
+    if _FISH_SAFE_RE.fullmatch(value):
+        return value
+    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 #: Flags that tie a launch to a specific conversation; they are replaced by
 #: ``--resume <sessionId>`` on relaunch.
@@ -921,6 +930,19 @@ class Restarter:
         return new_pid
 
     def _relaunch_command(self, info: SessionInfo, argv: list[str], *, cd: bool) -> str:
+        """The relaunch command line, quoted for the pane's shell.
+
+        Direct panes are relaunched by tmux through /bin/sh. Shell panes get
+        the command typed into their own shell: POSIX quoting, or fish quoting.
+        """
+        shell = ""
+        if info.mode == "shell":
+            shell = os.path.basename((proc_argv(self.host, info.pane_pid) or [""])[0]).lstrip("-")
+        if shell == "fish":
+            command = " ".join(fish_quote(a) for a in argv)
+            if cd:
+                command = f"cd {fish_quote(info.cwd)}; and {command}"
+            return command
         command = shlex.join(argv)
         if info.mode == "shell" and cd:
             # The shell is still in the launch dir, not in the worktree.

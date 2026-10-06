@@ -79,6 +79,34 @@ REAL_PERMISSION_PROMPT = (
 UNKNOWN_DIALOG = "Do you trust this folder?\n❯ 1. Yes\n  2. No\nEnter to select\n"
 
 
+def fish_split(text):
+    """Minimal fish tokenizer: bare words, single quotes (\\ and \' escapes), ';'."""
+    words, cur, quoted, i = [], "", False, 0
+    while i < len(text):
+        c = text[i]
+        if c == "'":
+            quoted, i = True, i + 1
+            while text[i] != "'":
+                if text[i] == "\\" and text[i + 1] in "\\'":
+                    cur, i = cur + text[i + 1], i + 2
+                else:
+                    cur, i = cur + text[i], i + 1
+        elif c in " ;":
+            if cur or quoted:
+                words.append(cur)
+            cur, quoted = "", False
+            if c == ";":
+                words.append(";")
+        elif c in "\"$*?~{}()|&<>\\":
+            raise AssertionError(f"unquoted fish metacharacter {c!r} in {text!r}")
+        else:
+            cur += c
+        i += 1
+    if cur or quoted:
+        words.append(cur)
+    return words
+
+
 class FakeHost:
     """In-memory tmux + /proc + session registry."""
 
@@ -115,15 +143,16 @@ class FakeHost:
         self.files[f"{REG}/{pid}.json"] = json.dumps(data)
         self.files[f"{REG}/{pid}.0123abcd.key"] = "secret"
 
-    def add_shell_pane(self, target, claude_pid, argv, session_id, screen=STATUS, **reg):
+    def add_shell_pane(self, target, claude_pid, argv, session_id, screen=STATUS, shell_name="bash",
+                       **reg):
         shell = claude_pid - 1
-        self.add_proc(shell, ["-bash"], children=[claude_pid])
+        self.add_proc(shell, [f"-{shell_name}"], children=[claude_pid])
         self.add_proc(claude_pid, argv)
         self.register(claude_pid, session_id, **reg)
         self.panes[target] = {"target": target, "pane_id": f"%{len(self.panes)}",
                               "pane_pid": shell, "command": "claude", "path": "/work",
                               "dead": False, "screen": screen, "mode": "shell",
-                              "claude": claude_pid, "remain": False}
+                              "claude": claude_pid, "remain": False, "shell": shell_name}
 
     def add_direct_pane(self, target, claude_pid, argv, session_id, screen=STATUS, **reg):
         self.add_proc(claude_pid, argv)
@@ -234,7 +263,7 @@ class FakeHost:
         self.remove_proc(pane["claude"])
         if pane["mode"] == "shell":
             self.files[f"/proc/{pane['pane_pid']}/task/{pane['pane_pid']}/children"] = ""
-            pane["command"], pane["screen"] = "bash", "user@host:/work$ "
+            pane["command"], pane["screen"] = pane.get("shell", "bash"), "user@host:/work$ "
         else:
             assert pane["remain"], "pane would have closed: remain-on-exit not set"
             pane["dead"], pane["screen"] = True, "Pane is dead\n"
@@ -286,6 +315,11 @@ class FakeHost:
                 words, cwd = shlex.split(text), pane["path"]
                 if words[:1] == ["cd"] and words[2:3] == ["&&"]:
                     cwd, words = words[1], words[3:]
+                self._launch(pane, words, cwd)
+            elif pane["mode"] == "shell" and pane["command"] == "fish" and text:
+                words, cwd = fish_split(text), pane["path"]
+                if words[:1] == ["cd"] and words[2:4] == [";", "and"]:
+                    cwd, words = words[1], words[4:]
                 self._launch(pane, words, cwd)
             elif text:
                 pane.setdefault("received", []).append(text)
@@ -753,6 +787,24 @@ class TestRestartTraps:
         assert pane["launched"] == [CLAUDE, flag, "wt-dev", "--agent", "dev",
                                     "--resume", "sid-a"]
         assert pane["launched_cwd"] == "/work"
+
+    @pytest.mark.parametrize("shell_name", ["bash", "fish"])
+    def test_cwd_and_arguments_with_spaces_and_quotes(self, host, shell_name):
+        # The relaunch command is typed into the pane's own shell; fish treats
+        # backslashes inside single quotes differently from POSIX shells.
+        cwd = "/work/it's a \\dir/.claude/worktrees/x"
+        argv = [CLAUDE, "--worktree", "--append-system-prompt", "say 'hi' \\o/ $HOME *"]
+        host.add_shell_pane("a:0.0", 101, argv, "sid", shell_name=shell_name, cwd=cwd)
+        r = restarter(host).restart("a:0.0", nudge=None)
+        assert r.status == "OK", r.message
+        pane = host.panes["a:0.0"]
+        assert pane["launched"] == [CLAUDE, "--append-system-prompt", argv[3], "--resume", "sid"]
+        assert pane["launched_cwd"] == cwd
+
+    def test_fish_quote(self):
+        assert sess.fish_quote("plain/path-1.0") == "plain/path-1.0"
+        assert sess.fish_quote("a b") == "'a b'"
+        assert sess.fish_quote("it's \\x") == "'it\\'s \\\\x'"
 
     def test_verify_fails_when_session_id_differs(self, host):
         host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid")

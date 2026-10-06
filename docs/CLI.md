@@ -466,7 +466,8 @@ claude-mux session restart --all --match '^agent-'     # one at a time
    - Pane runs a shell: wait for the shell, then type the command. A bare `--worktree` (no name)
      is dropped and the command is prefixed with `cd <session cwd> &&`: a bare `--worktree`
      creates a new worktree on every launch, and the shell is still in the launch directory.
-     `--worktree <name>` is kept as is.
+     `--worktree <name>` is kept as is. The command is quoted for the pane's shell: POSIX quoting
+     for bash, zsh, sh, dash and ksh; fish quoting (and `cd <dir>; and …`) for fish.
    - Claude Code is the pane process itself: `remain-on-exit` is set before exit and the pane is
      relaunched with `tmux respawn-pane` in the session's cwd (`--worktree` is dropped because
      the cwd already is the worktree).
