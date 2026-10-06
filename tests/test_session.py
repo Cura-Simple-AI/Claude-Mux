@@ -225,7 +225,7 @@ class FakeHost:
             return
         sid = self.resume_session_override or argv[argv.index("--resume") + 1]
         self.register(pid, sid, cwd=cwd)
-        pane.update(claude=pid, command="claude", screen=STATUS, launched=argv)
+        pane.update(claude=pid, command="claude", screen=STATUS, launched=argv, launched_cwd=cwd)
         if pane["mode"] == "shell":
             self.files[f"/proc/{pane['pane_pid']}/task/{pane['pane_pid']}/children"] = str(pid)
 
@@ -254,7 +254,10 @@ class FakeHost:
                 else:
                     self._exit_claude(pane)
             elif pane["mode"] == "shell" and pane["command"] == "bash" and text:
-                self._launch(pane, shlex.split(text), pane["path"])
+                words, cwd = shlex.split(text), pane["path"]
+                if words[:1] == ["cd"] and words[2:3] == ["&&"]:
+                    cwd, words = words[1], words[3:]
+                self._launch(pane, words, cwd)
             elif text:
                 pane.setdefault("received", []).append(text)
             return
@@ -631,6 +634,29 @@ class TestRestartTraps:
         assert host.panes["a:0.0"]["launched"] == sess.build_relaunch_argv(AGENT_ARGV, "sid-a")
         assert r.old_pid == 101 and r.new_pid not in (None, 101)
 
+    def test_shell_pane_drops_bare_worktree_and_resumes_in_its_cwd(self, host):
+        # A bare --worktree creates a new, randomly named worktree on every
+        # launch, so replaying it would resume in a fresh worktree. The shell
+        # stayed in the launch dir; cd into the session's worktree instead.
+        argv = [CLAUDE, "--worktree", "--agent", "dev"]
+        host.add_shell_pane("a:0.0", 101, argv, "sid-a", cwd="/work/.claude/worktrees/x")
+        r = restarter(host).restart("a:0.0", nudge=None)
+        assert r.status == "OK", r.message
+        pane = host.panes["a:0.0"]
+        assert pane["launched"] == [CLAUDE, "--agent", "dev", "--resume", "sid-a"]
+        assert pane["launched_cwd"] == "/work/.claude/worktrees/x"
+
+    @pytest.mark.parametrize("flag", ["-w", "--worktree"])
+    def test_shell_pane_keeps_named_worktree(self, host, flag):
+        argv = [CLAUDE, flag, "wt-dev", "--agent", "dev"]
+        host.add_shell_pane("a:0.0", 101, argv, "sid-a", cwd="/work/.claude/worktrees/wt-dev")
+        r = restarter(host).restart("a:0.0", nudge=None)
+        assert r.status == "OK", r.message
+        pane = host.panes["a:0.0"]
+        assert pane["launched"] == [CLAUDE, flag, "wt-dev", "--agent", "dev",
+                                    "--resume", "sid-a"]
+        assert pane["launched_cwd"] == "/work"
+
     def test_verify_fails_when_session_id_differs(self, host):
         host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid")
         host.resume_session_override = "another-session"
@@ -730,10 +756,38 @@ class TestRestartCli:
         assert r.exit_code == 0, r.output
         assert order == [("activate", 0)]
 
+    def test_profile_with_container_is_refused(self, host):
+        # Activating a profile writes the HOST's config; the container's
+        # Claude Code would never see it.
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "s1")
+        with patch("claude_mux.cli.cmd_activate") as activate:
+            r = _invoke(host, ["a:0.0", "--profile", "work", "--container", "box",
+                               "--no-nudge"])
+        assert r.exit_code == 2
+        assert "--profile" in r.output and "--container" in r.output
+        activate.assert_not_called()
+        assert host.sends("a:0.0") == []
+
     def test_dialog_exit_code(self, host):
         host.add_shell_pane("a:0.0", 101, [CLAUDE], "s1", screen=KEEP_DIALOG)
         r = _invoke(host, ["a:0.0"])
         assert r.exit_code == 4 and r.output.startswith("SKIPPED")
+
+    @pytest.mark.parametrize("name", ["list", "restart"])
+    def test_cli_docs_cover_every_session_flag(self, name):
+        root = sess.Path(__file__).resolve().parent.parent
+        docs = (root / "docs" / "CLI.md").read_text()
+        section = docs.split(f"### `claude-mux session {name}`", 1)[1].split("\n### ", 1)[0]
+        command = cli.commands["session"].commands[name]
+        flags = [o for p in command.params for o in p.opts
+                 if o.startswith("--") and o != "--help"]
+        assert flags
+        assert [f for f in flags if f"`{f}" not in section] == []
+
+    def test_changelog_mentions_container_user(self):
+        root = sess.Path(__file__).resolve().parent.parent
+        unreleased = (root / "CHANGELOG.md").read_text().split("## [0.", 1)[0]
+        assert "--container-user" in unreleased
 
     def test_help_lists_commands(self):
         r = CliRunner().invoke(cli, ["session", "--help"])

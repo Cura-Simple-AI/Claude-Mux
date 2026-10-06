@@ -1287,7 +1287,7 @@ def cmd_session_list(container, container_user, as_json):
 @click.option("--model", default=None, metavar="ID",
               help="Model for the resumed session (short aliases are expanded)")
 @click.option("--profile", default=None, metavar="NAME",
-              help="Run `activate NAME` before restarting")
+              help="Run `activate NAME` before restarting (host only; not with --container)")
 @click.option("--nudge", default=None, metavar="TEXT",
               help="Message sent after resume (default: ask the agent to recreate scheduled loops)")
 @click.option("--no-nudge", is_flag=True, help="Do not send any message after resume")
@@ -1341,6 +1341,11 @@ def cmd_session_restart(ctx, target, self_, all_, match, model, profile, nudge, 
 
     if container_user and not container:
         click.echo("Error: --container-user requires --container", err=True)
+        sys.exit(2)
+    if profile and container:
+        # `activate` writes the host's config; the container would never see it.
+        click.echo("Error: --profile cannot be combined with --container (it would activate "
+                   "the profile on the host, not in the container)", err=True)
         sys.exit(2)
     host = _session_host(container, container_user)
 

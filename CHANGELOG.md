@@ -12,6 +12,12 @@ Format: [Semantic Versioning](https://semver.org/). Dates in ISO 8601.
 - `session list` and `session restart` (single pane, `--self`, `--all`): safe exit and resume of
   Claude Code sessions in tmux — refuses open dialogs, always keeps worktrees, expands short
   model aliases, nudges the agent to recreate scheduled loops after resume.
+- `session list` / `session restart`: `--container NAME` operates on tmux inside a running
+  container (`docker exec`); `--container-user USER` selects the user owning the tmux server
+  (`docker exec -u`), since tmux servers are per user. `--profile` and `--self` are refused with
+  `--container`.
+- `session restart`: a bare `--worktree` in the original command line is not replayed in shell
+  panes (it would create a new worktree); the session resumes in its existing worktree cwd.
 
 ---
 

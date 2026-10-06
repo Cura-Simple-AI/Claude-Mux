@@ -514,6 +514,16 @@ def split_claude_args(args: list[str]) -> tuple[list[list[str]], list[str]]:
     return groups, positional
 
 
+def has_bare_worktree(argv: list[str]) -> bool:
+    """True when ``--worktree``/``-w`` is given without a name.
+
+    Each launch with a bare ``--worktree`` creates a new, randomly named
+    worktree, so it must never be replayed on resume.
+    """
+    groups, _prompt = split_claude_args(_claude_args(argv))
+    return any(g == ["--worktree"] or g == ["-w"] for g in groups)
+
+
 def build_relaunch_argv(argv: list[str], session_id: str, model: str | None = None,
                         drop_worktree: bool = False) -> list[str]:
     """Original argv minus conversation flags, plus ``--resume <sessionId>``.
@@ -521,7 +531,8 @@ def build_relaunch_argv(argv: list[str], session_id: str, model: str | None = No
     The positional prompt is dropped: with ``--resume`` it would be sent to the
     agent again as a new message. ``--model`` is replaced when ``model`` is
     given. ``--worktree`` is dropped when relaunching inside the worktree
-    directory itself (direct panes).
+    directory itself (direct panes, and shell panes with a bare
+    ``--worktree``).
     """
     head = argv[:2] if os.path.basename(argv[0]) == "node" else argv[:1]
     groups, _prompt = split_claude_args(_claude_args(argv))
@@ -699,12 +710,15 @@ class Restarter:
                    "the re-attached session (status line)")
         return new_pid
 
-    def _relaunch(self, info: SessionInfo, argv: list[str]) -> None:
+    def _relaunch(self, info: SessionInfo, argv: list[str], *, cd: bool = False) -> None:
         command = shlex.join(argv)
         if info.mode == "direct":
             self.tmux.respawn(info.target, info.cwd or self.host.home(), command)
             self.tmux.set_remain_on_exit(info.target, False)
         else:
+            if cd:
+                # The shell is still in the launch dir, not in the worktree.
+                command = f"cd {shlex.quote(info.cwd)} && {command}"
             self.tmux.send_literal(info.target, command)
             self.tmux.send_keys(info.target, "Enter")
 
@@ -756,12 +770,16 @@ class Restarter:
             if info.attached:
                 result.new_pid = self._respawn_attached(info)
             else:
+                # A bare --worktree would create a new worktree on resume; run
+                # inside the session's existing worktree cwd instead.
+                bare_worktree = (info.mode == "shell" and bool(info.cwd)
+                                 and has_bare_worktree(info.argv))
                 argv = build_relaunch_argv(info.argv, info.session_id, model,
-                                           drop_worktree=info.mode == "direct")
+                                           drop_worktree=info.mode == "direct" or bare_worktree)
                 if info.mode == "direct":
                     self.tmux.set_remain_on_exit(info.target, True)
                 self._exit_interactive(info)
-                self._relaunch(info, argv)
+                self._relaunch(info, argv, cd=bare_worktree)
                 result.new_pid = self._verify(info)
             if nudge:
                 self._nudge(info, nudge)

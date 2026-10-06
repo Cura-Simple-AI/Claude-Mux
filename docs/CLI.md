@@ -384,6 +384,12 @@ claude-mux session list --container dev    # tmux inside a running container (do
 claude-mux session list --container dev --container-user vscode   # tmux server of another user
 ```
 
+| Option | Description |
+|---|---|
+| `--container NAME` | Inspect tmux inside a running container (`docker exec`) |
+| `--container-user USER` | With `--container`: the user owning the tmux server (`docker exec -u`); tmux servers are per user |
+| `--json` | Output as JSON |
+
 Each session is mapped **tmux pane → claude pid → `~/.claude/sessions/<pid>.json`** and shows
 the session id, name, cwd, original command line, model, context % and state:
 
@@ -413,12 +419,12 @@ claude-mux session restart --all --match '^agent-'     # one at a time
 | Option | Description |
 |---|---|
 | `--model ID` | Model for the resumed session. Short aliases are expanded (see below) |
-| `--profile NAME` | Run `activate NAME` before restarting |
+| `--profile NAME` | Run `activate NAME` before restarting. Host only: refused with `--container`, because `activate` writes the host's config, which the container never sees |
 | `--nudge TEXT` | Message sent after resume. Default asks the agent to recreate its scheduled loops |
 | `--no-nudge` | Send no message after resume |
 | `--force` | Do not wait for idle; send Escape first. Open dialogs are still refused |
 | `--timeout SEC` | Seconds to wait for each step (default 300) |
-| `--self` | Restart the calling session's pane via a detached helper (`tmux run-shell -b`) |
+| `--self` | Restart the calling session's pane via a detached helper (`tmux run-shell -b`). Not with `--container` |
 | `--delay SEC` | With `--self`: seconds before the helper starts (default 5) |
 | `--all` | Restart every session, one at a time. The caller's own pane is skipped |
 | `--match REGEX` | With `--all`: only sessions whose target, name or cwd matches |
@@ -445,7 +451,10 @@ claude-mux session restart --all --match '^agent-'     # one at a time
    minus `--resume`, `--session-id`, `--fork-session` and `--continue`, plus `--resume <sessionId>`.
    A positional prompt from the original command line is dropped — with `--resume` it would be
    sent to the agent again as a new message.
-   - Pane runs a shell: wait for the shell, then type the command.
+   - Pane runs a shell: wait for the shell, then type the command. A bare `--worktree` (no name)
+     is dropped and the command is prefixed with `cd <session cwd> &&`: a bare `--worktree`
+     creates a new worktree on every launch, and the shell is still in the launch directory.
+     `--worktree <name>` is kept as is.
    - Claude Code is the pane process itself: `remain-on-exit` is set before exit and the pane is
      relaunched with `tmux respawn-pane` in the session's cwd (`--worktree` is dropped because
      the cwd already is the worktree).
