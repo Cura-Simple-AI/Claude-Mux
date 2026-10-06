@@ -274,7 +274,9 @@ class Tmux:
         self._run("respawn-pane", "-t", target, "-c", cwd, command)
 
     def run_shell_background(self, command: str) -> None:
-        self._run("run-shell", "-b", command)
+        # run-shell expands tmux formats in its argument: "#S" becomes the
+        # session name and "#(cmd)" RUNS cmd. "##" is a literal "#".
+        self._run("run-shell", "-b", command.replace("#", "##"))
 
 
 # ---------------------------------------------------------------------------
@@ -853,12 +855,14 @@ class Restarter:
 
 
 def self_restart_command(python: str, target: str, *, delay: float, extra: list[str]) -> str:
-    """Shell command run by the detached helper for ``restart --self``.
+    """Shell command (POSIX sh, as run by ``tmux run-shell``) for ``restart --self``.
 
     The helper runs from the tmux server's directory, so the package location
-    is put on PYTHONPATH: the helper runs the same claude_mux as the caller.
+    is put in front of PYTHONPATH: the helper runs the same claude_mux as the
+    caller. An existing PYTHONPATH is kept, since dependencies may be found
+    only through it.
     """
     package_parent = str(Path(__file__).resolve().parent.parent)
-    inner = shlex.join(["env", f"PYTHONPATH={package_parent}", python, "-m", "claude_mux",
-                        "session", "restart", target, *extra])
-    return f"sleep {float(delay):g}; {inner}"
+    pythonpath = f'PYTHONPATH={shlex.quote(package_parent)}"${{PYTHONPATH:+:$PYTHONPATH}}"'
+    inner = shlex.join([python, "-m", "claude_mux", "session", "restart", target, *extra])
+    return f"sleep {float(delay):g}; {pythonpath} {inner}"

@@ -4,7 +4,9 @@ No real tmux server, process or session registry is touched: every external
 operation goes through FakeHost.
 """
 import json
+import re
 import shlex
+import subprocess
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -779,12 +781,34 @@ class TestRestartCli:
         assert sess.own_pane(host, pid=900) == host.panes["b:0.0"]["pane_id"]
         assert sess.own_pane(host, pid=12345) is None
 
-    def test_self_helper_runs_the_callers_package(self):
-        cmd = sess.self_restart_command("/usr/bin/python3", "%3", delay=5, extra=[])
+    @pytest.mark.parametrize("existing, expected_suffix", [
+        (None, ""), ("/deps a:/more", ":/deps a:/more")])
+    def test_self_helper_prepends_package_to_pythonpath(self, tmp_path, existing,
+                                                        expected_suffix):
+        # The helper runs the caller's claude_mux, but keeps an existing
+        # PYTHONPATH (dependencies may only be found through it).
+        fake_python = tmp_path / "python"
+        fake_python.write_text('#!/bin/sh\nprintf %s "$PYTHONPATH"\n')
+        fake_python.chmod(0o755)
+        cmd = sess.self_restart_command(str(fake_python), "%3", delay=0, extra=[])
+        env = {"PATH": "/usr/bin:/bin"}
+        if existing is not None:
+            env["PYTHONPATH"] = existing
+        out = subprocess.run(["/bin/sh", "-c", cmd], env=env, capture_output=True,
+                             text=True, check=True).stdout
         parent = str(sess.Path(sess.__file__).resolve().parent.parent)
-        assert cmd.startswith("sleep 5; env ")
-        assert shlex.split(cmd.split("; ", 1)[1])[:3] == ["env", f"PYTHONPATH={parent}",
-                                                         "/usr/bin/python3"]
+        assert out == parent + expected_suffix
+
+    def test_self_escapes_tmux_formats_in_the_command(self, host):
+        # run-shell expands formats: "#S" would become the session name and
+        # "#(cmd)" would run cmd. Every "#" must reach the shell unchanged.
+        host.add_shell_pane("me:0.0", 101, [CLAUDE], "s1")
+        nudge = "issue #S #{session_name} #(touch /tmp/pwned) ##x"
+        r = _invoke(host, ["--self", "--nudge", nudge], env={"TMUX_PANE": "%0"})
+        assert r.exit_code == 0, r.output
+        (call,) = [c for c in host.calls if c[0] == "run-shell"]
+        assert re.sub("##", "", call[2]).count("#") == 0
+        assert shlex.quote(nudge) in call[2].replace("##", "#")
 
     def test_self_outside_tmux_is_usage_error(self, host):
         assert _invoke(host, ["--self"], env={"TMUX_PANE": ""}).exit_code == 2

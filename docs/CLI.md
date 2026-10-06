@@ -424,7 +424,7 @@ claude-mux session restart --all --match '^agent-'     # one at a time
 | `--no-nudge` | Send no message after resume |
 | `--force` | Do not wait for idle; send Escape first. Open dialogs are still refused |
 | `--timeout SEC` | Seconds to wait for each step (default 300) |
-| `--self` | Restart the calling session's pane via a detached helper (`tmux run-shell -b`). Not with `--container` |
+| `--self` | Restart the calling session's pane via a detached helper (`tmux run-shell -b`; `#` is escaped so tmux formats in `--nudge` are not expanded). The helper runs the caller's claude_mux, prepended to `PYTHONPATH`. Not with `--container` |
 | `--delay SEC` | With `--self`: seconds before the helper starts (default 5) |
 | `--all` | Restart every session, one at a time. The caller's own pane is skipped |
 | `--match REGEX` | With `--all`: only sessions whose target, name or cwd matches |

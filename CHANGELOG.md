@@ -24,6 +24,9 @@ Format: [Semantic Versioning](https://semver.org/). Dates in ISO 8601.
   (`--plan-mode-required`, `--init`, `-d2e`, …), variadic (`--channels`) and optional-value
   (`--rc`, `--remote`, `--project`) options. Unknown options never consume an argument that
   starts with `-`, and are reported as warnings.
+- `session restart --self`: every `#` in the helper command is escaped for `tmux run-shell`,
+  which expands formats (`#S`, `#{...}`) and runs `#(...)` — a `--nudge` containing them was
+  altered or executed. The helper now prepends the package to `PYTHONPATH` instead of replacing it.
 
 ---
 
