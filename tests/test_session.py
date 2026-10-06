@@ -43,6 +43,31 @@ STOP_TASKS_DIALOG = (
     "  2. Cancel\n"
     "Enter to select\n"
 )
+# Exit dialogs as rendered by Claude Code 2.1.x (captured from a live pane).
+RULE = "▔" * 60 + "\n"
+REAL_KEEP_DIALOG = (
+    "● PONG\n" + RULE
+    + "   Exiting worktree session\n"
+    "   You have 1 uncommitted file. These will be lost if you remove the worktree.\n"
+    "   ❯ 1. Keep worktree    Stays at /work/.claude/worktrees/wt\n"
+    "     2. Remove worktree  All changes and commits will be lost.\n"
+    "   Enter to confirm · Esc to cancel\n"
+)
+REAL_STOP_TASKS_DIALOG = (
+    RULE + "   Background work is running\n"
+    "   The following will stop when you exit:\n"
+    "   shell · sleep 600\n"
+    "   ❯ 1. Exit and stop tasks\n"
+    "     2. Move to background and exit\n"
+    "     3. Stay\n"
+    "   Enter to confirm · Esc to cancel\n"
+)
+REAL_TRUST_DIALOG = (
+    "─" * 60 + "\n Accessing workspace:\n /work\n"
+    " Quick safety check: Is this a project you created or one you trust?\n"
+    " ❯ No, exit\n   Yes, I trust this folder\n"
+    " Enter to confirm · Esc to cancel\n"
+)
 UNKNOWN_DIALOG = "Do you trust this folder?\n❯ 1. Yes\n  2. No\nEnter to select\n"
 
 
@@ -404,6 +429,41 @@ class TestRestartTraps:
         r = restarter(host).restart("a:0.0", nudge=None)
         assert r.status == "FAILED" and "unknown dialog" in r.message
         assert host.answers == []
+
+    @pytest.mark.parametrize("screen", [REAL_KEEP_DIALOG, REAL_STOP_TASKS_DIALOG,
+                                        REAL_TRUST_DIALOG])
+    def test_refuses_real_enter_to_confirm_dialogs(self, host, screen):
+        # Enter in an open dialog confirms the highlighted option (possibly
+        # "Remove worktree"), so nothing may be typed into such a pane.
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid", screen=screen)
+        assert sess.list_sessions(host)[0].state == "dialog"
+        r = restarter(host).restart("a:0.0", nudge=None, force=True)
+        assert r.status == "SKIPPED"
+        assert host.sends("a:0.0") == []
+
+    def test_real_keep_worktree_dialog_answers_keep(self, host):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid")
+        host.dialogs["a:0.0"] = [REAL_KEEP_DIALOG]
+        r = restarter(host).restart("a:0.0", nudge=None)
+        assert r.status == "OK", r.message
+        assert host.answers == [("a:0.0", "1")]
+
+    def test_real_stop_tasks_dialog_answers_1(self, host):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid")
+        host.dialogs["a:0.0"] = [REAL_STOP_TASKS_DIALOG]
+        r = restarter(host).restart("a:0.0", nudge=None)
+        assert r.status == "OK", r.message
+        assert host.answers == [("a:0.0", "1")]
+
+    def test_transcript_above_dialog_does_not_pick_the_answer(self):
+        # A numbered list mentioning "keep" and "worktree" in the transcript
+        # must not be mistaken for the options of the dialog below it.
+        screen = ("● Options:\n  2. Keep using the worktree\n" + REAL_STOP_TASKS_DIALOG)
+        assert sess.choose_dialog_answer(screen) == 1
+
+    def test_trust_dialog_is_never_answered(self):
+        with pytest.raises(sess.SessionError, match="unknown dialog"):
+            sess.choose_dialog_answer(REAL_TRUST_DIALOG)
 
     def test_text_and_enter_sent_in_separate_calls(self, host):
         host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid")

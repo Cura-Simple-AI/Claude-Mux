@@ -56,7 +56,10 @@ _SESSION_FLAGS = {
     "--fork-session": False, "--continue": False, "-c": False,
 }
 
-DIALOG_MARKER = "Enter to select"
+#: Footer of a selection dialog. Claude Code uses both wordings (the exit
+#: dialogs and the trust dialog say "Enter to confirm").
+DIALOG_RE = re.compile(r"Enter to (?:select|confirm)")
+_RULE_RE = re.compile(r"^\s*[─━═▔▁-]{10,}\s*$")
 _WORKING_RE = re.compile(r"esc to interrupt", re.IGNORECASE)
 _STATUS_LINE_RE = re.compile(r"ctx \d+%|⏵⏵|\? for shortcuts|bypass permissions")
 _CTX_RE = re.compile(r"ctx (\d+)%")
@@ -272,9 +275,27 @@ def _flag_value(args: list[str], flag: str) -> str | None:
 DIALOG_BOTTOM_LINES = 12
 
 
-def has_dialog(screen: str) -> bool:
+def _bottom_lines(screen: str) -> list[str]:
     lines = [line for line in screen.splitlines() if line.strip()]
-    return any(DIALOG_MARKER in line for line in lines[-DIALOG_BOTTOM_LINES:])
+    return lines[-DIALOG_BOTTOM_LINES:]
+
+
+def has_dialog(screen: str) -> bool:
+    return any(DIALOG_RE.search(line) for line in _bottom_lines(screen))
+
+
+def dialog_region(screen: str) -> str:
+    """The dialog itself: the bottom lines, cut at the last horizontal rule.
+
+    The transcript above a dialog can contain numbered lists and words like
+    "worktree"; those must never influence which answer is chosen.
+    """
+    lines = _bottom_lines(screen)
+    for i in range(len(lines) - 1, -1, -1):
+        if _RULE_RE.match(lines[i]):
+            lines = lines[i + 1:]
+            break
+    return "\n".join(lines)
 
 
 def pane_state(screen: str, registry_status: str | None) -> str:
@@ -442,8 +463,9 @@ def choose_dialog_answer(screen: str) -> int:
     - "Exit and stop tasks": option 1.
     Unknown dialogs are never answered.
     """
-    opts = parse_options(screen)
-    lower = screen.lower()
+    region = dialog_region(screen)
+    opts = parse_options(region)
+    lower = region.lower()
     if "worktree" in lower:
         keep = [n for n, label in sorted(opts.items())
                 if "keep" in label.lower() and "remove" not in label.lower()]
@@ -606,7 +628,7 @@ class Restarter:
                 result.warnings.append(warning)
             if info.state == "dialog":
                 # Pasting into a dialog would select an answer. Never do that.
-                result.status, result.message = "SKIPPED", "dialog open (Enter to select)"
+                result.status, result.message = "SKIPPED", "dialog open (Enter to select/confirm)"
                 return result
             if force:
                 self.tmux.send_keys(info.target, "Escape")
@@ -628,7 +650,7 @@ class Restarter:
             result.status = "OK"
             result.message = f"pid {result.old_pid} -> {result.new_pid}, session {info.session_id}"
         except _DialogVisible:
-            result.status, result.message = "SKIPPED", "dialog open (Enter to select)"
+            result.status, result.message = "SKIPPED", "dialog open (Enter to select/confirm)"
         except SessionError as exc:
             result.status, result.message = "FAILED", str(exc)
             self._restore_pane(info)

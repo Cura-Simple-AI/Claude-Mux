@@ -390,7 +390,7 @@ the session id, name, cwd, original command line, model, context % and state:
 |---|---|
 | `idle` | waiting for input |
 | `working` | a turn is running (registry status `busy` or "esc to interrupt" on screen) |
-| `dialog` | a selection dialog is open ("Enter to select" at the bottom of the pane) |
+| `dialog` | a dialog is open ("Enter to select" or "Enter to confirm" at the bottom of the pane) |
 
 Panes running `claude attach <job>` (background sessions) are marked with `*`; the pid shown is
 the background process.
@@ -427,7 +427,7 @@ claude-mux session restart --all --match '^agent-'     # one at a time
 **Sequence and safety rules:**
 
 1. **Refuse if a dialog is open.** Text typed into a selection dialog picks an answer, so a pane
-   showing "Enter to select" is reported as `SKIPPED` — even with `--force`.
+   showing "Enter to select" or "Enter to confirm" is reported as `SKIPPED` — even with `--force`.
 2. **Wait until idle** (unless `--force`, which sends Escape first).
 3. **Exit.** `/exit` is typed, then Enter is sent in a *separate* `send-keys` call. Exit dialogs:
    - worktree dialog → the option labelled **Keep**. An option labelled Remove is never chosen;

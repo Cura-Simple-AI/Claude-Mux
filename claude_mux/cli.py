@@ -1299,7 +1299,7 @@ def cmd_session_restart(ctx, target, self_, all_, match, model, profile, nudge, 
 
     \b
     Safety rules:
-      - Refuses when a dialog ("Enter to select") is open in the pane.
+      - Refuses when a dialog ("Enter to select/confirm") is open in the pane.
       - Waits until the session is idle unless --force.
       - Exit dialogs: "Keep worktree" is always answered Keep (never Remove);
         "Exit and stop tasks" is answered with option 1.
