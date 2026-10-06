@@ -1,0 +1,536 @@
+"""Tests for `cm session` (list / restart) against a fake tmux.
+
+No real tmux server, process or session registry is touched: every external
+operation goes through FakeHost.
+"""
+import json
+import shlex
+from unittest.mock import MagicMock, patch
+
+import pytest
+from click.testing import CliRunner
+
+from claude_mux import session as sess
+from claude_mux.cli import cli
+
+HOME = "/home/user"
+REG = f"{HOME}/.claude/sessions"
+CLAUDE = "/usr/bin/claude"
+STATUS = "─" * 40 + "\n❯ \n" + "─" * 40 + "\n  main · Opus 5.5 ctx 17% · 5h 10%\n  ⏵⏵ bypass permissions on\n"
+WORKING = "* Brewing… (esc to interrupt)\n" + STATUS
+
+KEEP_DIALOG = (
+    "This session ran in a worktree.\n"
+    "❯ 1. Keep worktree\n"
+    "  2. Remove worktree\n"
+    "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+)
+KEEP_SECOND_DIALOG = (
+    "This session ran in a worktree.\n"
+    "❯ 1. Remove worktree and branch\n"
+    "  2. Keep worktree\n"
+    "Enter to select · Esc to cancel\n"
+)
+REMOVE_ONLY_DIALOG = (
+    "Worktree has changes.\n"
+    "❯ 1. Remove worktree\n"
+    "  2. Cancel\n"
+    "Enter to select\n"
+)
+STOP_TASKS_DIALOG = (
+    "Background tasks are still running.\n"
+    "❯ 1. Exit and stop tasks\n"
+    "  2. Cancel\n"
+    "Enter to select\n"
+)
+UNKNOWN_DIALOG = "Do you trust this folder?\n❯ 1. Yes\n  2. No\nEnter to select\n"
+
+
+class FakeHost:
+    """In-memory tmux + /proc + session registry."""
+
+    def __init__(self):
+        self.files: dict[str, str] = {}
+        self.panes: dict[str, dict] = {}
+        self.calls: list[list[str]] = []
+        self.killed: list[int] = []
+        self.t = 0.0
+        self.next_pid = 5000
+        self.typed: dict[str, str] = {}
+        # behaviour knobs per pane
+        self.dialogs: dict[str, list[str]] = {}
+        self.answers: list[tuple[str, str]] = []
+        self.resume_session_override: str | None = None
+        self.busy_polls: dict[str, int] = {}
+
+    # -- setup helpers -----------------------------------------------------
+    def add_proc(self, pid, argv, children=()):
+        self.files[f"/proc/{pid}/cmdline"] = "\0".join(argv) + "\0"
+        self.files[f"/proc/{pid}/task/{pid}/children"] = " ".join(map(str, children))
+
+    def remove_proc(self, pid):
+        self.files.pop(f"/proc/{pid}/cmdline", None)
+        self.files.pop(f"/proc/{pid}/task/{pid}/children", None)
+        self.files.pop(f"{REG}/{pid}.json", None)
+
+    def register(self, pid, session_id, **extra):
+        data = {"pid": pid, "sessionId": session_id, "cwd": "/work", "name": f"s-{pid}",
+                "kind": "interactive", "status": "idle", **extra}
+        self.files[f"{REG}/{pid}.json"] = json.dumps(data)
+        self.files[f"{REG}/{pid}.0123abcd.key"] = "secret"
+
+    def add_shell_pane(self, target, claude_pid, argv, session_id, screen=STATUS, **reg):
+        shell = claude_pid - 1
+        self.add_proc(shell, ["-bash"], children=[claude_pid])
+        self.add_proc(claude_pid, argv)
+        self.register(claude_pid, session_id, **reg)
+        self.panes[target] = {"target": target, "pane_id": f"%{len(self.panes)}",
+                              "pane_pid": shell, "command": "claude", "path": "/work",
+                              "dead": False, "screen": screen, "mode": "shell",
+                              "claude": claude_pid, "remain": False}
+
+    def add_direct_pane(self, target, claude_pid, argv, session_id, screen=STATUS, **reg):
+        self.add_proc(claude_pid, argv)
+        self.register(claude_pid, session_id, **reg)
+        self.panes[target] = {"target": target, "pane_id": f"%{len(self.panes)}",
+                              "pane_pid": claude_pid, "command": "claude", "path": "/work",
+                              "dead": False, "screen": screen, "mode": "direct",
+                              "claude": claude_pid, "remain": False}
+
+    def add_attach_pane(self, target, attach_pid, bg_pid, session_id):
+        self.add_proc(attach_pid, [CLAUDE, "attach", session_id[:8]])
+        self.add_proc(bg_pid, ["claude", "bg-spare", "--bg-spare", "/tmp/x.sock"])
+        self.register(bg_pid, session_id, kind="bg", jobId=session_id[:8])
+        self.panes[target] = {"target": target, "pane_id": f"%{len(self.panes)}",
+                              "pane_pid": attach_pid, "command": "claude", "path": "/work",
+                              "dead": False, "screen": STATUS, "mode": "direct",
+                              "claude": attach_pid, "remain": False, "bg": bg_pid}
+
+    # -- Host API ----------------------------------------------------------
+    def read_text(self, path):
+        return self.files.get(path)
+
+    def listdir(self, path):
+        prefix = path.rstrip("/") + "/"
+        return sorted({p[len(prefix):].split("/")[0] for p in self.files if p.startswith(prefix)})
+
+    def kill(self, pid, sig=15):
+        self.killed.append(pid)
+        self.remove_proc(pid)
+        for pane in self.panes.values():
+            if pane.get("bg") == pid:
+                pane["screen"] = "Conversation moved to background.\n  Sessions overview\n"
+        return True
+
+    def home(self):
+        return HOME
+
+    def sleep(self, seconds):
+        self.t += seconds
+        for target, n in list(self.busy_polls.items()):
+            if n > 0:
+                self.busy_polls[target] = n - 1
+                if n == 1:
+                    self.panes[target]["screen"] = STATUS
+
+    def now(self):
+        return self.t
+
+    def run(self, argv):
+        assert argv[0] == "tmux", argv
+        self.calls.append(argv[1:])
+        cmd, args = argv[1], argv[2:]
+        if cmd == "list-panes":
+            return 0, "\n".join(self._fmt(p) for p in self.panes.values()) + "\n"
+        target = args[args.index("-t") + 1] if "-t" in args else None
+        pane = self.panes.get(target)
+        if cmd == "run-shell":
+            return 0, ""
+        if pane is None:
+            return 1, ""
+        if cmd == "display-message":
+            return 0, self._fmt(pane) + "\n"
+        if cmd == "capture-pane":
+            return 0, pane["screen"]
+        if cmd == "send-keys":
+            self._send(pane, args[args.index("-t") + 2:])
+            return 0, ""
+        if cmd == "set-option":
+            pane["remain"] = "-u" not in args
+            return 0, ""
+        if cmd == "respawn-pane":
+            assert pane["dead"], "respawn on a live pane"
+            self._launch(pane, shlex.split(args[-1]), args[args.index("-c") + 1])
+            pane["pane_pid"] = pane["claude"]
+            pane["dead"] = False
+            return 0, ""
+        return 1, ""
+
+    # -- simulation --------------------------------------------------------
+    @staticmethod
+    def _fmt(p):
+        return "\t".join([p["target"], p["pane_id"], str(p["pane_pid"]), p["command"],
+                          p["path"], "1" if p["dead"] else "0"])
+
+    def _exit_claude(self, pane):
+        self.remove_proc(pane["claude"])
+        if pane["mode"] == "shell":
+            self.files[f"/proc/{pane['pane_pid']}/task/{pane['pane_pid']}/children"] = ""
+            pane["command"], pane["screen"] = "bash", "user@host:/work$ "
+        else:
+            assert pane["remain"], "pane would have closed: remain-on-exit not set"
+            pane["dead"], pane["screen"] = True, "Pane is dead\n"
+
+    def _launch(self, pane, argv, cwd):
+        self.next_pid += 1
+        pid = self.next_pid
+        self.add_proc(pid, argv)
+        sid = self.resume_session_override or argv[argv.index("--resume") + 1]
+        self.register(pid, sid, cwd=cwd)
+        pane.update(claude=pid, command="claude", screen=STATUS, launched=argv)
+        if pane["mode"] == "shell":
+            self.files[f"/proc/{pane['pane_pid']}/task/{pane['pane_pid']}/children"] = str(pid)
+
+    def _send(self, pane, keys):
+        t = pane["target"]
+        if keys[0] == "-l":
+            self.typed[t] = self.typed.get(t, "") + keys[1]
+            text = keys[1]
+            if sess.has_dialog(pane["screen"]) and text.isdigit():
+                self.answers.append((t, text))
+                queue = self.dialogs.get(t, [])
+                if queue:
+                    queue.pop(0)
+                self.typed[t] = ""
+                if queue:
+                    pane["screen"] = queue[0]
+                else:
+                    self._exit_claude(pane)
+            return
+        if keys == ["Enter"]:
+            text, self.typed[t] = self.typed.get(t, ""), ""
+            if text == "/exit":
+                queue = self.dialogs.get(t, [])
+                if queue:
+                    pane["screen"] = queue[0]
+                else:
+                    self._exit_claude(pane)
+            elif pane["mode"] == "shell" and pane["command"] == "bash" and text:
+                self._launch(pane, shlex.split(text), pane["path"])
+            elif text:
+                pane.setdefault("received", []).append(text)
+            return
+        if keys == ["C-c", "C-c"] and pane.get("bg") and not self.files.get(
+                f"/proc/{pane['bg']}/cmdline"):
+            self._exit_claude(pane)
+
+    def sends(self, target):
+        return [c for c in self.calls if c[0] == "send-keys" and target in c]
+
+
+@pytest.fixture()
+def host():
+    return FakeHost()
+
+
+def restarter(host, **kw):
+    return sess.Restarter(host, timeout=kw.pop("timeout", 60), poll=1, **kw)
+
+
+AGENT_ARGV = [CLAUDE, "--agent", "dev", "--worktree", "wt-dev", "--permission-mode",
+              "bypassPermissions", "--model", "claude-opus-5-5", "--resume", "old-id",
+              "--fork-session"]
+
+
+# ---------------------------------------------------------------------------
+# Discovery / list
+# ---------------------------------------------------------------------------
+
+class TestList:
+    def test_maps_pane_to_pid_and_registry(self, host):
+        host.add_shell_pane("a:0.0", 101, AGENT_ARGV, "sid-a")
+        (s,) = sess.list_sessions(host)
+        assert (s.target, s.claude_pid, s.session_id, s.mode) == ("a:0.0", 101, "sid-a", "shell")
+        assert s.cwd == "/work" and s.name == "s-101"
+        assert s.model == "claude-opus-5-5" and s.context_pct == 17 and s.state == "idle"
+
+    def test_ignores_key_files_in_registry(self, host):
+        host.add_shell_pane("a:0.0", 101, AGENT_ARGV, "sid-a")
+        reg = sess.load_registry(host)
+        assert list(reg) == [101]
+
+    def test_states(self, host):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "s1", screen=WORKING)
+        host.add_shell_pane("b:0.0", 201, [CLAUDE], "s2", screen=KEEP_DIALOG)
+        host.add_shell_pane("c:0.0", 301, [CLAUDE], "s3", status="busy")
+        states = {s.target: s.state for s in sess.list_sessions(host)}
+        assert states == {"a:0.0": "working", "b:0.0": "dialog", "c:0.0": "working"}
+
+    def test_dialog_text_in_transcript_is_not_a_dialog(self, host):
+        screen = "agent said: «Enter to select» was in my grep\n" + "line\n" * 20 + STATUS
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "s1", screen=screen)
+        assert sess.list_sessions(host)[0].state == "idle"
+
+    def test_attached_background_session(self, host):
+        host.add_attach_pane("bg:0.0", 400, 401, "cbf58c04-aaaa")
+        (s,) = sess.list_sessions(host)
+        assert s.attached and s.session_pid == 401 and s.session_id == "cbf58c04-aaaa"
+
+    def test_cli_list_json(self, host):
+        host.add_shell_pane("a:0.0", 101, AGENT_ARGV, "sid-a")
+        with patch("claude_mux.cli._session_host", return_value=host):
+            r = CliRunner().invoke(cli, ["session", "list", "--json"])
+        assert r.exit_code == 0, r.output
+        assert json.loads(r.output)[0]["session_id"] == "sid-a"
+
+    def test_cli_list_is_read_only(self, host):
+        host.add_shell_pane("a:0.0", 101, AGENT_ARGV, "sid-a")
+        with patch("claude_mux.cli._session_host", return_value=host):
+            r = CliRunner().invoke(cli, ["session", "list"])
+        assert r.exit_code == 0 and "sid-a" in r.output
+        assert not [c for c in host.calls if c[0] not in ("list-panes", "capture-pane")]
+
+
+# ---------------------------------------------------------------------------
+# Model aliases and argv
+# ---------------------------------------------------------------------------
+
+class TestArgvAndModel:
+    def test_relaunch_argv_keeps_flags_and_resumes(self):
+        argv = sess.build_relaunch_argv(AGENT_ARGV, "sid")
+        assert argv == [CLAUDE, "--agent", "dev", "--worktree", "wt-dev", "--permission-mode",
+                        "bypassPermissions", "--model", "claude-opus-5-5", "--resume", "sid"]
+
+    def test_relaunch_argv_drops_session_id_flag_and_replaces_model(self):
+        argv = sess.build_relaunch_argv([CLAUDE, "--session-id", "x", "--model=opus", "-c"],
+                                        "sid", "claude-sonnet-5-5")
+        assert argv == [CLAUDE, "--model", "claude-sonnet-5-5", "--resume", "sid"]
+
+    def test_short_alias_expanded_to_full_id(self):
+        assert sess.resolve_model("opus") == ("claude-opus-5-5", None)
+        assert sess.resolve_model("Sonnet")[0] == "claude-sonnet-5-5"
+        assert sess.resolve_model("haiku")[0] == "claude-haiku-4-5-20251001"
+
+    def test_alias_table_is_configurable(self):
+        assert sess.resolve_model("opus", {"opus": "claude-opus-9"})[0] == "claude-opus-9"
+
+    def test_unknown_short_alias_warns(self):
+        model, warning = sess.resolve_model("opusplan")
+        assert model == "opusplan" and "not a full model id" in warning
+
+    def test_restart_expands_alias_from_original_argv(self, host):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE, "--model", "opus"], "sid")
+        r = restarter(host).restart("a:0.0", nudge=None)
+        assert r.status == "OK", r.message
+        assert host.panes["a:0.0"]["launched"] == [CLAUDE, "--model", "claude-opus-5-5",
+                                                    "--resume", "sid"]
+
+    def test_cli_alias_from_config(self, host, tmp_path):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid")
+        with patch("claude_mux.cli._session_host", return_value=host), \
+                patch("claude_mux.cli._session_aliases", return_value={"opus": "claude-opus-x"}):
+            r = CliRunner().invoke(cli, ["session", "restart", "a:0.0", "--model", "opus",
+                                         "--no-nudge", "--timeout", "30"])
+        assert r.exit_code == 0, r.output
+        assert host.panes["a:0.0"]["launched"][-3:] == ["claude-opus-x", "--resume", "sid"]
+
+
+# ---------------------------------------------------------------------------
+# Restart traps
+# ---------------------------------------------------------------------------
+
+class TestRestartTraps:
+    def test_refuses_when_dialog_visible(self, host):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid", screen=KEEP_DIALOG)
+        r = restarter(host).restart("a:0.0")
+        assert r.status == "SKIPPED" and "dialog" in r.message
+        assert host.sends("a:0.0") == []
+
+    def test_refuses_dialog_even_with_force(self, host):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid", screen=UNKNOWN_DIALOG)
+        r = restarter(host).restart("a:0.0", force=True)
+        assert r.status == "SKIPPED" and host.sends("a:0.0") == []
+
+    def test_waits_until_idle(self, host):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid", screen=WORKING)
+        host.busy_polls["a:0.0"] = 3
+        r = restarter(host).restart("a:0.0", nudge=None)
+        assert r.status == "OK", r.message
+        assert host.t >= 3
+
+    def test_working_session_times_out_without_force(self, host):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid", screen=WORKING)
+        r = restarter(host, timeout=5).restart("a:0.0")
+        assert r.status == "FAILED" and "idle" in r.message
+        assert host.sends("a:0.0") == []
+
+    def test_force_sends_escape_first(self, host):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid", screen=WORKING)
+        r = restarter(host).restart("a:0.0", force=True, nudge=None)
+        assert r.status == "OK", r.message
+        assert host.sends("a:0.0")[0] == ["send-keys", "-t", "a:0.0", "Escape"]
+
+    def test_keep_worktree_dialog_answers_keep(self, host):
+        host.add_shell_pane("a:0.0", 101, AGENT_ARGV, "sid")
+        host.dialogs["a:0.0"] = [KEEP_DIALOG]
+        r = restarter(host).restart("a:0.0", nudge=None)
+        assert r.status == "OK", r.message
+        assert host.answers == [("a:0.0", "1")]
+
+    def test_keep_worktree_picks_keep_when_it_is_not_option_1(self, host):
+        host.add_shell_pane("a:0.0", 101, AGENT_ARGV, "sid")
+        host.dialogs["a:0.0"] = [KEEP_SECOND_DIALOG]
+        r = restarter(host).restart("a:0.0", nudge=None)
+        assert r.status == "OK", r.message
+        assert host.answers == [("a:0.0", "2")]
+
+    def test_never_answers_remove_worktree(self, host):
+        host.add_shell_pane("a:0.0", 101, AGENT_ARGV, "sid")
+        host.dialogs["a:0.0"] = [REMOVE_ONLY_DIALOG]
+        r = restarter(host).restart("a:0.0", nudge=None)
+        assert r.status == "FAILED" and "Keep" in r.message
+        assert host.answers == []
+
+    def test_exit_and_stop_tasks_dialog_answers_1(self, host):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid")
+        host.dialogs["a:0.0"] = [STOP_TASKS_DIALOG, KEEP_DIALOG]
+        r = restarter(host).restart("a:0.0", nudge=None)
+        assert r.status == "OK", r.message
+        assert host.answers == [("a:0.0", "1"), ("a:0.0", "1")]
+
+    def test_unknown_dialog_is_never_answered(self, host):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid")
+        host.dialogs["a:0.0"] = [UNKNOWN_DIALOG]
+        r = restarter(host).restart("a:0.0", nudge=None)
+        assert r.status == "FAILED" and "unknown dialog" in r.message
+        assert host.answers == []
+
+    def test_text_and_enter_sent_in_separate_calls(self, host):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid")
+        r = restarter(host).restart("a:0.0", nudge="hello agent")
+        assert r.status == "OK", r.message
+        for call in host.sends("a:0.0"):
+            assert not ("-l" in call and "Enter" in call), call
+        literal = [c[-1] for c in host.sends("a:0.0") if "-l" in c]
+        assert literal[0] == "/exit" and literal[-1] == "hello agent"
+        assert host.panes["a:0.0"]["received"] == ["hello agent"]
+
+    def test_default_nudge_asks_to_recreate_loops(self, host):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid")
+        r = restarter(host).restart("a:0.0")
+        assert r.status == "OK", r.message
+        (msg,) = host.panes["a:0.0"]["received"]
+        assert msg == sess.DEFAULT_NUDGE and "scheduled loops" in msg
+
+    def test_background_session_sigterm_and_double_ctrl_c_in_one_call(self, host):
+        host.add_attach_pane("bg:0.0", 400, 401, "cbf58c04-aaaa")
+        r = restarter(host).restart("bg:0.0", nudge=None)
+        assert r.status == "OK", r.message
+        assert host.killed == [401]
+        assert ["send-keys", "-t", "bg:0.0", "C-c", "C-c"] in host.calls
+        assert host.panes["bg:0.0"]["launched"] == [CLAUDE, "--resume", "cbf58c04-aaaa"]
+
+    def test_direct_pane_uses_remain_on_exit_and_respawn(self, host):
+        host.add_direct_pane("d:0.0", 700, AGENT_ARGV, "sid-d")
+        r = restarter(host).restart("d:0.0", nudge=None)
+        assert r.status == "OK", r.message
+        pane = host.panes["d:0.0"]
+        assert pane["remain"] is False  # restored after respawn
+        assert any(c[0] == "respawn-pane" for c in host.calls)
+        # relaunched inside the worktree dir, so --worktree is dropped
+        assert "--worktree" not in pane["launched"]
+
+    def test_relaunch_uses_original_argv_and_resume(self, host):
+        host.add_shell_pane("a:0.0", 101, AGENT_ARGV, "sid-a")
+        r = restarter(host).restart("a:0.0", nudge=None)
+        assert r.status == "OK", r.message
+        assert host.panes["a:0.0"]["launched"] == sess.build_relaunch_argv(AGENT_ARGV, "sid-a")
+        assert r.old_pid == 101 and r.new_pid not in (None, 101)
+
+    def test_verify_fails_when_session_id_differs(self, host):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid")
+        host.resume_session_override = "another-session"
+        r = restarter(host, timeout=5).restart("a:0.0", nudge=None)
+        assert r.status == "FAILED" and "resumed session" in r.message
+
+    def test_unregistered_session_is_refused(self, host):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid")
+        host.files.pop(f"{REG}/101.json")
+        r = restarter(host).restart("a:0.0")
+        assert r.status == "FAILED" and "registry" in r.message
+        assert host.sends("a:0.0") == []
+
+
+# ---------------------------------------------------------------------------
+# CLI: --all, --self, --profile, usage
+# ---------------------------------------------------------------------------
+
+def _invoke(host, args, env=None):
+    with patch("claude_mux.cli._session_host", return_value=host):
+        return CliRunner().invoke(cli, ["session", "restart", *args], env=env or {})
+
+
+class TestRestartCli:
+    def test_requires_exactly_one_mode(self, host):
+        assert _invoke(host, []).exit_code == 2
+        assert _invoke(host, ["a:0.0", "--all"]).exit_code == 2
+
+    def test_all_reports_one_line_per_session(self, host):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "s1")
+        host.add_shell_pane("b:0.0", 201, [CLAUDE], "s2", screen=KEEP_DIALOG)
+        host.add_shell_pane("c:0.0", 301, [CLAUDE], "s3")
+        host.dialogs["c:0.0"] = [UNKNOWN_DIALOG]
+        r = _invoke(host, ["--all", "--no-nudge", "--timeout", "20"])
+        lines = [line.split()[:2] for line in r.output.splitlines() if line.strip()]
+        assert lines == [["OK", "a:0.0"], ["SKIPPED", "b:0.0"], ["FAILED", "c:0.0"]]
+        assert r.exit_code == 1
+
+    def test_all_with_match(self, host):
+        host.add_shell_pane("agent-1:0.0", 101, [CLAUDE], "s1")
+        host.add_shell_pane("other:0.0", 201, [CLAUDE], "s2")
+        r = _invoke(host, ["--all", "--match", "^agent-", "--no-nudge"])
+        assert r.exit_code == 0, r.output
+        assert "agent-1:0.0" in r.output and "other:0.0" not in r.output
+        assert host.sends("other:0.0") == []
+
+    def test_all_skips_own_pane(self, host):
+        host.add_shell_pane("me:0.0", 101, [CLAUDE], "s1")
+        own = host.panes["me:0.0"]["pane_id"]
+        r = _invoke(host, ["--all", "--no-nudge"], env={"TMUX_PANE": own})
+        assert "SKIPPED" in r.output and "--self" in r.output
+        assert host.sends("me:0.0") == []
+
+    def test_self_spawns_detached_helper(self, host):
+        host.add_shell_pane("me:0.0", 101, [CLAUDE], "s1")
+        r = _invoke(host, ["--self", "--model", "opus", "--delay", "3"], env={"TMUX_PANE": "%0"})
+        assert r.exit_code == 0, r.output
+        (call,) = [c for c in host.calls if c[0] == "run-shell"]
+        assert call[1] == "-b"
+        assert call[2].startswith("sleep 3; ")
+        assert "session restart %0 --model opus" in call[2]
+        assert host.sends("%0") == [] and host.sends("me:0.0") == []
+
+    def test_self_outside_tmux_is_usage_error(self, host):
+        assert _invoke(host, ["--self"], env={"TMUX_PANE": ""}).exit_code == 2
+
+    def test_profile_activates_before_restart(self, host):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "s1")
+        order = []
+        sync = MagicMock()
+        with patch("claude_mux.cli._managers", return_value=(MagicMock(), sync, None, None)), \
+                patch("claude_mux.cli._find_sub", return_value={"id": "x", "name": "work"}):
+            sync.sync_default.side_effect = lambda _id: order.append(("activate", len(host.calls)))
+            r = _invoke(host, ["a:0.0", "--profile", "work", "--no-nudge"])
+        assert r.exit_code == 0, r.output
+        assert order == [("activate", 0)]
+
+    def test_dialog_exit_code(self, host):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "s1", screen=KEEP_DIALOG)
+        r = _invoke(host, ["a:0.0"])
+        assert r.exit_code == 4 and r.output.startswith("SKIPPED")
+
+    def test_help_lists_commands(self):
+        r = CliRunner().invoke(cli, ["session", "--help"])
+        assert r.exit_code == 0 and "list" in r.output and "restart" in r.output
+        r = CliRunner().invoke(cli, ["session", "restart", "--help"])
+        assert "--self" in r.output and "Keep worktree" in r.output

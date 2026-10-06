@@ -6,6 +6,15 @@ Format: [Semantic Versioning](https://semver.org/). Dates in ISO 8601.
 
 ---
 
+## [Unreleased]
+
+### Added
+- `session list` and `session restart` (single pane, `--self`, `--all`): safe exit and resume of
+  Claude Code sessions in tmux — refuses open dialogs, always keeps worktrees, expands short
+  model aliases, nudges the agent to recreate scheduled loops after resume.
+
+---
+
 ## [0.1.3] — 2026-04-25
 
 ### Bugfixes
