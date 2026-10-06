@@ -1,0 +1,1121 @@
+"""Safe listing, exit and resume of Claude Code sessions running in tmux.
+
+Everything that touches the outside world (tmux, /proc, the session registry,
+signals, sleeping) goes through a ``Host`` object so the logic can be tested
+against a fake tmux without touching real sessions.
+
+Pane modes:
+  "shell"  - the pane runs a shell and Claude Code is its child. After exit we
+             wait for the shell and type the relaunch command.
+  "direct" - Claude Code (or ``claude attach``) IS the pane process. The pane
+             would close on exit, so remain-on-exit is set first and the
+             session is relaunched with ``tmux respawn-pane``.
+
+Attached panes run ``claude attach <job>`` for a background session. Those are
+restarted with ``claude respawn <job>`` and the pane is re-attached if the
+attach client exited.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import shlex
+import signal
+import subprocess
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+#: Short model aliases may resolve to an older model under another profile,
+#: so they are expanded to full ids. Override or extend via
+#: ``session_model_aliases`` in the claude-mux config file.
+DEFAULT_MODEL_ALIASES = {
+    "opus": "claude-opus-5-5",
+    "sonnet": "claude-sonnet-5-5",
+    "haiku": "claude-haiku-4-5-20251001",
+}
+
+#: Session-scoped cron jobs do not survive a resume.
+DEFAULT_NUDGE = (
+    "Your session was restarted and resumed. Scheduled loops and cron jobs do "
+    "not survive a resume: please recreate any scheduled loops you had, then "
+    "continue where you left off."
+)
+
+SHELLS = {"bash", "zsh", "sh", "fish", "dash", "ksh", "-bash", "-zsh", "-sh", "-fish"}
+
+_FISH_SAFE_RE = re.compile(r"[\w@+=:,./-]+")
+
+
+def fish_quote(value: str) -> str:
+    """Quote for fish: inside single quotes, fish treats \\ and \' as escapes."""
+    if _FISH_SAFE_RE.fullmatch(value):
+        return value
+    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+#: Flags that tie a launch to a specific conversation; they are replaced by
+#: ``--resume <sessionId>`` on relaunch.
+_SESSION_FLAGS = {"--resume", "-r", "--session-id", "--fork-session", "--continue", "-c"}
+
+#: How Claude Code's options consume values. Needed to tell option values from
+#: the positional prompt, which must not be replayed on resume. Taken from
+#: ``claude --help`` plus the hidden options in the argument scanner of the
+#: Claude Code CLI itself (2.1.x). Hidden options matter: agent-team panes are
+#: launched with ``--agent-id``, ``--team-name``, ``--plan-mode-required`` etc.
+_BOOL_FLAGS = {
+    "-d2e", "--debug-to-stderr", "--verbose", "-p", "--print", "--bare", "--safe-mode",
+    "--init", "--init-only", "--maintenance", "--include-hook-events",
+    "--include-partial-messages", "--forward-subagent-text", "--session-mirror",
+    "--await-claim", "--await-initialize", "--dangerously-skip-permissions",
+    "--allow-dangerously-skip-permissions", "--replay-user-messages", "--enable-auth-status",
+    "--restricted", "--exclude-dynamic-system-prompt-sections", "-c", "--continue",
+    "--fork-session", "--deep-link-origin", "--no-session-persistence", "--reply-on-resume",
+    "--ide", "--desktop", "--strict-mcp-config", "--disable-slash-commands", "--chrome",
+    "--no-chrome", "--tmux", "--enable-auto-mode", "--bg", "--background", "--brief",
+    "--ax-screen-reader", "--plan-mode-required", "--hard-fail",
+    "--dangerously-allow-browser-network-access", "--local",
+    "-h", "--help", "-v", "-V", "--version",
+}
+#: Take the next argument only when it does not start with "-".
+_OPTIONAL_VALUE_FLAGS = {
+    "-d", "--debug", "-r", "--resume", "--from-pr", "-w", "--worktree", "--teleport",
+    "--cloud", "--remote", "--project", "--remote-control", "--rc", "--prompt-suggestions",
+}
+#: Take every following argument up to the next one that starts with "-".
+_VARIADIC_FLAGS = {
+    "--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools", "--tools",
+    "--add-dir", "--mcp-config", "--betas", "--file", "--channels",
+    "--dangerously-load-development-channels",
+}
+#: Always take exactly one value, even one that starts with "-".
+_VALUE_FLAGS = {
+    "--prefill", "--prefill-b64", "--deep-link-repo", "--deep-link-last-fetch",
+    "--deep-link-cwd-b64", "--handle-uri", "--settings", "--managed-settings",
+    "--setting-sources", "--client-data-url", "--watch-artifact",
+    "--watch-artifact-no-autoreact", "--team-name", "--agent-id", "--agent-name",
+    "--agent-color", "--parent-session-id", "--agent-type", "--model", "--agent", "--routine",
+    "--effort", "--permission-mode", "--inherit-permission-mode", "--proactivity",
+    "--debug-file", "--system-prompt", "--system-prompt-file", "--append-system-prompt",
+    "--append-system-prompt-file", "--system-prompt-snapshot",
+    "--append-subagent-system-prompt", "--append-subagent-system-prompt-file",
+    "--plan-mode-instructions", "--permission-prompt-tool", "--permission-prompts",
+    "--json-schema", "--fallback-model", "--advisor", "--agents", "--name", "-n",
+    "--plugin-dir", "--plugin-dir-no-mcp", "--plugin-url",
+    "--remote-control-session-name-prefix", "--sdk-url", "--exec", "-m", "--thinking",
+    "--thinking-display", "--max-thinking-tokens", "--max-turns", "--max-budget-usd",
+    "--task-budget", "--autocompact", "--rewind-files", "--resume-session-at",
+    "--resume-drops-turn", "--workload", "--output-format", "--input-format",
+    "--teammate-mode", "--messaging-socket-path", "--session-id", "--environment", "--pool",
+    "--ref", "--on-branch", "--correlation-id", "--forward-home-settings",
+    "--project-config-root", "--attach-serve",
+}
+_KNOWN_FLAGS = _BOOL_FLAGS | _OPTIONAL_VALUE_FLAGS | _VARIADIC_FLAGS | _VALUE_FLAGS
+
+#: Footer of a dialog. Exit and trust dialogs say "Enter to confirm", older
+#: selection lists "Enter to select"; permission prompts have no Enter hint
+#: at all ("Esc to cancel · Tab to amend").
+DIALOG_RE = re.compile(r"Enter to (?:select|confirm)|Esc to cancel|Do you want to proceed\?")
+_RULE_RE = re.compile(r"^\s*[─━═▔▁-]{10,}\s*$")
+_WORKING_RE = re.compile(r"esc to interrupt", re.IGNORECASE)
+_STATUS_LINE_RE = re.compile(
+    r"ctx \d+%|⏵⏵|⏸|\? for shortcuts|bypass permissions|(?:manual|plan) mode on|for agents")
+_CTX_RE = re.compile(r"ctx (\d+)%")
+_MODEL_RE = re.compile(r"\b((?:Opus|Sonnet|Haiku|Fable) \d+(?:\.\d+)?)\b")
+_OPTION_RE = re.compile(r"^\s*[❯>]?\s*(\d+)[.)]\s+(.*\S)\s*$")
+
+#: Field separator for tmux formats. Printable on purpose: tmux replaces
+#: control characters such as tab with "_" in some environments (seen with
+#: ``docker exec`` without a UTF-8 locale).
+_FMT_SEP = "|~|"
+_PANE_FMT = _FMT_SEP.join([
+    "#{session_name}:#{window_index}.#{pane_index}", "#{pane_id}", "#{pane_pid}",
+    "#{pane_current_command}", "#{pane_current_path}", "#{pane_dead}", "#{pane_in_mode}",
+])
+
+
+class SessionError(Exception):
+    """Raised when a restart step cannot be completed safely."""
+
+
+class _Skip(Exception):
+    """The pane is not in a state where typing is safe; nothing was typed."""
+
+
+DIALOG_OPEN = "dialog open (Enter to select/confirm)"
+
+
+# ---------------------------------------------------------------------------
+# Host abstraction
+# ---------------------------------------------------------------------------
+
+class LocalHost:
+    """Runs tmux and reads /proc on this machine."""
+
+    def run(self, argv: list[str]) -> tuple[int, str]:
+        try:
+            p = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return 127, str(exc)
+        return p.returncode, p.stdout
+
+    def read_text(self, path: str) -> str | None:
+        try:
+            return Path(path).read_text(errors="replace")
+        except OSError:
+            return None
+
+    def listdir(self, path: str) -> list[str]:
+        try:
+            return sorted(os.listdir(path))
+        except OSError:
+            return []
+
+    def kill(self, pid: int, sig: int = signal.SIGTERM) -> bool:
+        try:
+            os.kill(pid, sig)
+            return True
+        except OSError:
+            return False
+
+    def home(self) -> str:
+        return str(Path.home())
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
+
+    def now(self) -> float:
+        return time.monotonic()
+
+
+class DockerHost(LocalHost):
+    """Same operations, run inside a running container via ``docker exec``.
+
+    tmux servers are per user, so ``user`` must be the user that owns the
+    sessions when it differs from the container's default user.
+    """
+
+    def __init__(self, container: str, user: str | None = None):
+        self.container = container
+        self.user = user
+
+    def exec_argv(self, argv: list[str]) -> list[str]:
+        user = ["-u", self.user] if self.user else []
+        return ["docker", "exec", *user, self.container, *argv]
+
+    def _in_container(self, argv: list[str]) -> tuple[int, str]:
+        return LocalHost.run(self, self.exec_argv(argv))
+
+    def run(self, argv: list[str]) -> tuple[int, str]:
+        return self._in_container(argv)
+
+    def read_text(self, path: str) -> str | None:
+        rc, out = self._in_container(["cat", path])
+        return out if rc == 0 else None
+
+    def listdir(self, path: str) -> list[str]:
+        rc, out = self._in_container(["ls", "-1", path])
+        return sorted(out.split()) if rc == 0 else []
+
+    def kill(self, pid: int, sig: int = signal.SIGTERM) -> bool:
+        return self._in_container(["kill", f"-{int(sig)}", str(pid)])[0] == 0
+
+    def home(self) -> str:
+        rc, out = self._in_container(["sh", "-c", "echo $HOME"])
+        return out.strip() if rc == 0 and out.strip() else "/root"
+
+
+def make_host(container: str | None = None, user: str | None = None) -> LocalHost:
+    return DockerHost(container, user) if container else LocalHost()
+
+
+# ---------------------------------------------------------------------------
+# Tmux wrapper
+# ---------------------------------------------------------------------------
+
+class Tmux:
+    def __init__(self, host: LocalHost):
+        self.host = host
+
+    def _run(self, *args: str) -> str:
+        rc, out = self.host.run(["tmux", *args])
+        if rc != 0:
+            raise SessionError(f"tmux {args[0]} failed (exit {rc})")
+        return out
+
+    @staticmethod
+    def _parse(line: str) -> dict:
+        keys = ["target", "pane_id", "pane_pid", "command", "path", "dead", "in_mode"]
+        parts = line.split(_FMT_SEP)
+        d = dict(zip(keys, parts + [""] * (len(keys) - len(parts))))
+        d["pane_pid"] = int(d["pane_pid"]) if d["pane_pid"].isdigit() else 0
+        d["dead"] = d["dead"] == "1"
+        d["in_mode"] = d["in_mode"] == "1"
+        return d
+
+    def list_panes(self) -> list[dict]:
+        try:
+            out = self._run("list-panes", "-a", "-F", _PANE_FMT)
+        except SessionError:
+            return []
+        return [self._parse(line) for line in out.splitlines() if line.strip()]
+
+    def pane(self, target: str) -> dict:
+        return self._parse(self._run("display-message", "-p", "-t", target, _PANE_FMT).strip())
+
+    def capture(self, target: str, styled: bool = False) -> str:
+        """Pane contents; ``styled`` keeps the SGR escapes (``capture-pane -e``)."""
+        return self._run("capture-pane", "-p", *(["-e"] if styled else []), "-t", target)
+
+    def send_literal(self, target: str, text: str) -> None:
+        self._run("send-keys", "-t", target, "-l", text)
+
+    def send_keys(self, target: str, *keys: str) -> None:
+        """Send named keys in ONE send-keys call (e.g. ``C-c C-c``)."""
+        self._run("send-keys", "-t", target, *keys)
+
+    def get_remain_on_exit(self, target: str) -> str | None:
+        """The pane's own remain-on-exit value, or None when it is not set on the pane."""
+        return self._run("show-options", "-p", "-v", "-t", target, "remain-on-exit").strip() or None
+
+    def set_remain_on_exit(self, target: str, value: str | None) -> None:
+        """Set the pane's remain-on-exit; None removes the pane-level value."""
+        if value is None:
+            self._run("set-option", "-p", "-u", "-t", target, "remain-on-exit")
+        else:
+            self._run("set-option", "-p", "-t", target, "remain-on-exit", value)
+
+    def respawn(self, target: str, cwd: str, command: str) -> None:
+        self._run("respawn-pane", "-t", target, "-c", cwd, command)
+
+    def run_shell_background(self, command: str) -> None:
+        # run-shell expands tmux formats in its argument: "#S" becomes the
+        # session name and "#(cmd)" RUNS cmd. "##" is a literal "#".
+        self._run("run-shell", "-b", command.replace("#", "##"))
+
+
+# ---------------------------------------------------------------------------
+# Discovery
+# ---------------------------------------------------------------------------
+
+def proc_argv(host: LocalHost, pid: int) -> list[str] | None:
+    raw = host.read_text(f"/proc/{pid}/cmdline")
+    if not raw:
+        return None
+    return [a for a in raw.split("\0") if a]
+
+
+def proc_ppid(host: LocalHost, pid: int) -> int | None:
+    for line in (host.read_text(f"/proc/{pid}/status") or "").splitlines():
+        if line.startswith("PPid:"):
+            value = line.split(":", 1)[1].strip()
+            return int(value) if value.isdigit() else None
+    return None
+
+
+def proc_children(host: LocalHost, pid: int) -> list[int]:
+    raw = host.read_text(f"/proc/{pid}/task/{pid}/children") or ""
+    return [int(x) for x in raw.split() if x.isdigit()]
+
+
+def is_claude(argv: list[str] | None) -> bool:
+    if not argv:
+        return False
+    base = os.path.basename(argv[0])
+    # Background workers rewrite their title: argv[0] is "claude bg-spare".
+    if base in ("claude", "claude.exe") or base.split(" ", 1)[0] in ("claude", "claude.exe"):
+        return True
+    return base == "node" and len(argv) > 1 and "claude-code" in argv[1]
+
+
+def _claude_args(argv: list[str]) -> list[str]:
+    """Arguments after the executable (and after the script for node launches)."""
+    return argv[2:] if os.path.basename(argv[0]) == "node" else argv[1:]
+
+
+def is_attach(argv: list[str] | None) -> bool:
+    return is_claude(argv) and _claude_args(argv)[:1] == ["attach"]
+
+
+def load_registry(host: LocalHost, sessions_dir: str | None = None) -> dict[int, dict]:
+    """Read ``~/.claude/sessions/<pid>.json`` (metadata only; other files are ignored)."""
+    d = sessions_dir or f"{host.home()}/.claude/sessions"
+    reg: dict[int, dict] = {}
+    for name in host.listdir(d):
+        if not name.endswith(".json") or not name[:-5].isdigit():
+            continue
+        try:
+            data = json.loads(host.read_text(f"{d}/{name}") or "")
+        except ValueError:
+            continue
+        if isinstance(data, dict):
+            reg[int(name[:-5])] = data
+    return reg
+
+
+def _flag_value(args: list[str], flag: str) -> str | None:
+    for i, a in enumerate(args):
+        if a == flag and i + 1 < len(args):
+            return args[i + 1]
+        if a.startswith(flag + "="):
+            return a.split("=", 1)[1]
+    return None
+
+
+#: A dialog replaces the prompt at the bottom of the pane. The marker text can
+#: also appear in the transcript above (e.g. quoted by the agent); that is not a dialog.
+DIALOG_BOTTOM_LINES = 12
+
+
+def _bottom_lines(screen: str) -> list[str]:
+    lines = [line for line in screen.splitlines() if line.strip()]
+    return lines[-DIALOG_BOTTOM_LINES:]
+
+
+def has_dialog(screen: str) -> bool:
+    return any(DIALOG_RE.search(line) for line in _bottom_lines(screen))
+
+
+def dialog_region(screen: str) -> str:
+    """The dialog itself: the bottom lines, cut at the last horizontal rule.
+
+    The transcript above a dialog can contain numbered lists and words like
+    "worktree"; those must never influence which answer is chosen.
+    """
+    lines = _bottom_lines(screen)
+    for i in range(len(lines) - 1, -1, -1):
+        if _RULE_RE.match(lines[i]):
+            lines = lines[i + 1:]
+            break
+    return "\n".join(lines)
+
+
+#: Rules around the prompt box. The top rule may carry a title (``--name``).
+_BOX_RULE_RE = re.compile(r"^\s*[─━═]{2,}.*[─━═]{2,}\s*$")
+_ESC_RE = re.compile(r"\x1b(?:\[([0-9;:?]*)([@-~])|\][^\x07\x1b]*(?:\x07|\x1b\\)|[()][0-9A-Za-z]|.)",
+                     re.DOTALL)
+#: What Claude Code shows in the prompt instead of long or multi-line pasted text.
+_PASTE_MARKER_RE = re.compile(
+    r"\[(?:Pasted text #\d+(?: \+\d+ lines)?|\.\.\.Truncated text #\d+ \+\d+ lines\.\.\.)\]")
+
+
+def _apply_sgr(params: str, dim: bool, inverse: bool) -> tuple[bool, bool]:
+    parts = params.split(";") if params else [""]
+    i = 0
+    while i < len(parts):
+        p = parts[i].split(":")[0]
+        if p in ("", "0"):
+            dim = inverse = False
+        elif p == "2":
+            dim = True
+        elif p == "22":
+            dim = False
+        elif p == "7":
+            inverse = True
+        elif p == "27":
+            inverse = False
+        elif p in ("38", "48", "58") and ":" not in parts[i]:
+            i += {"5": 2, "2": 4}.get(parts[i + 1] if i + 1 < len(parts) else "", 0)
+        i += 1
+    return dim, inverse
+
+
+def _styled_lines(screen: str) -> list[list[tuple[str, bool, bool]]]:
+    """Lines of (character, dim, inverse) cells from ``capture-pane -e`` output."""
+    lines: list[list[tuple[str, bool, bool]]] = [[]]
+    dim = inverse = False
+    i = 0
+    while i < len(screen):
+        ch = screen[i]
+        if ch == "\x1b":
+            m = _ESC_RE.match(screen, i)
+            if m and m.group(2) == "m":
+                dim, inverse = _apply_sgr(m.group(1), dim, inverse)
+            i = m.end() if m else i + 1
+            continue
+        if ch == "\n":
+            lines.append([])
+        else:
+            lines[-1].append((ch, dim, inverse))
+        i += 1
+    return lines
+
+
+def strip_ansi(screen: str) -> str:
+    return "\n".join("".join(c for c, _, _ in line) for line in _styled_lines(screen))
+
+
+def prompt_text(screen: str) -> str | None:
+    """Unsent text in Claude Code's prompt box, from a (styled) capture.
+
+    The prompt box is the ``❯`` line between the last two horizontal rules.
+    Returns "" when it is empty and None when there is no prompt box. A
+    placeholder or prompt suggestion is rendered dim (with the cursor on its
+    first character) and does not count as text.
+    """
+    lines = _styled_lines(screen)
+    plain = ["".join(c for c, _, _ in line) for line in lines]
+    rules = [i for i, t in enumerate(plain) if _RULE_RE.match(t) or _BOX_RULE_RE.match(t)]
+    if len(rules) < 2 or rules[-1] - rules[-2] < 2:
+        return None
+    top, bottom = rules[-2], rules[-1]
+    first = lines[top + 1]
+    k = next((j for j, (c, _, _) in enumerate(first) if not c.isspace()), None)
+    if k is None or first[k][0] not in "❯>":
+        return None
+    cells = first[k + 1:]
+    for line in lines[top + 2:bottom]:
+        cells = cells + [(" ", False, False)] + line
+    shown = [inverse for c, dim, inverse in cells if not dim and not c.isspace()]
+    if any(dim for _, dim, _ in cells) and len(shown) <= 1 and all(shown):
+        return ""
+    return " ".join("".join(c for c, dim, _ in cells if not dim).split())
+
+
+def _same_text(shown: str, typed: str) -> bool:
+    """Does the prompt line show exactly ``typed`` (wrapped, or collapsed as a paste)?"""
+    squash = "".join(shown.split())
+    return squash == "".join(typed.split()) or bool(_PASTE_MARKER_RE.fullmatch(shown.strip()))
+
+
+def pane_state(screen: str, registry_status: str | None) -> str:
+    """Return ``dialog``, ``working`` or ``idle``."""
+    # The registry reports "waiting" while a permission prompt is open.
+    if has_dialog(screen) or registry_status == "waiting":
+        return "dialog"
+    if registry_status == "busy" or _WORKING_RE.search(screen):
+        return "working"
+    return "idle"
+
+
+@dataclass
+class SessionInfo:
+    target: str
+    pane_id: str
+    pane_pid: int
+    mode: str                       # "shell" | "direct"
+    claude_pid: int                 # Claude process shown in the pane
+    argv: list[str] = field(default_factory=list)
+    attached: bool = False          # pane runs `claude attach <job>`
+    session_pid: int | None = None  # registry pid (the background process if attached)
+    session_id: str | None = None
+    name: str | None = None
+    cwd: str | None = None
+    kind: str | None = None
+    model: str | None = None
+    context_pct: int | None = None
+    state: str = "idle"
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def find_claude_in_pane(host: LocalHost, pane: dict) -> tuple[str, int, list[str]] | None:
+    """Return (mode, pid, argv) of the Claude process in a pane, if any."""
+    pid = pane["pane_pid"]
+    argv = proc_argv(host, pid)
+    if is_claude(argv):
+        return "direct", pid, argv
+    for child in proc_children(host, pid):
+        cargv = proc_argv(host, child)
+        if is_claude(cargv):
+            return "shell", child, cargv
+    return None
+
+
+def inspect_pane(host: LocalHost, tmux: Tmux, pane: dict,
+                 registry: dict[int, dict]) -> SessionInfo | None:
+    found = find_claude_in_pane(host, pane)
+    if not found:
+        return None
+    mode, pid, argv = found
+    info = SessionInfo(target=pane["target"], pane_id=pane["pane_id"],
+                       pane_pid=pane["pane_pid"], mode=mode, claude_pid=pid, argv=argv)
+    entry = None
+    if is_attach(argv):
+        info.attached = True
+        job = (_claude_args(argv)[1:2] or [""])[0]
+        for rpid, data in registry.items():
+            if job and (data.get("jobId") == job or str(data.get("sessionId", "")).startswith(job)):
+                info.session_pid, entry = rpid, data
+                break
+    elif pid in registry:
+        info.session_pid, entry = pid, registry[pid]
+    if entry:
+        info.session_id = entry.get("sessionId")
+        info.name = entry.get("name")
+        info.cwd = entry.get("cwd")
+        info.kind = entry.get("kind")
+    try:
+        screen = tmux.capture(pane["target"])
+    except SessionError:
+        screen = ""
+    info.state = pane_state(screen, (entry or {}).get("status"))
+    m = _CTX_RE.search(screen)
+    info.context_pct = int(m.group(1)) if m else None
+    m = _MODEL_RE.search(screen)
+    info.model = _flag_value(_claude_args(argv), "--model") or (m.group(1) if m else None)
+    return info
+
+
+def list_sessions(host: LocalHost, tmux: Tmux | None = None,
+                  sessions_dir: str | None = None) -> list[SessionInfo]:
+    tmux = tmux or Tmux(host)
+    registry = load_registry(host, sessions_dir)
+    out = []
+    for pane in tmux.list_panes():
+        if pane["dead"]:
+            continue
+        info = inspect_pane(host, tmux, pane, registry)
+        if info:
+            out.append(info)
+    return out
+
+
+def own_pane(host: LocalHost, tmux: Tmux | None = None, pid: int | None = None,
+             sessions_dir: str | None = None) -> str | None:
+    """Pane id of the Claude session this process runs under, if any.
+
+    Walks up the process tree to the Claude process. This also works for
+    background sessions: they run under a daemon, have no ``$TMUX_PANE`` and
+    are shown in a pane by ``claude attach``.
+    """
+    ancestors: set[int] = set()
+    current = pid or os.getpid()
+    for _ in range(64):
+        parent = proc_ppid(host, current)
+        if not parent or parent <= 1 or parent in ancestors:
+            break
+        ancestors.add(parent)
+        current = parent
+    if not ancestors:
+        return None
+    for s in list_sessions(host, tmux, sessions_dir):
+        if s.claude_pid in ancestors or (s.session_pid or -1) in ancestors:
+            return s.pane_id
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Model aliases and relaunch argv
+# ---------------------------------------------------------------------------
+
+def resolve_model(model: str | None,
+                  aliases: dict[str, str] | None = None) -> tuple[str | None, str | None]:
+    """Expand a short alias to a full model id. Returns (model, warning)."""
+    if not model:
+        return model, None
+    table = {**DEFAULT_MODEL_ALIASES, **(aliases or {})}
+    if model.lower() in table:
+        return table[model.lower()], None
+    if not model.startswith("claude-"):
+        return model, (f"model '{model}' is not a full model id and may resolve "
+                       "to a different model under another profile")
+    return model, None
+
+
+def split_claude_args(args: list[str]) -> tuple[list[list[str]], list[str]]:
+    """Split Claude Code arguments into option groups and positional arguments.
+
+    Each group is the option followed by the values it consumes, e.g.
+    ``["--model", "x"]`` or ``["--add-dir", "a", "b"]``.
+    """
+    groups: list[list[str]] = []
+    positional: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            positional += args[i + 1:]
+            break
+        if not a.startswith("-") or a == "-":
+            positional.append(a)
+            i += 1
+            continue
+        flag = a.split("=", 1)[0]
+        group = [a]
+        i += 1
+        if "=" in a or flag in _BOOL_FLAGS:
+            pass
+        elif flag in _VARIADIC_FLAGS:
+            while i < len(args) and not args[i].startswith("-"):
+                group.append(args[i])
+                i += 1
+        elif flag in _VALUE_FLAGS:
+            if i < len(args):
+                group.append(args[i])
+                i += 1
+        elif i < len(args) and not args[i].startswith("-"):
+            # Optional-value flags, and unknown flags (assumed to take a value).
+            group.append(args[i])
+            i += 1
+        groups.append(group)
+    return groups, positional
+
+
+def unknown_flags(argv: list[str]) -> list[str]:
+    """Options in a Claude Code argv whose arity is not known."""
+    groups, _prompt = split_claude_args(_claude_args(argv))
+    return [g[0].split("=", 1)[0] for g in groups
+            if g[0].split("=", 1)[0] not in _KNOWN_FLAGS]
+
+
+def claude_head(argv: list[str]) -> list[str]:
+    """The executable part of a Claude Code argv (``node cli.js`` for node launches)."""
+    return argv[:2] if os.path.basename(argv[0]) == "node" else argv[:1]
+
+
+def has_bare_worktree(argv: list[str]) -> bool:
+    """True when ``--worktree``/``-w`` is given without a name.
+
+    Each launch with a bare ``--worktree`` creates a new, randomly named
+    worktree, so it must never be replayed on resume.
+    """
+    groups, _prompt = split_claude_args(_claude_args(argv))
+    return any(g == ["--worktree"] or g == ["-w"] for g in groups)
+
+
+def build_relaunch_argv(argv: list[str], session_id: str, model: str | None = None,
+                        drop_worktree: bool = False) -> list[str]:
+    """Original argv minus conversation flags, plus ``--resume <sessionId>``.
+
+    The positional prompt is dropped: with ``--resume`` it would be sent to the
+    agent again as a new message. ``--model`` is replaced when ``model`` is
+    given. ``--worktree`` is dropped when relaunching inside the worktree
+    directory itself (direct panes, and shell panes with a bare
+    ``--worktree``).
+    """
+    head = claude_head(argv)
+    groups, _prompt = split_claude_args(_claude_args(argv))
+    drop = set(_SESSION_FLAGS)
+    if model:
+        drop.add("--model")
+    if drop_worktree:
+        drop |= {"--worktree", "-w"}
+    kept = [x for g in groups if g[0].split("=", 1)[0] not in drop for x in g]
+    if model:
+        kept += ["--model", model]
+    return head + kept + ["--resume", session_id]
+
+
+# ---------------------------------------------------------------------------
+# Dialogs
+# ---------------------------------------------------------------------------
+
+def parse_options(screen: str) -> dict[int, str]:
+    """Numbered options of a dialog, e.g. ``{1: 'Keep worktree', 2: 'Remove worktree'}``."""
+    opts: dict[int, str] = {}
+    for line in screen.splitlines():
+        m = _OPTION_RE.match(line)
+        if m:
+            opts[int(m.group(1))] = m.group(2)
+    return opts
+
+
+def choose_dialog_answer(screen: str) -> int:
+    """Pick the safe answer for an exit dialog, or raise SessionError.
+
+    - worktree dialog: the option labelled Keep - never one labelled Remove.
+    - "Exit and stop tasks": option 1.
+    Unknown dialogs are never answered.
+    """
+    region = dialog_region(screen)
+    opts = parse_options(region)
+    lower = region.lower()
+    if "worktree" in lower:
+        keep = [n for n, label in sorted(opts.items())
+                if "keep" in label.lower() and "remove" not in label.lower()]
+        if not keep:
+            raise SessionError("worktree dialog without a Keep option; refusing to answer")
+        return keep[0]
+    if "exit and stop tasks" in lower:
+        label = opts.get(1, "").lower()
+        if "remove" in label or "delete" in label:
+            raise SessionError("unexpected option 1 in exit dialog; refusing to answer")
+        return 1
+    raise SessionError("unknown dialog on screen; refusing to answer")
+
+
+# ---------------------------------------------------------------------------
+# Restart
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RestartResult:
+    target: str
+    status: str = "FAILED"   # OK | SKIPPED | FAILED
+    message: str = ""
+    session_id: str | None = None
+    old_pid: int | None = None
+    new_pid: int | None = None
+    warnings: list[str] = field(default_factory=list)
+
+    def line(self) -> str:
+        return f"{self.status:<8} {self.target}  {self.message}".rstrip()
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+class Restarter:
+    """Restart one session safely. Every wait is polled with a timeout."""
+
+    #: Claude Code shows typed or erased text only after a short delay
+    #: (measured: ~75 ms), so the prompt line is polled before Enter.
+    RENDER_TIMEOUT = 3.0
+    RENDER_POLL = 0.05
+
+    def __init__(self, host: LocalHost, tmux: Tmux | None = None, *,
+                 sessions_dir: str | None = None, timeout: float = 300.0,
+                 poll: float = 1.0, log=None):
+        self.host = host
+        self.tmux = tmux or Tmux(host)
+        self.sessions_dir = sessions_dir
+        self.timeout = timeout
+        self.poll = poll
+        self.log = log or (lambda msg: None)
+        #: pane id -> the pane's own remain-on-exit value before the restart
+        self._remain_prior: dict[str, str | None] = {}
+
+    def _wait(self, predicate, what: str, timeout: float | None = None):
+        deadline = self.host.now() + (self.timeout if timeout is None else timeout)
+        while True:
+            value = predicate()
+            if value:
+                return value
+            if self.host.now() >= deadline:
+                raise SessionError(f"timed out waiting for {what}")
+            self.host.sleep(self.poll)
+
+    def _alive(self, pid: int) -> bool:
+        return is_claude(proc_argv(self.host, pid))
+
+    def _registry(self) -> dict[int, dict]:
+        return load_registry(self.host, self.sessions_dir)
+
+    def inspect(self, target: str) -> SessionInfo:
+        info = inspect_pane(self.host, self.tmux, self.tmux.pane(target), self._registry())
+        if not info:
+            raise SessionError("no Claude Code process in this pane")
+        if not info.session_id:
+            raise SessionError("session not found in the session registry")
+        return info
+
+    def _wait_idle(self, info: SessionInfo) -> None:
+        def idle():
+            status = self._registry().get(info.session_pid or -1, {}).get("status")
+            state = pane_state(self.tmux.capture(info.pane_id), status)
+            if state == "dialog":
+                raise _Skip(DIALOG_OPEN)
+            return state == "idle"
+        self._wait(idle, "the session to become idle")
+
+    def _capture_prompt(self, info: SessionInfo) -> str | None:
+        """Fresh capture: raise _Skip on a dialog, else return the prompt text."""
+        screen = self.tmux.capture(info.pane_id, styled=True)
+        if has_dialog(strip_ansi(screen)):
+            raise _Skip(DIALOG_OPEN)
+        return prompt_text(screen)
+
+    def _poll_prompt(self, info: SessionInfo, done) -> str | None:
+        """Capture the prompt line until ``done(text)`` or RENDER_TIMEOUT; return the last text."""
+        deadline = self.host.now() + self.RENDER_TIMEOUT
+        while True:
+            text = self._capture_prompt(info)
+            if done(text) or self.host.now() >= deadline:
+                return text
+            self.host.sleep(self.RENDER_POLL)
+
+    def _ensure_not_in_mode(self, info: SessionInfo, what: str, force: bool) -> None:
+        """In copy or view mode, keys go to tmux instead of Claude Code, while
+        ``capture-pane`` still shows the screen below. --force leaves the mode."""
+        if not self.tmux.pane(info.pane_id)["in_mode"]:
+            return
+        if force:
+            self.log(f"{info.pane_id}: leaving copy/view mode")
+            self.tmux.send_keys(info.pane_id, "-X", "cancel")
+            if not self.tmux.pane(info.pane_id)["in_mode"]:
+                return
+        raise _Skip(f"pane is in copy/view mode ({what} not sent"
+                    f"{'' if force else '; --force leaves the mode'})")
+
+    def _ensure_empty_prompt(self, info: SessionInfo, what: str, force: bool) -> None:
+        """Typing into a non-empty prompt would append to the user's draft and
+        send both as one message. The draft is cleared only with --force."""
+        self._ensure_not_in_mode(info, what, force)
+        text = self._capture_prompt(info)
+        if text is None:
+            raise _Skip(f"prompt line not found ({what} not sent)")
+        if not text:
+            return
+        if not force:
+            raise _Skip(f"unsent text in the prompt line ({what} not sent; --force clears it)")
+        for _ in range(3):
+            self.log(f"{info.pane_id}: clearing unsent text in the prompt line")
+            before = text
+            self.tmux.send_keys(info.pane_id, "C-u")
+            # C-u clears only the current line of a multi-line draft: wait
+            # until the line is empty or has changed, not for a fixed time.
+            text = self._poll_prompt(info, lambda t: t != before)
+            if text:
+                self.tmux.send_keys(info.pane_id, "-N", str(len(text)), "BSpace")
+                text = self._poll_prompt(info, lambda t: t == "")
+            if text == "":
+                return
+        raise _Skip(f"could not clear the prompt line ({what} not sent)")
+
+    def _type_and_submit(self, info: SessionInfo, text: str, what: str, force: bool) -> None:
+        """Type ``text`` into an empty prompt; Enter only once the prompt line
+        shows exactly ``text`` and no dialog is open."""
+        self._ensure_empty_prompt(info, what, force)
+        self.tmux.send_literal(info.pane_id, text)
+        try:
+            shown = self._poll_prompt(info, lambda t: t is not None and _same_text(t, text))
+        except _Skip:
+            # Enter would confirm the highlighted option of the dialog.
+            raise SessionError(f"a dialog appeared while typing {what}; Enter not sent")
+        if shown is not None and _same_text(shown, text):
+            self.tmux.send_keys(info.pane_id, "Enter")
+            return
+        typed, seen = "".join(text.split()), "".join((shown or "").split())
+        # The keys are delivered in order, so backspaces remove exactly the
+        # typed text, as long as nothing was typed after it.
+        if shown is not None and (seen.endswith(typed) or typed.startswith(seen)):
+            self.tmux.send_keys(info.pane_id, "-N", str(len(text)), "BSpace")
+            removed = "; the typed text was removed"
+        else:
+            removed = ""
+        if shown and not typed.startswith(seen):
+            reason = f"the prompt line changed while typing {what}"
+        else:
+            reason = (f"the prompt line did not show the typed {what} "
+                      f"within {self.RENDER_TIMEOUT:g}s")
+        raise SessionError(f"{reason}; Enter not sent{removed}")
+
+    def _exited(self, info: SessionInfo) -> bool:
+        if self._alive(info.claude_pid):
+            return False
+        pane = self.tmux.pane(info.pane_id)
+        return pane["dead"] if info.mode == "direct" else pane["command"] in SHELLS
+
+    def _exit_interactive(self, info: SessionInfo, force: bool) -> None:
+        self._type_and_submit(info, "/exit", "/exit", force)
+        seen: dict[str, int] = {}
+
+        def exited():
+            if self._exited(info):
+                return True
+            screen = self.tmux.capture(info.pane_id)
+            if has_dialog(screen):
+                choice = choose_dialog_answer(screen)
+                key = screen.strip()
+                seen[key] = seen.get(key, 0) + 1
+                if seen[key] == 1:
+                    self.log(f"{info.pane_id}: answering exit dialog with option {choice}")
+                    self.tmux.send_literal(info.pane_id, str(choice))
+                elif seen[key] > 5:
+                    raise SessionError("exit dialog did not accept the answer")
+            return False
+        self._wait(exited, "Claude Code to exit")
+
+    def _hold_pane(self, info: SessionInfo) -> None:
+        """Keep the pane open when its process exits (remain-on-exit on)."""
+        if info.pane_id not in self._remain_prior:
+            self._remain_prior[info.pane_id] = self.tmux.get_remain_on_exit(info.pane_id)
+        self.tmux.set_remain_on_exit(info.pane_id, "on")
+
+    def _release_pane(self, info: SessionInfo | None) -> None:
+        """Restore remain-on-exit to its value before the restart.
+
+        A dead pane is left as it is: with remain-on-exit it stays visible, so
+        the session can be relaunched by hand (see the logged command).
+        """
+        if not info or info.pane_id not in self._remain_prior:
+            return
+        try:
+            if not self.tmux.pane(info.pane_id)["dead"]:
+                self.tmux.set_remain_on_exit(info.pane_id, self._remain_prior.pop(info.pane_id))
+        except SessionError:
+            pass
+
+    def _respawn_attached(self, info: SessionInfo) -> int:
+        """Restart a background session with ``claude respawn <job>``.
+
+        Killing the background process does not work: the daemon starts it
+        again at once and the attach view stays open. ``claude respawn``
+        resumes the same conversation; the ``claude attach`` client in the pane
+        may exit, so remain-on-exit is set and the pane is re-attached.
+        """
+        job = (_claude_args(info.argv)[1:2] or [""])[0]
+        if not job:
+            raise SessionError("cannot tell the background job id from `claude attach`")
+        self._hold_pane(info)
+        respawn = [*claude_head(info.argv), "respawn", job]
+        self.log(f"{info.pane_id}: running {shlex.join(respawn)}; if this restart is "
+                 f"interrupted, re-attach with: tmux respawn-pane -k -t {info.pane_id} "
+                 f"{shlex.quote(shlex.join(info.argv))}")
+        rc, _ = self.host.run(respawn)
+        if rc != 0:
+            raise SessionError(f"claude respawn {job} failed (exit {rc})")
+
+        def respawned():
+            for rpid, data in self._registry().items():
+                if (data.get("sessionId") == info.session_id and rpid != info.session_pid
+                        and self._alive(rpid)):
+                    return rpid
+            return None
+        new_pid = self._wait(respawned, "the background session to come back")
+        if self.tmux.pane(info.pane_id)["dead"]:
+            self.tmux.respawn(info.pane_id, info.cwd or self.host.home(), shlex.join(info.argv))
+        self._release_pane(info)
+        self._wait(lambda: _STATUS_LINE_RE.search(self.tmux.capture(info.pane_id)),
+                   "the re-attached session (status line)")
+        return new_pid
+
+    def _relaunch_command(self, info: SessionInfo, argv: list[str], *, cd: bool) -> str:
+        """The relaunch command line, quoted for the pane's shell.
+
+        Direct panes are relaunched by tmux through /bin/sh. Shell panes get
+        the command typed into their own shell: POSIX quoting, or fish quoting.
+        """
+        shell = ""
+        if info.mode == "shell":
+            shell = os.path.basename((proc_argv(self.host, info.pane_pid) or [""])[0]).lstrip("-")
+        if shell == "fish":
+            command = " ".join(fish_quote(a) for a in argv)
+            if cd:
+                command = f"cd {fish_quote(info.cwd)}; and {command}"
+            return command
+        command = shlex.join(argv)
+        if info.mode == "shell" and cd:
+            # The shell is still in the launch dir, not in the worktree.
+            command = f"cd {shlex.quote(info.cwd)} && {command}"
+        return command
+
+    def _log_recovery(self, info: SessionInfo, command: str) -> None:
+        """Log how to relaunch by hand, before anything irreversible happens."""
+        if info.mode == "direct":
+            how = shlex.join(["tmux", "respawn-pane", "-k", "-t", info.pane_id, "-c",
+                              info.cwd or self.host.home(), command])
+        else:
+            how = f"type in the pane's shell: {command}"
+        self.log(f"{info.pane_id}: if this restart is interrupted, relaunch with: {how}")
+
+    def _relaunch(self, info: SessionInfo, command: str) -> None:
+        if info.mode == "direct":
+            self.tmux.respawn(info.pane_id, info.cwd or self.host.home(), command)
+            self._release_pane(info)
+        else:
+            # Claude Code has exited: the command must reach the shell, so a
+            # copy/view mode entered meanwhile is left.
+            self._ensure_not_in_mode(info, "relaunch command", True)
+            self.tmux.send_literal(info.pane_id, command)
+            self.tmux.send_keys(info.pane_id, "Enter")
+
+    def _verify(self, info: SessionInfo) -> int:
+        def resumed():
+            found = find_claude_in_pane(self.host, self.tmux.pane(info.pane_id))
+            if not found or found[1] == info.claude_pid:
+                return None
+            if self._registry().get(found[1], {}).get("sessionId") != info.session_id:
+                return None
+            if not _STATUS_LINE_RE.search(self.tmux.capture(info.pane_id)):
+                return None
+            return found[1]
+        return self._wait(resumed, "the resumed session (new pid, same sessionId, status line)")
+
+    def _nudge(self, info: SessionInfo, text: str, force: bool) -> None:
+        def ready():
+            screen = self.tmux.capture(info.pane_id)
+            return not has_dialog(screen) and _STATUS_LINE_RE.search(screen)
+        self._wait(ready, "the resumed session to accept the nudge")
+        self._type_and_submit(info, text, "nudge", force)
+
+    def restart(self, target: str, *, model: str | None = None,
+                aliases: dict[str, str] | None = None,
+                nudge: str | None = DEFAULT_NUDGE, force: bool = False) -> RestartResult:
+        result = RestartResult(target=target)
+        info = None
+        try:
+            info = self.inspect(target)
+            result.session_id = info.session_id
+            result.old_pid = info.session_pid if info.attached else info.claude_pid
+            if info.attached and model:
+                raise SessionError("--model is not supported for background sessions "
+                                   "(claude respawn keeps the session's settings)")
+            original = None if info.attached else _flag_value(_claude_args(info.argv), "--model")
+            model, warning = resolve_model(model or original, aliases)
+            if warning:
+                result.warnings.append(warning)
+            for flag in [] if info.attached else unknown_flags(info.argv):
+                result.warnings.append(f"unknown option {flag}: assumed to take one value "
+                                       "unless the next argument starts with '-'")
+            if info.state == "dialog":
+                # Pasting into a dialog would select an answer. Never do that.
+                raise _Skip(DIALOG_OPEN)
+            self._ensure_not_in_mode(info, "/exit", force)
+            if force:
+                self.tmux.send_keys(info.pane_id, "Escape")
+            else:
+                self._wait_idle(info)
+            if info.attached:
+                result.new_pid = self._respawn_attached(info)
+            else:
+                # A bare --worktree would create a new worktree on resume; run
+                # inside the session's existing worktree cwd instead.
+                bare_worktree = (info.mode == "shell" and bool(info.cwd)
+                                 and has_bare_worktree(info.argv))
+                argv = build_relaunch_argv(info.argv, info.session_id, model,
+                                           drop_worktree=info.mode == "direct" or bare_worktree)
+                command = self._relaunch_command(info, argv, cd=bare_worktree)
+                # Checked here as well as right before typing: a draft found
+                # now must not cost the pane its remain-on-exit change.
+                self._ensure_empty_prompt(info, "/exit", force)
+                self._log_recovery(info, command)
+                if info.mode == "direct":
+                    self._hold_pane(info)
+                self._exit_interactive(info, force)
+                self._relaunch(info, command)
+                result.new_pid = self._verify(info)
+            restarted = f"pid {result.old_pid} -> {result.new_pid}, session {info.session_id}"
+            if nudge:
+                try:
+                    self._nudge(info, nudge, force)
+                except (_Skip, SessionError) as exc:
+                    # The session itself was restarted: not a failure.
+                    result.status, result.message = "SKIPPED", f"{restarted}; nudge: {exc}"
+                    return result
+            result.status, result.message = "OK", restarted
+        except _Skip as exc:
+            result.status, result.message = "SKIPPED", str(exc)
+        except SessionError as exc:
+            result.status, result.message = "FAILED", str(exc)
+        finally:
+            self._release_pane(info)
+        return result
+
+
+def self_restart_command(python: str, target: str, *, delay: float, extra: list[str],
+                         log: str | None = None) -> str:
+    """Shell command (POSIX sh, as run by ``tmux run-shell``) for ``restart --self``.
+
+    The helper runs from the tmux server's directory, so the package location
+    is put in front of PYTHONPATH: the helper runs the same claude_mux as the
+    caller. An existing PYTHONPATH is kept, since dependencies may be found
+    only through it.
+
+    With ``log``, output is appended to it and the command always exits 0:
+    ``run-shell -b`` puts the current pane in view-mode to show a non-zero
+    exit status, which would cover the restarted session.
+    """
+    package_parent = str(Path(__file__).resolve().parent.parent)
+    pythonpath = f'PYTHONPATH={shlex.quote(package_parent)}"${{PYTHONPATH:+:$PYTHONPATH}}"'
+    inner = shlex.join([python, "-m", "claude_mux", "session", "restart", target, *extra])
+    command = f"sleep {float(delay):g}; {pythonpath} {inner}"
+    if log is not None:
+        command += f" >> {shlex.quote(log)} 2>&1; exit 0"
+    return command

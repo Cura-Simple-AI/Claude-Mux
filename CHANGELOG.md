@@ -6,6 +6,55 @@ Format: [Semantic Versioning](https://semver.org/). Dates in ISO 8601.
 
 ---
 
+## [Unreleased]
+
+### Added
+- `session list` and `session restart` (single pane, `--self`, `--all`): safe exit and resume of
+  Claude Code sessions in tmux — refuses open dialogs, always keeps worktrees, expands short
+  model aliases, nudges the agent to recreate scheduled loops after resume.
+- `session list` / `session restart`: `--container NAME` operates on tmux inside a running
+  container (`docker exec`); `--container-user USER` selects the user owning the tmux server
+  (`docker exec -u`), since tmux servers are per user. `--profile` and `--self` are refused with
+  `--container`.
+- `session restart`: a bare `--worktree` in the original command line is not replayed in shell
+  panes (it would create a new worktree); the session resumes in its existing worktree cwd.
+
+### Fixed
+- `session restart`: Enter is sent only after the prompt line shows the typed `/exit` or nudge.
+  Claude Code renders typed text ~75 ms after `send-keys`, and the immediate re-check failed
+  every restart of an idle session, leaving `/exit` in the prompt line. The prompt line is now
+  polled for up to 3 s; on timeout the typed text is removed again and the restart fails. The
+  `--force` clear of a draft is polled the same way.
+- `session restart`: a nudge that cannot be sent after a successful restart (including a dialog
+  or a timeout while typing it) gives `SKIPPED` (exit 4) with the new pid, not `FAILED`.
+- `session restart`: a pane in tmux copy or view mode is `SKIPPED` before anything is typed
+  (keys would reach tmux, not Claude Code); `--force` leaves the mode first.
+- `session restart --self`: the helper command always exits 0 (its result is in the log), so
+  `tmux run-shell -b` no longer leaves the pane in view mode after a failed or skipped restart.
+- `session restart`: complete option arity for Claude Code, including hidden boolean
+  (`--plan-mode-required`, `--init`, `-d2e`, …), variadic (`--channels`) and optional-value
+  (`--rc`, `--remote`, `--project`) options. Unknown options never consume an argument that
+  starts with `-`, and are reported as warnings.
+- `session restart --self`: every `#` in the helper command is escaped for `tmux run-shell`,
+  which expands formats (`#S`, `#{...}`) and runs `#(...)` — a `--nudge` containing them was
+  altered or executed. The helper now prepends the package to `PYTHONPATH` instead of replacing it.
+- `session restart`: the pane is addressed by its pane id (`%N`) instead of `sess:win.pane`,
+  which can point to another pane after windows are renumbered. `claude respawn` uses the same
+  executable as the session (`node cli.js` for node installs, not `node respawn`).
+  `remain-on-exit` is restored to the pane's own previous value — also for attached panes and
+  after failures — instead of being unset.
+- `session restart`: `/exit` and the nudge are never typed into a prompt line that holds unsent
+  text — they were appended to the draft and sent as one message. Such panes are `SKIPPED`;
+  `--force` clears the line first. Right before typing and right before Enter the pane is
+  captured again: a dialog that appeared in the meantime, or a prompt line that does not show
+  exactly the typed text, stops the restart without Enter (also after the `--force` Escape).
+- `session restart`: the relaunch command is logged before `/exit` is sent, so an interrupted
+  restart (for example a `--self` helper that dies) can be finished by hand.
+- `session restart`: in fish shell panes the relaunch command is quoted for fish, which treats
+  backslashes inside single quotes differently from POSIX shells.
+
+---
+
 ## [0.1.3] — 2026-04-25
 
 ### Bugfixes

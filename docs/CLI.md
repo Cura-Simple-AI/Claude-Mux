@@ -373,6 +373,157 @@ claude-mux init --force   # overwrite existing statusLine setting
 **After running:** restart Claude Code. The status bar shows the active subscription name,
 updated every time you activate a subscription with `claude-mux activate`.
 
+### `claude-mux session list`
+
+Lists Claude Code sessions running in tmux panes. Read-only.
+
+```bash
+claude-mux session list                    # table
+claude-mux session list --json             # machine-readable
+claude-mux session list --container dev    # tmux inside a running container (docker exec)
+claude-mux session list --container dev --container-user vscode   # tmux server of another user
+```
+
+| Option | Description |
+|---|---|
+| `--container NAME` | Inspect tmux inside a running container (`docker exec`) |
+| `--container-user USER` | With `--container`: the user owning the tmux server (`docker exec -u`); tmux servers are per user |
+| `--json` | Output as JSON |
+
+Each session is mapped **tmux pane → claude pid → `~/.claude/sessions/<pid>.json`** and shows
+the session id, name, cwd, original command line, model, context % and state:
+
+| State | Meaning |
+|---|---|
+| `idle` | waiting for input |
+| `working` | a turn is running (registry status `busy` or "esc to interrupt" on screen) |
+| `dialog` | a dialog or permission prompt is open ("Enter to select", "Enter to confirm" or "Esc to cancel" at the bottom of the pane, or registry status `waiting`) |
+
+Panes running `claude attach <job>` (background sessions) are marked with `*`; the pid shown is
+the background process.
+
+---
+
+### `claude-mux session restart`
+
+Exits a Claude Code session and resumes the same conversation in the same pane.
+
+```bash
+claude-mux session restart main:0.1                    # one pane
+claude-mux session restart main:0.1 --model opus       # expanded to a full model id
+claude-mux session restart main:0.1 --profile work     # `activate work` first
+claude-mux session restart --self                      # the session calling the command
+claude-mux session restart --all --match '^agent-'     # one at a time
+```
+
+| Option | Description |
+|---|---|
+| `--model ID` | Model for the resumed session. Short aliases are expanded (see below) |
+| `--profile NAME` | Run `activate NAME` before restarting. Host only: refused with `--container`, because `activate` writes the host's config, which the container never sees |
+| `--nudge TEXT` | Message sent after resume. Default asks the agent to recreate its scheduled loops |
+| `--no-nudge` | Send no message after resume |
+| `--force` | Do not wait for idle; send Escape first, leave tmux copy/view mode, and clear unsent text in the prompt line. Open dialogs are still refused |
+| `--timeout SEC` | Seconds to wait for each step (default 300) |
+| `--self` | Restart the calling session's pane via a detached helper (`tmux run-shell -b`; `#` is escaped so tmux formats in `--nudge` are not expanded). The helper runs the caller's claude_mux, prepended to `PYTHONPATH`. Not with `--container` |
+| `--delay SEC` | With `--self`: seconds before the helper starts (default 5) |
+| `--all` | Restart every session, one at a time. The caller's own pane is skipped |
+| `--match REGEX` | With `--all`: only sessions whose target, name or cwd matches |
+| `--container NAME` | Operate on tmux inside a running container |
+| `--container-user USER` | With `--container`: the user owning the tmux server (`docker exec -u`); tmux servers are per user |
+| `--json` | Output as JSON |
+
+**Sequence and safety rules:**
+
+1. **Refuse if a dialog is open.** Text typed into a selection dialog picks an answer, so a pane
+   in the `dialog` state (see above) is reported as `SKIPPED` — even with `--force`.
+2. **Refuse if the pane is in tmux copy or view mode** (`#{pane_in_mode}`, e.g. after scrolling
+   with the mouse): keys would go to tmux, not to Claude Code, while `capture-pane` still shows
+   the screen below. Reported as `SKIPPED`; `--force` leaves the mode first
+   (`send-keys -X cancel`). Checked again before every text that is typed.
+3. **Wait until idle** (unless `--force`, which sends Escape first).
+4. **Refuse if the prompt line holds unsent text.** Whatever is typed is appended to it, and Enter
+   would send the user's draft together with `/exit` as an ordinary message. Such a pane is
+   reported as `SKIPPED`; with `--force` the line is cleared first (`C-u`, then backspaces) and
+   polled until it is empty. Placeholder text and prompt suggestions (rendered dim) do not count.
+5. **Log the relaunch command** (to stderr, or the `--self` log file) before anything is sent, so
+   the session can be relaunched by hand if the restart is interrupted.
+6. **Exit.** `/exit` is typed, then Enter is sent in a *separate* `send-keys` call. Immediately
+   before typing, the pane is captured again and checked for a dialog and an empty prompt line.
+   Claude Code shows typed text only after a short delay (~75 ms measured), so the prompt line is
+   then polled every 50 ms for up to 3 s. Enter is sent only once the prompt line shows exactly
+   the typed text and no dialog is open. If a dialog appears, nothing more is sent. If the text
+   does not show up in time, the typed text is removed again with backspaces (only when the prompt
+   line still ends with, or is a prefix of, that text) and the restart fails. Exit dialogs:
+   - worktree dialog → the option labelled **Keep**. An option labelled Remove is never chosen;
+     if there is no Keep option the restart fails and the dialog is left untouched.
+   - "Exit and stop tasks" → option 1.
+   - any other dialog → the restart fails without answering.
+7. **Background sessions** (`claude attach`): restarted with `claude respawn <job>`, which
+   resumes the same conversation (killing the background process does not work — the daemon
+   starts it again and the attach view stays open). `remain-on-exit` is set first; if the
+   `claude attach` client exits, the pane is re-attached with `tmux respawn-pane`. Steps 4, 6, 8
+   and 9 do not apply, and `--model` is refused because `claude respawn` keeps the session's settings.
+8. **Relaunch** with the original argv (`--agent`, `--worktree`, `--permission-mode`, `--model`, …)
+   minus `--resume`, `--session-id`, `--fork-session` and `--continue`, plus `--resume <sessionId>`.
+   A positional prompt from the original command line is dropped — with `--resume` it would be
+   sent to the agent again as a new message. To tell option values from the prompt, the arity of
+   every Claude Code option is known, including hidden ones (`--plan-mode-required`,
+   `--agent-id`, `--channels a b`, `--rc [name]`, …). An unknown option is assumed to take one
+   value unless the next argument starts with `-`, and the restart reports a warning for it.
+   - Pane runs a shell: wait for the shell, then type the command. A bare `--worktree` (no name)
+     is dropped and the command is prefixed with `cd <session cwd> &&`: a bare `--worktree`
+     creates a new worktree on every launch, and the shell is still in the launch directory.
+     `--worktree <name>` is kept as is. The command is quoted for the pane's shell: POSIX quoting
+     for bash, zsh, sh, dash and ksh; fish quoting (and `cd <dir>; and …`) for fish.
+   - Claude Code is the pane process itself: `remain-on-exit` is set before exit and the pane is
+     relaunched with `tmux respawn-pane` in the session's cwd (`--worktree` is dropped because
+     the cwd already is the worktree).
+9. **Verify:** a new pid, the same `sessionId` in the registry and a visible status line.
+10. **Nudge:** the text, then Enter in a separate call, with the same checks as for `/exit`.
+   Session-scoped cron jobs do not survive a resume, so the default nudge asks the agent to
+   recreate its scheduled loops. If the nudge cannot be sent safely — text in the prompt line,
+   copy/view mode, a dialog, or the typed text not shown in time — the result is `SKIPPED`, not
+   `FAILED`: the session itself was restarted, and the message says so (`pid a -> b, …; nudge: …`).
+
+Worktrees are never removed.
+
+Once resolved, the pane is addressed by its pane id (`%N`) for the whole restart, so it is never
+confused with another pane when windows are renumbered. `remain-on-exit` is restored to the
+pane's previous value after the restart, also when it fails or is skipped; a pane that is already
+dead is left open so the session can be relaunched by hand.
+
+**Model aliases.** A short alias such as `opus` can resolve to an older model under a different
+profile, so aliases are expanded to full ids before relaunch (this also applies to an alias in the
+original command line). Defaults: `opus` → `claude-opus-5-5`, `sonnet` → `claude-sonnet-5-5`,
+`haiku` → `claude-haiku-4-5-20251001`. Override or extend them in `~/.claude-mux/subscriptions.json`:
+
+```json
+{ "session_model_aliases": { "opus": "claude-opus-5-5" } }
+```
+
+Any other model name that does not start with `claude-` produces a warning.
+
+**`--self`.** An agent cannot exit its own session synchronously. `--self` schedules a detached
+helper that sleeps `--delay` seconds and then runs `session restart <pane>` with the same
+options. The pane is found by walking up the process tree to the Claude process, which also works
+for background sessions shown through `claude attach` (they have no `$TMUX_PANE`); `$TMUX_PANE`
+is the fallback. The helper runs the same claude-mux package as the caller
+(log: `~/.claude-mux/session-restart.log`). The helper command always exits 0 — its result is in
+the log — because `tmux run-shell -b` shows a non-zero exit status in view mode on the current
+pane, which would cover the restarted session. End the turn right after calling it so the session
+becomes idle.
+
+**`--all` output:** one line per session — `OK`, `SKIPPED` (dialog / own pane) or `FAILED`.
+
+Exit codes: `0` OK, `1` failed (any session with `--all`), `2` usage, `4` skipped (dialog open,
+draft, copy/view mode, or nudge not sent after a successful restart).
+
+**Known limitation.** A pane whose process is a non-interactive shell that waits for Claude Code
+(e.g. `tmux new-session 'cd dir && claude'`, i.e. `sh -c …`) is treated like a pane running an
+interactive shell. After `/exit` that shell ends and the pane closes, so the relaunch fails; the
+logged relaunch command can be used to start the session again in a new pane. Start sessions
+either directly (`tmux new-session claude …`) or from an interactive shell.
+
 ---
 
 ## Scripting examples
@@ -439,6 +590,8 @@ claude-mux test || claude-mux failover
 | `q` | (exit TUI) | — |
 | — | `claude-mux active` | Print active subscription name |
 | — | `claude-mux init` | Install Claude Code status line |
+| — | `claude-mux session list` | List Claude Code sessions in tmux (TUI view may follow) |
+| — | `claude-mux session restart` | Exit and resume sessions safely (TUI action may follow) |
 | — | `claude-mux statusline` | Format status line from Claude Code JSON (called by statusline.sh) |
 
 ---

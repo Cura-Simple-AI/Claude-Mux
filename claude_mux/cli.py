@@ -1212,6 +1212,232 @@ def cmd_init(force):
 
 
 # ---------------------------------------------------------------------------
+# session
+# ---------------------------------------------------------------------------
+
+def _session_host(container, user=None):
+    """Host used by `session` commands. Patched in tests with a fake tmux."""
+    from claude_mux import session as sess
+    return sess.make_host(container, user)
+
+
+def _session_aliases() -> dict:
+    """User overrides for short model aliases (``session_model_aliases`` in config)."""
+    try:
+        aliases = _cm()._data.get("session_model_aliases") or {}
+    except Exception:
+        return {}
+    return aliases if isinstance(aliases, dict) else {}
+
+
+@cli.group("session")
+def cmd_session():
+    """List, exit and resume Claude Code sessions running in tmux.
+
+    Sessions are mapped tmux pane -> claude pid -> ~/.claude/sessions/<pid>.json.
+    """
+
+
+@cmd_session.command("list")
+@click.option("--container", default=None, metavar="NAME",
+              help="Inspect tmux inside a running container (docker exec)")
+@click.option("--container-user", default=None, metavar="USER",
+              help="With --container: user owning the tmux server (docker exec -u)")
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON")
+def cmd_session_list(container, container_user, as_json):
+    """List Claude Code sessions in tmux panes.
+
+    Shows pane, pid, session name and id, model, context %, state
+    (idle / working / dialog) and the original command line. Read-only.
+    """
+    from claude_mux import session as sess
+    if container_user and not container:
+        click.echo("Error: --container-user requires --container", err=True)
+        sys.exit(2)
+    sessions = sess.list_sessions(_session_host(container, container_user))
+    if as_json:
+        click.echo(json.dumps([s.to_dict() for s in sessions], indent=2))
+        return
+    if not sessions:
+        click.echo("No Claude Code sessions found in tmux.")
+        if container and not container_user:
+            click.echo("(tmux servers are per user; try --container-user if the sessions "
+                       "belong to another user than the container's default)")
+        return
+    click.echo(f"{'TARGET':<24} {'PID':<9} {'STATE':<8} {'MODEL':<20} {'CTX':<5} "
+               f"{'NAME':<26} SESSION")
+    click.echo("-" * 120)
+    for s in sessions:
+        ctx = f"{s.context_pct}%" if s.context_pct is not None else "-"
+        pid = s.claude_pid if not s.attached else f"{s.session_pid or '?'}*"
+        click.echo(f"{s.target:<24} {str(pid):<9} {s.state:<8} {(s.model or '-'):<20} "
+                   f"{ctx:<5} {(s.name or '-')[:26]:<26} {s.session_id or '-'}")
+        click.echo(f"    cwd: {s.cwd or '-'}  argv: {' '.join(s.argv)[:160]}")
+    if any(s.attached for s in sessions):
+        click.echo("\n* background session shown through `claude attach`")
+
+
+@cmd_session.command("restart")
+@click.argument("target", required=False)
+@click.option("--self", "self_", is_flag=True,
+              help="Restart the calling session's pane via a detached helper")
+@click.option("--all", "all_", is_flag=True, help="Restart every session, one at a time")
+@click.option("--match", default=None, metavar="REGEX",
+              help="With --all: only sessions whose target, name or cwd matches")
+@click.option("--model", default=None, metavar="ID",
+              help="Model for the resumed session (short aliases are expanded)")
+@click.option("--profile", default=None, metavar="NAME",
+              help="Run `activate NAME` before restarting (host only; not with --container)")
+@click.option("--nudge", default=None, metavar="TEXT",
+              help="Message sent after resume (default: ask the agent to recreate scheduled loops)")
+@click.option("--no-nudge", is_flag=True, help="Do not send any message after resume")
+@click.option("--force", is_flag=True,
+              help="Do not wait for idle; send Escape first and clear unsent text in the "
+                   "prompt line. Open dialogs are still refused")
+@click.option("--timeout", default=300.0, show_default=True, type=float,
+              help="Seconds to wait for each step")
+@click.option("--delay", default=5.0, show_default=True, type=float,
+              help="With --self: seconds before the helper starts")
+@click.option("--container", default=None, metavar="NAME",
+              help="Operate on tmux inside a running container (docker exec)")
+@click.option("--container-user", default=None, metavar="USER",
+              help="With --container: user owning the tmux server (docker exec -u)")
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON")
+@click.pass_context
+def cmd_session_restart(ctx, target, self_, all_, match, model, profile, nudge, no_nudge,
+                        force, timeout, delay, container, container_user, as_json):
+    """Exit a Claude Code session and resume it in the same pane.
+
+    \b
+    Safety rules:
+      - Refuses when a dialog or permission prompt is open in the pane.
+      - Refuses when the prompt line holds unsent text (--force clears it);
+        /exit and the nudge are never appended to a draft.
+      - Waits until the session is idle unless --force.
+      - Exit dialogs: "Keep worktree" is always answered Keep (never Remove);
+        "Exit and stop tasks" is answered with option 1.
+      - Background sessions (`claude attach`): `claude respawn <job>`, then
+        the pane is re-attached if needed. --model is not supported there.
+      - Relaunches with the original argv plus --resume <sessionId> and
+        verifies a new pid with the same sessionId and a visible status line.
+
+    \b
+    Examples:
+      cm session restart main:0.1 --model opus
+      cm session restart --self
+      cm session restart --all --match 'agent-' --profile work
+    """
+    import os
+    from claude_mux import session as sess
+
+    modes = sum(bool(x) for x in (target, self_, all_))
+    if modes != 1:
+        click.echo("Error: give exactly one of TARGET, --self or --all", err=True)
+        sys.exit(2)
+    if match and not all_:
+        click.echo("Error: --match requires --all", err=True)
+        sys.exit(2)
+    if no_nudge:
+        nudge_text = None
+    else:
+        nudge_text = nudge if nudge is not None else sess.DEFAULT_NUDGE
+
+    if container_user and not container:
+        click.echo("Error: --container-user requires --container", err=True)
+        sys.exit(2)
+    if profile and container:
+        # `activate` writes the host's config; the container would never see it.
+        click.echo("Error: --profile cannot be combined with --container (it would activate "
+                   "the profile on the host, not in the container)", err=True)
+        sys.exit(2)
+    host = _session_host(container, container_user)
+
+    if self_:
+        if container:
+            click.echo("Error: --self cannot be combined with --container", err=True)
+            sys.exit(2)
+        # Background sessions have no $TMUX_PANE; find the pane via the process tree.
+        pane = sess.own_pane(host) or os.environ.get("TMUX_PANE")
+        if not pane:
+            click.echo("Error: --self must run inside a Claude Code session in a tmux pane",
+                       err=True)
+            sys.exit(2)
+        extra = []
+        for flag, value in (("--model", model), ("--profile", profile),
+                            ("--timeout", timeout)):
+            if value is not None:
+                extra += [flag, str(value)]
+        if no_nudge:
+            extra.append("--no-nudge")
+        elif nudge is not None:
+            extra += ["--nudge", nudge]
+        if force:
+            extra.append("--force")
+        log_file = CLAUDE_MUX_DIR / "session-restart.log"
+        cmd = sess.self_restart_command(sys.executable, pane, delay=delay, extra=extra,
+                                        log=str(log_file))
+        try:
+            sess.Tmux(host).run_shell_background(cmd)
+        except sess.SessionError as exc:
+            click.echo(f"Error: {exc}", err=True)
+            sys.exit(1)
+        if as_json:
+            click.echo(json.dumps({"ok": True, "target": pane, "delay": delay, "log": str(log_file)}))
+        else:
+            click.echo(f"Restart of {pane} scheduled in {delay:g}s (log: {log_file}). "
+                       "End your turn now so the session becomes idle.")
+        return
+
+    if profile:
+        try:
+            ctx.invoke(cmd_activate, name=profile, quiet=True, as_json=False)
+        except SystemExit as exc:
+            if exc.code:
+                click.echo(f"Error: could not activate profile '{profile}'", err=True)
+                sys.exit(1)
+
+    restarter = sess.Restarter(host, timeout=timeout,
+                               log=lambda m: None if as_json else click.echo(m, err=True))
+    aliases = _session_aliases()
+
+    if all_:
+        import re as _re
+        pattern = _re.compile(match) if match else None
+        own = None if container else (sess.own_pane(host) or os.environ.get("TMUX_PANE"))
+        targets = []
+        for s in sess.list_sessions(host):
+            hay = " ".join(x for x in (s.target, s.name or "", s.cwd or "") if x)
+            if pattern and not pattern.search(hay):
+                continue
+            targets.append(s)
+        results = []
+        for s in targets:
+            if own and not container and s.pane_id == own:
+                r = sess.RestartResult(target=s.target, status="SKIPPED",
+                                       message="own pane (use --self)")
+            else:
+                r = restarter.restart(s.target, model=model, aliases=aliases,
+                                      nudge=nudge_text, force=force)
+            results.append(r)
+            if not as_json:
+                click.echo(r.line())
+                for w in r.warnings:
+                    click.echo(f"         warning: {w}")
+        if as_json:
+            click.echo(json.dumps([r.to_dict() for r in results], indent=2))
+        sys.exit(1 if any(r.status == "FAILED" for r in results) else 0)
+
+    r = restarter.restart(target, model=model, aliases=aliases, nudge=nudge_text, force=force)
+    if as_json:
+        click.echo(json.dumps(r.to_dict(), indent=2))
+    else:
+        for w in r.warnings:
+            click.echo(f"warning: {w}", err=True)
+        click.echo(r.line())
+    sys.exit({"OK": 0, "SKIPPED": 4, "FAILED": 1}[r.status])
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
