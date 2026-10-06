@@ -390,7 +390,7 @@ the session id, name, cwd, original command line, model, context % and state:
 |---|---|
 | `idle` | waiting for input |
 | `working` | a turn is running (registry status `busy` or "esc to interrupt" on screen) |
-| `dialog` | a dialog is open ("Enter to select" or "Enter to confirm" at the bottom of the pane) |
+| `dialog` | a dialog or permission prompt is open ("Enter to select", "Enter to confirm" or "Esc to cancel" at the bottom of the pane, or registry status `waiting`) |
 
 Panes running `claude attach <job>` (background sessions) are marked with `*`; the pid shown is
 the background process.
@@ -417,7 +417,7 @@ claude-mux session restart --all --match '^agent-'     # one at a time
 | `--no-nudge` | Send no message after resume |
 | `--force` | Do not wait for idle; send Escape first. Open dialogs are still refused |
 | `--timeout SEC` | Seconds to wait for each step (default 300) |
-| `--self` | Restart the session in `$TMUX_PANE` via a detached helper (`tmux run-shell -b`) |
+| `--self` | Restart the calling session's pane via a detached helper (`tmux run-shell -b`) |
 | `--delay SEC` | With `--self`: seconds before the helper starts (default 5) |
 | `--all` | Restart every session, one at a time. The caller's own pane is skipped |
 | `--match REGEX` | With `--all`: only sessions whose target, name or cwd matches |
@@ -427,16 +427,18 @@ claude-mux session restart --all --match '^agent-'     # one at a time
 **Sequence and safety rules:**
 
 1. **Refuse if a dialog is open.** Text typed into a selection dialog picks an answer, so a pane
-   showing "Enter to select" or "Enter to confirm" is reported as `SKIPPED` — even with `--force`.
+   in the `dialog` state (see above) is reported as `SKIPPED` — even with `--force`.
 2. **Wait until idle** (unless `--force`, which sends Escape first).
 3. **Exit.** `/exit` is typed, then Enter is sent in a *separate* `send-keys` call. Exit dialogs:
    - worktree dialog → the option labelled **Keep**. An option labelled Remove is never chosen;
      if there is no Keep option the restart fails and the dialog is left untouched.
    - "Exit and stop tasks" → option 1.
    - any other dialog → the restart fails without answering.
-4. **Background sessions** (`claude attach`): the background process gets SIGTERM, then the
-   overview is closed with two Ctrl-C sent in **one** `send-keys` call (separate calls do not
-   close it).
+4. **Background sessions** (`claude attach`): restarted with `claude respawn <job>`, which
+   resumes the same conversation (killing the background process does not work — the daemon
+   starts it again and the attach view stays open). `remain-on-exit` is set first; if the
+   `claude attach` client exits, the pane is re-attached with `tmux respawn-pane`. Steps 5-6
+   do not apply, and `--model` is refused because `claude respawn` keeps the session's settings.
 5. **Relaunch** with the original argv (`--agent`, `--worktree`, `--permission-mode`, `--model`, …)
    minus `--resume`, `--session-id`, `--fork-session` and `--continue`, plus `--resume <sessionId>`.
    - Pane runs a shell: wait for the shell, then type the command.
@@ -461,9 +463,12 @@ original command line). Defaults: `opus` → `claude-opus-5-5`, `sonnet` → `cl
 Any other model name that does not start with `claude-` produces a warning.
 
 **`--self`.** An agent cannot exit its own session synchronously. `--self` schedules a detached
-helper that sleeps `--delay` seconds and then runs `session restart $TMUX_PANE` with the same
-options (log: `~/.claude-mux/session-restart.log`). End the turn right after calling it so the
-session becomes idle.
+helper that sleeps `--delay` seconds and then runs `session restart <pane>` with the same
+options. The pane is found by walking up the process tree to the Claude process, which also works
+for background sessions shown through `claude attach` (they have no `$TMUX_PANE`); `$TMUX_PANE`
+is the fallback. The helper runs the same claude-mux package as the caller
+(log: `~/.claude-mux/session-restart.log`). End the turn right after calling it so the session
+becomes idle.
 
 **`--all` output:** one line per session — `OK`, `SKIPPED` (dialog / own pane) or `FAILED`.
 

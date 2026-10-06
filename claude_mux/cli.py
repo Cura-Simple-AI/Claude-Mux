@@ -1272,7 +1272,7 @@ def cmd_session_list(container, as_json):
 @cmd_session.command("restart")
 @click.argument("target", required=False)
 @click.option("--self", "self_", is_flag=True,
-              help="Restart the session in the current tmux pane via a detached helper")
+              help="Restart the calling session's pane via a detached helper")
 @click.option("--all", "all_", is_flag=True, help="Restart every session, one at a time")
 @click.option("--match", default=None, metavar="REGEX",
               help="With --all: only sessions whose target, name or cwd matches")
@@ -1299,11 +1299,12 @@ def cmd_session_restart(ctx, target, self_, all_, match, model, profile, nudge, 
 
     \b
     Safety rules:
-      - Refuses when a dialog ("Enter to select/confirm") is open in the pane.
+      - Refuses when a dialog or permission prompt is open in the pane.
       - Waits until the session is idle unless --force.
       - Exit dialogs: "Keep worktree" is always answered Keep (never Remove);
         "Exit and stop tasks" is answered with option 1.
-      - Background sessions: SIGTERM, then two Ctrl-C in one send-keys call.
+      - Background sessions (`claude attach`): `claude respawn <job>`, then
+        the pane is re-attached if needed. --model is not supported there.
       - Relaunches with the original argv plus --resume <sessionId> and
         verifies a new pid with the same sessionId and a visible status line.
 
@@ -1331,9 +1332,14 @@ def cmd_session_restart(ctx, target, self_, all_, match, model, profile, nudge, 
     host = _session_host(container)
 
     if self_:
-        pane = os.environ.get("TMUX_PANE")
-        if not pane or container:
-            click.echo("Error: --self must run inside a local tmux pane", err=True)
+        if container:
+            click.echo("Error: --self cannot be combined with --container", err=True)
+            sys.exit(2)
+        # Background sessions have no $TMUX_PANE; find the pane via the process tree.
+        pane = sess.own_pane(host) or os.environ.get("TMUX_PANE")
+        if not pane:
+            click.echo("Error: --self must run inside a Claude Code session in a tmux pane",
+                       err=True)
             sys.exit(2)
         extra = []
         for flag, value in (("--model", model), ("--profile", profile),
@@ -1376,7 +1382,7 @@ def cmd_session_restart(ctx, target, self_, all_, match, model, profile, nudge, 
     if all_:
         import re as _re
         pattern = _re.compile(match) if match else None
-        own = os.environ.get("TMUX_PANE")
+        own = None if container else (sess.own_pane(host) or os.environ.get("TMUX_PANE"))
         targets = []
         for s in sess.list_sessions(host):
             hay = " ".join(x for x in (s.target, s.name or "", s.cwd or "") if x)

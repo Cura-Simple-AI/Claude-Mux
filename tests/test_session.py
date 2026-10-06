@@ -68,6 +68,12 @@ REAL_TRUST_DIALOG = (
     " ❯ No, exit\n   Yes, I trust this folder\n"
     " Enter to confirm · Esc to cancel\n"
 )
+REAL_PERMISSION_PROMPT = (
+    "─" * 60 + "\n Bash command\n   │ python3 -m claude_mux session restart --self\n"
+    " This command requires approval\n Do you want to proceed?\n"
+    " ❯ 1. Yes\n   2. Yes, and allow access to /work\n   3. No\n"
+    " Esc to cancel · Tab to amend\n"
+)
 UNKNOWN_DIALOG = "Do you trust this folder?\n❯ 1. Yes\n  2. No\nEnter to select\n"
 
 
@@ -87,6 +93,7 @@ class FakeHost:
         self.answers: list[tuple[str, str]] = []
         self.resume_session_override: str | None = None
         self.busy_polls: dict[str, int] = {}
+        self.attach_survives_respawn = False
 
     # -- setup helpers -----------------------------------------------------
     def add_proc(self, pid, argv, children=()):
@@ -162,6 +169,8 @@ class FakeHost:
         return self.t
 
     def run(self, argv):
+        if argv[1:2] == ["respawn"]:
+            return self._claude_respawn(argv[2])
         assert argv[0] == "tmux", argv
         self.calls.append(argv[1:])
         cmd, args = argv[1], argv[2:]
@@ -210,6 +219,10 @@ class FakeHost:
         self.next_pid += 1
         pid = self.next_pid
         self.add_proc(pid, argv)
+        if "attach" in argv:
+            self.add_proc(pid, argv)
+            pane.update(claude=pid, command="claude", screen=STATUS, launched=argv)
+            return
         sid = self.resume_session_override or argv[argv.index("--resume") + 1]
         self.register(pid, sid, cwd=cwd)
         pane.update(claude=pid, command="claude", screen=STATUS, launched=argv)
@@ -248,6 +261,31 @@ class FakeHost:
         if keys == ["C-c", "C-c"] and pane.get("bg") and not self.files.get(
                 f"/proc/{pane['bg']}/cmdline"):
             self._exit_claude(pane)
+
+    def _claude_respawn(self, job):
+        """`claude respawn <job>`: new background pid, same session; the attach
+        client exits unless ``attach_survives_respawn`` is set."""
+        self.calls.append(["claude-respawn", job])
+        for rpid, raw in list(self.files.items()):
+            if not rpid.startswith(REG + "/") or not rpid.endswith(".json"):
+                continue
+            data = json.loads(raw)
+            if data.get("jobId") != job:
+                continue
+            self.remove_proc(data["pid"])
+            self.next_pid += 1
+            # As seen live: the worker rewrites argv[0] to "claude bg-spare".
+            self.add_proc(self.next_pid, ["claude bg-spare", "--bg-spare", "/tmp/y.sock"])
+            self.register(self.next_pid, data["sessionId"], kind="bg", jobId=job)
+            for pane in self.panes.values():
+                if pane.get("bg") == data["pid"]:
+                    pane["bg"] = self.next_pid
+                    if not self.attach_survives_respawn:
+                        assert pane["remain"], "pane would have closed: remain-on-exit not set"
+                        self.remove_proc(pane["claude"])
+                        pane["dead"], pane["screen"] = True, "Pane is dead\n"
+            return 0, f"respawned {job}\n"
+        return 1, ""
 
     def sends(self, target):
         return [c for c in self.calls if c[0] == "send-keys" and target in c]
@@ -431,7 +469,7 @@ class TestRestartTraps:
         assert host.answers == []
 
     @pytest.mark.parametrize("screen", [REAL_KEEP_DIALOG, REAL_STOP_TASKS_DIALOG,
-                                        REAL_TRUST_DIALOG])
+                                        REAL_TRUST_DIALOG, REAL_PERMISSION_PROMPT])
     def test_refuses_real_enter_to_confirm_dialogs(self, host, screen):
         # Enter in an open dialog confirms the highlighted option (possibly
         # "Remove worktree"), so nothing may be typed into such a pane.
@@ -461,6 +499,17 @@ class TestRestartTraps:
         screen = ("● Options:\n  2. Keep using the worktree\n" + REAL_STOP_TASKS_DIALOG)
         assert sess.choose_dialog_answer(screen) == 1
 
+    def test_registry_waiting_status_is_a_dialog(self, host):
+        # A permission prompt sets the registry status to "waiting".
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid", status="waiting")
+        assert sess.list_sessions(host)[0].state == "dialog"
+        r = restarter(host).restart("a:0.0", nudge=None)
+        assert r.status == "SKIPPED" and host.sends("a:0.0") == []
+
+    def test_permission_prompt_is_never_answered(self):
+        with pytest.raises(sess.SessionError, match="unknown dialog"):
+            sess.choose_dialog_answer(REAL_PERMISSION_PROMPT)
+
     def test_trust_dialog_is_never_answered(self):
         with pytest.raises(sess.SessionError, match="unknown dialog"):
             sess.choose_dialog_answer(REAL_TRUST_DIALOG)
@@ -482,13 +531,40 @@ class TestRestartTraps:
         (msg,) = host.panes["a:0.0"]["received"]
         assert msg == sess.DEFAULT_NUDGE and "scheduled loops" in msg
 
-    def test_background_session_sigterm_and_double_ctrl_c_in_one_call(self, host):
+    def test_background_session_uses_claude_respawn_and_reattaches(self, host):
+        # Killing the background process does not restart it cleanly (the
+        # daemon brings it back and the attach view stays open), so the
+        # supported `claude respawn <job>` is used and the pane re-attached.
+        host.add_attach_pane("bg:0.0", 400, 401, "cbf58c04-aaaa")
+        r = restarter(host).restart("bg:0.0", nudge="hi")
+        assert r.status == "OK", r.message
+        assert ["claude-respawn", "cbf58c04"] in host.calls
+        assert host.killed == []
+        assert (r.old_pid, r.new_pid) == (401, host.panes["bg:0.0"]["bg"]) and r.new_pid != 401
+        assert host.panes["bg:0.0"]["launched"] == [CLAUDE, "attach", "cbf58c04"]
+        assert host.panes["bg:0.0"]["remain"] is False
+        assert host.panes["bg:0.0"]["received"] == ["hi"]
+
+    def test_background_session_attach_client_survives_respawn(self, host):
+        host.attach_survives_respawn = True
         host.add_attach_pane("bg:0.0", 400, 401, "cbf58c04-aaaa")
         r = restarter(host).restart("bg:0.0", nudge=None)
         assert r.status == "OK", r.message
-        assert host.killed == [401]
-        assert ["send-keys", "-t", "bg:0.0", "C-c", "C-c"] in host.calls
-        assert host.panes["bg:0.0"]["launched"] == [CLAUDE, "--resume", "cbf58c04-aaaa"]
+        assert not [c for c in host.calls if c[0] == "respawn-pane"]
+        assert host.panes["bg:0.0"]["remain"] is False
+
+    def test_background_session_waits_until_idle(self, host):
+        host.add_attach_pane("bg:0.0", 400, 401, "cbf58c04-aaaa")
+        host.panes["bg:0.0"]["screen"] = WORKING
+        r = restarter(host, timeout=5).restart("bg:0.0", nudge=None)
+        assert r.status == "FAILED" and "idle" in r.message
+        assert not [c for c in host.calls if c[0] == "claude-respawn"]
+
+    def test_background_session_refuses_model_change(self, host):
+        host.add_attach_pane("bg:0.0", 400, 401, "cbf58c04-aaaa")
+        r = restarter(host).restart("bg:0.0", model="opus", nudge=None)
+        assert r.status == "FAILED" and "--model" in r.message
+        assert not [c for c in host.calls if c[0] == "claude-respawn"]
 
     def test_direct_pane_uses_remain_on_exit_and_respawn(self, host):
         host.add_direct_pane("d:0.0", 700, AGENT_ARGV, "sid-d")
@@ -569,6 +645,28 @@ class TestRestartCli:
         assert call[2].startswith("sleep 3; ")
         assert "session restart %0 --model opus" in call[2]
         assert host.sends("%0") == [] and host.sends("me:0.0") == []
+
+    def test_self_finds_pane_of_background_session_without_tmux_pane(self, host):
+        host.add_attach_pane("bg:0.0", 400, 401, "cbf58c04-aaaa")
+        host.files["/proc/900/status"] = "Name:\tpython3\nPPid:\t899\n"
+        host.files["/proc/899/status"] = "Name:\tbash\nPPid:\t401\n"
+        host.files["/proc/401/status"] = "Name:\tclaude\nPPid:\t1\n"
+        assert sess.own_pane(host, pid=900) == host.panes["bg:0.0"]["pane_id"]
+
+    def test_own_pane_of_shell_pane(self, host):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "s1")
+        host.add_shell_pane("b:0.0", 201, [CLAUDE], "s2")
+        host.files["/proc/900/status"] = "PPid:\t201\n"
+        host.files["/proc/201/status"] = "PPid:\t200\n"
+        assert sess.own_pane(host, pid=900) == host.panes["b:0.0"]["pane_id"]
+        assert sess.own_pane(host, pid=12345) is None
+
+    def test_self_helper_runs_the_callers_package(self):
+        cmd = sess.self_restart_command("/usr/bin/python3", "%3", delay=5, extra=[])
+        parent = str(sess.Path(sess.__file__).resolve().parent.parent)
+        assert cmd.startswith("sleep 5; env ")
+        assert shlex.split(cmd.split("; ", 1)[1])[:3] == ["env", f"PYTHONPATH={parent}",
+                                                         "/usr/bin/python3"]
 
     def test_self_outside_tmux_is_usage_error(self, host):
         assert _invoke(host, ["--self"], env={"TMUX_PANE": ""}).exit_code == 2

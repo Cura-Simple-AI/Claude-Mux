@@ -11,9 +11,9 @@ Pane modes:
              would close on exit, so remain-on-exit is set first and the
              session is relaunched with ``tmux respawn-pane``.
 
-Attached panes run ``claude attach <job>`` for a background session. The
-background process gets SIGTERM, and the overview is closed with two Ctrl-C
-sent in ONE send-keys call.
+Attached panes run ``claude attach <job>`` for a background session. Those are
+restarted with ``claude respawn <job>`` and the pane is re-attached if the
+attach client exited.
 """
 from __future__ import annotations
 
@@ -56,12 +56,14 @@ _SESSION_FLAGS = {
     "--fork-session": False, "--continue": False, "-c": False,
 }
 
-#: Footer of a selection dialog. Claude Code uses both wordings (the exit
-#: dialogs and the trust dialog say "Enter to confirm").
-DIALOG_RE = re.compile(r"Enter to (?:select|confirm)")
+#: Footer of a dialog. Exit and trust dialogs say "Enter to confirm", older
+#: selection lists "Enter to select"; permission prompts have no Enter hint
+#: at all ("Esc to cancel · Tab to amend").
+DIALOG_RE = re.compile(r"Enter to (?:select|confirm)|Esc to cancel|Do you want to proceed\?")
 _RULE_RE = re.compile(r"^\s*[─━═▔▁-]{10,}\s*$")
 _WORKING_RE = re.compile(r"esc to interrupt", re.IGNORECASE)
-_STATUS_LINE_RE = re.compile(r"ctx \d+%|⏵⏵|\? for shortcuts|bypass permissions")
+_STATUS_LINE_RE = re.compile(
+    r"ctx \d+%|⏵⏵|⏸|\? for shortcuts|bypass permissions|(?:manual|plan) mode on|for agents")
 _CTX_RE = re.compile(r"ctx (\d+)%")
 _MODEL_RE = re.compile(r"\b((?:Opus|Sonnet|Haiku|Fable) \d+(?:\.\d+)?)\b")
 _OPTION_RE = re.compile(r"^\s*[❯>]?\s*(\d+)[.)]\s+(.*\S)\s*$")
@@ -222,6 +224,14 @@ def proc_argv(host: LocalHost, pid: int) -> list[str] | None:
     return [a for a in raw.split("\0") if a]
 
 
+def proc_ppid(host: LocalHost, pid: int) -> int | None:
+    for line in (host.read_text(f"/proc/{pid}/status") or "").splitlines():
+        if line.startswith("PPid:"):
+            value = line.split(":", 1)[1].strip()
+            return int(value) if value.isdigit() else None
+    return None
+
+
 def proc_children(host: LocalHost, pid: int) -> list[int]:
     raw = host.read_text(f"/proc/{pid}/task/{pid}/children") or ""
     return [int(x) for x in raw.split() if x.isdigit()]
@@ -231,7 +241,8 @@ def is_claude(argv: list[str] | None) -> bool:
     if not argv:
         return False
     base = os.path.basename(argv[0])
-    if base in ("claude", "claude.exe"):
+    # Background workers rewrite their title: argv[0] is "claude bg-spare".
+    if base in ("claude", "claude.exe") or base.split(" ", 1)[0] in ("claude", "claude.exe"):
         return True
     return base == "node" and len(argv) > 1 and "claude-code" in argv[1]
 
@@ -300,7 +311,8 @@ def dialog_region(screen: str) -> str:
 
 def pane_state(screen: str, registry_status: str | None) -> str:
     """Return ``dialog``, ``working`` or ``idle``."""
-    if has_dialog(screen):
+    # The registry reports "waiting" while a permission prompt is open.
+    if has_dialog(screen) or registry_status == "waiting":
         return "dialog"
     if registry_status == "busy" or _WORKING_RE.search(screen):
         return "working"
@@ -389,6 +401,30 @@ def list_sessions(host: LocalHost, tmux: Tmux | None = None,
         if info:
             out.append(info)
     return out
+
+
+def own_pane(host: LocalHost, tmux: Tmux | None = None, pid: int | None = None,
+             sessions_dir: str | None = None) -> str | None:
+    """Pane id of the Claude session this process runs under, if any.
+
+    Walks up the process tree to the Claude process. This also works for
+    background sessions: they run under a daemon, have no ``$TMUX_PANE`` and
+    are shown in a pane by ``claude attach``.
+    """
+    ancestors: set[int] = set()
+    current = pid or os.getpid()
+    for _ in range(64):
+        parent = proc_ppid(host, current)
+        if not parent or parent <= 1 or parent in ancestors:
+            break
+        ancestors.add(parent)
+        current = parent
+    if not ancestors:
+        return None
+    for s in list_sessions(host, tmux, sessions_dir):
+        if s.claude_pid in ancestors or (s.session_pid or -1) in ancestors:
+            return s.pane_id
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -575,14 +611,35 @@ class Restarter:
             return False
         self._wait(exited, "Claude Code to exit")
 
-    def _exit_attached(self, info: SessionInfo) -> None:
-        if info.session_pid:
-            self.host.kill(info.session_pid, signal.SIGTERM)
-            self._wait(lambda: not self._alive(info.session_pid),
-                       "the background session to stop", timeout=30)
-        # Two quick Ctrl-C in ONE send-keys call; otherwise the overview stays open.
-        self.tmux.send_keys(info.target, "C-c", "C-c")
-        self._wait(lambda: self._exited(info), "the session overview to close", timeout=30)
+    def _respawn_attached(self, info: SessionInfo) -> int:
+        """Restart a background session with ``claude respawn <job>``.
+
+        Killing the background process does not work: the daemon starts it
+        again at once and the attach view stays open. ``claude respawn``
+        resumes the same conversation; the ``claude attach`` client in the pane
+        may exit, so remain-on-exit is set and the pane is re-attached.
+        """
+        job = (_claude_args(info.argv)[1:2] or [""])[0]
+        if not job:
+            raise SessionError("cannot tell the background job id from `claude attach`")
+        self.tmux.set_remain_on_exit(info.target, True)
+        rc, _ = self.host.run([info.argv[0], "respawn", job])
+        if rc != 0:
+            raise SessionError(f"claude respawn {job} failed (exit {rc})")
+
+        def respawned():
+            for rpid, data in self._registry().items():
+                if (data.get("sessionId") == info.session_id and rpid != info.session_pid
+                        and self._alive(rpid)):
+                    return rpid
+            return None
+        new_pid = self._wait(respawned, "the background session to come back")
+        if self.tmux.pane(info.target)["dead"]:
+            self.tmux.respawn(info.target, info.cwd or self.host.home(), shlex.join(info.argv))
+        self.tmux.set_remain_on_exit(info.target, False)
+        self._wait(lambda: _STATUS_LINE_RE.search(self.tmux.capture(info.target)),
+                   "the re-attached session (status line)")
+        return new_pid
 
     def _relaunch(self, info: SessionInfo, argv: list[str]) -> None:
         command = shlex.join(argv)
@@ -621,7 +678,11 @@ class Restarter:
         info = None
         try:
             info = self.inspect(target)
-            result.session_id, result.old_pid = info.session_id, info.claude_pid
+            result.session_id = info.session_id
+            result.old_pid = info.session_pid if info.attached else info.claude_pid
+            if info.attached and model:
+                raise SessionError("--model is not supported for background sessions "
+                                   "(claude respawn keeps the session's settings)")
             original = None if info.attached else _flag_value(_claude_args(info.argv), "--model")
             model, warning = resolve_model(model or original, aliases)
             if warning:
@@ -632,19 +693,18 @@ class Restarter:
                 return result
             if force:
                 self.tmux.send_keys(info.target, "Escape")
-            elif not info.attached:
-                self._wait_idle(info)
-            base = [info.argv[0]] if info.attached else info.argv
-            argv = build_relaunch_argv(base, info.session_id, model,
-                                       drop_worktree=info.mode == "direct")
-            if info.mode == "direct":
-                self.tmux.set_remain_on_exit(info.target, True)
-            if info.attached:
-                self._exit_attached(info)
             else:
+                self._wait_idle(info)
+            if info.attached:
+                result.new_pid = self._respawn_attached(info)
+            else:
+                argv = build_relaunch_argv(info.argv, info.session_id, model,
+                                           drop_worktree=info.mode == "direct")
+                if info.mode == "direct":
+                    self.tmux.set_remain_on_exit(info.target, True)
                 self._exit_interactive(info)
-            self._relaunch(info, argv)
-            result.new_pid = self._verify(info)
+                self._relaunch(info, argv)
+                result.new_pid = self._verify(info)
             if nudge:
                 self._nudge(info, nudge)
             result.status = "OK"
@@ -668,6 +728,12 @@ class Restarter:
 
 
 def self_restart_command(python: str, target: str, *, delay: float, extra: list[str]) -> str:
-    """Shell command run by the detached helper for ``restart --self``."""
-    inner = shlex.join([python, "-m", "claude_mux", "session", "restart", target, *extra])
+    """Shell command run by the detached helper for ``restart --self``.
+
+    The helper runs from the tmux server's directory, so the package location
+    is put on PYTHONPATH: the helper runs the same claude_mux as the caller.
+    """
+    package_parent = str(Path(__file__).resolve().parent.parent)
+    inner = shlex.join(["env", f"PYTHONPATH={package_parent}", python, "-m", "claude_mux",
+                        "session", "restart", target, *extra])
     return f"sleep {float(delay):g}; {inner}"
