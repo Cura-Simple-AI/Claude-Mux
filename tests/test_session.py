@@ -126,6 +126,9 @@ class FakeHost:
         self.respawn_argvs: list[list[str]] = []
         self.respawn_rc = 0
         self.after_exit: dict[str, object] = {}
+        #: captures that still show the old screen after text is typed or
+        #: erased (Claude Code renders typed text only after ~75 ms)
+        self.render_delay = 0
 
     # -- setup helpers -----------------------------------------------------
     def add_proc(self, pid, argv, children=()):
@@ -254,7 +257,8 @@ class FakeHost:
     @staticmethod
     def _fmt(p):
         return sess._FMT_SEP.join([p["target"], p["pane_id"], str(p["pane_pid"]), p["command"],
-                          p["path"], "1" if p["dead"] else "0"])
+                          p["path"], "1" if p["dead"] else "0",
+                          "1" if p.get("in_mode") else "0"])
 
     def _exit_claude(self, pane):
         hook = self.after_exit.pop(pane["target"], None)
@@ -286,6 +290,19 @@ class FakeHost:
 
     def _send(self, pane, keys):
         t = pane["target"]
+        if keys[:2] == ["-X", "cancel"]:
+            pane["in_mode"] = False
+            return
+        if pane.get("in_mode"):
+            # copy/view mode: the keys are mode commands, Claude Code never sees them
+            pane.setdefault("mode_keys", []).append(keys)
+            return
+        edits = keys[0] == "-l" or keys == ["C-u"] or keys[2:] == ["BSpace"]
+        if edits and self.render_delay and not (keys[0] == "-l" and keys[1].isdigit()
+                                                and sess.has_dialog(pane["screen"])):
+            if not pane.get("stale"):
+                pane["stale"] = [0, self._render_now(pane)]
+            pane["stale"][0] = self.render_delay
         if keys[0] == "-l":
             text = keys[1]
             if sess.has_dialog(pane["screen"]) and text.isdigit():
@@ -342,7 +359,17 @@ class FakeHost:
             self._exit_claude(pane)
 
     def render(self, pane):
-        """The pane as captured: draft and typed text shown in the prompt line."""
+        """The pane as captured; for ``render_delay`` captures after an edit, the old screen."""
+        stale = pane.get("stale")
+        if stale:
+            stale[0] -= 1
+            if stale[0] <= 0:
+                pane.pop("stale")
+            return stale[1]
+        return self._render_now(pane)
+
+    def _render_now(self, pane):
+        """Draft and typed text shown in the prompt line."""
         line = pane.get("draft", "") + pane.get("typed", "")
         if line and pane["command"] == "claude":
             return pane["screen"].replace("\n❯ \n", "\n❯ " + line.replace("\n", "\n  ") + "\n", 1)
@@ -971,6 +998,9 @@ class TestDraftAndRechecks:
         assert r.status == "FAILED" and "prompt line changed" in r.message
         assert not [c for c in host.sends("a:0.0") if c[-1] == "Enter"]
         assert "received" not in host.panes["a:0.0"]
+        # Only the text the tool typed is removed; the other text stays.
+        assert host.panes["a:0.0"]["draft"] == "user "
+        assert host.panes["a:0.0"].get("typed", "") == ""
 
     def test_dialog_after_force_escape_is_rechecked(self, host):
         host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid", screen=WORKING)
@@ -989,9 +1019,129 @@ class TestDraftAndRechecks:
             pane["on_type"] = lambda p: p.update(screen=REAL_PERMISSION_PROMPT)
         host._launch = launch
         result = r.restart("a:0.0", nudge="hi")
-        assert result.status == "FAILED" and "Enter not sent" in result.message
+        # The restart itself succeeded: only the nudge was not sent.
+        assert result.status == "SKIPPED" and "Enter not sent" in result.message
+        assert "pid 101 ->" in result.message
         assert "received" not in host.panes["a:0.0"]
 
+
+
+def _never_render_after_launch(host):
+    real_launch = host._launch
+
+    def launch(pane, argv, cwd):
+        real_launch(pane, argv, cwd)
+        host.render_delay = 10 ** 6
+    host._launch = launch
+
+
+class TestLateRendering:
+    """Claude Code renders typed text ~75 ms after send-keys (measured live:
+    '' at 0/25/50 ms, '/exit' at 75 ms). A capture right after typing sees
+    the old prompt line."""
+
+    @pytest.mark.parametrize("delay", [1, 3])
+    def test_exit_and_nudge_rendered_late_are_submitted(self, host, delay):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid")
+        host.render_delay = delay
+        r = restarter(host).restart("a:0.0", nudge="hi")
+        assert r.status == "OK", r.message
+        assert host.panes["a:0.0"]["claude"] != 101
+        assert host.panes["a:0.0"]["received"] == ["hi"]
+
+    def test_direct_pane_exit_rendered_late(self, host):
+        host.add_direct_pane("d:0.0", 700, [CLAUDE], "sid-d")
+        host.render_delay = 2
+        r = restarter(host).restart("d:0.0", nudge=None)
+        assert r.status == "OK", r.message
+
+    def test_exit_never_rendered_is_removed_and_fails(self, host):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid")
+        host.render_delay = 10 ** 6
+        r = restarter(host).restart("a:0.0", nudge=None)
+        assert r.status == "FAILED" and "Enter not sent" in r.message
+        assert "/exit" in r.message
+        sends = host.sends("a:0.0")
+        assert not [c for c in sends if c[-1] == "Enter"]
+        assert sends[-1][-3:] == ["-N", "5", "BSpace"]
+        assert host.panes["a:0.0"].get("typed", "") == ""
+        assert host.panes["a:0.0"]["claude"] == 101
+        # Polled for a bounded time, not the restart timeout.
+        assert host.t <= sess.Restarter.RENDER_TIMEOUT + 1
+
+    def test_no_backspace_when_the_prompt_box_is_gone(self, host):
+        # Without a prompt line the keys could reach a shell: never erase blind.
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid")
+        host.panes["a:0.0"]["on_type"] = lambda p: p.update(screen="user@host:/work$ ")
+        r = restarter(host).restart("a:0.0", nudge=None)
+        assert r.status == "FAILED" and "Enter not sent" in r.message
+        assert [c[-1] for c in host.sends("a:0.0")] == ["/exit"]
+
+    def test_nudge_never_rendered_after_successful_restart_is_skipped(self, host):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid")
+        _never_render_after_launch(host)
+        r = restarter(host).restart("a:0.0", nudge="hi")
+        assert r.status == "SKIPPED", r.message
+        assert "pid 101 ->" in r.message and "nudge" in r.message
+        assert host.panes["a:0.0"]["claude"] != 101
+        assert "received" not in host.panes["a:0.0"]
+        assert host.panes["a:0.0"].get("typed", "") == ""
+
+    def test_nudge_timeout_exit_code_is_skipped_not_failed(self, host):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid")
+        _never_render_after_launch(host)
+        r = _invoke(host, ["a:0.0", "--nudge", "hi"])
+        assert r.exit_code == 4, r.output
+        assert r.output.splitlines()[-1].startswith("SKIPPED")
+
+    @pytest.mark.parametrize("draft", ["half a thought", "line one\nline two"])
+    def test_force_clear_rendered_late(self, host, draft):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid")
+        host.panes["a:0.0"]["draft"] = draft
+        host.render_delay = 2
+        r = restarter(host).restart("a:0.0", force=True, nudge="hi")
+        assert r.status == "OK", r.message
+        assert host.panes["a:0.0"]["received"] == ["hi"]
+
+    def test_force_clear_single_line_needs_no_backspace(self, host):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid")
+        host.panes["a:0.0"]["draft"] = "half a thought"
+        host.render_delay = 2
+        r = restarter(host).restart("a:0.0", force=True, nudge=None)
+        assert r.status == "OK", r.message
+        assert not [c for c in host.sends("a:0.0") if c[-1] == "BSpace"]
+
+
+class TestCopyMode:
+    def test_pane_in_copy_mode_is_skipped_before_typing(self, host):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid")
+        host.panes["a:0.0"]["in_mode"] = True
+        r = restarter(host).restart("a:0.0", nudge=None)
+        assert r.status == "SKIPPED" and "copy/view mode" in r.message
+        assert host.sends("a:0.0") == []
+        assert host.panes["a:0.0"]["claude"] == 101
+
+    def test_force_leaves_copy_mode_first(self, host):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid", screen=WORKING)
+        host.busy_polls["a:0.0"] = 0
+        host.panes["a:0.0"]["in_mode"] = True
+        r = restarter(host).restart("a:0.0", nudge=None, force=True)
+        assert r.status == "OK", r.message
+        assert host.sends("a:0.0")[0][-2:] == ["-X", "cancel"]
+        assert "mode_keys" not in host.panes["a:0.0"]
+
+    def test_copy_mode_before_nudge_skips_the_nudge(self, host):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid")
+        real_launch = host._launch
+
+        def launch(pane, argv, cwd):
+            real_launch(pane, argv, cwd)
+            pane["in_mode"] = True
+        host._launch = launch
+        r = restarter(host).restart("a:0.0", nudge="hi")
+        assert r.status == "SKIPPED" and "copy/view mode" in r.message
+        assert "pid 101 ->" in r.message
+        assert "mode_keys" not in host.panes["a:0.0"]
 
 class TestRecoveryLog:
     def _events(self, host):
@@ -1125,6 +1275,26 @@ class TestRestartCli:
         (call,) = [c for c in host.calls if c[0] == "run-shell"]
         assert re.sub("##", "", call[2]).count("#") == 0
         assert shlex.quote(nudge) in call[2].replace("##", "#")
+
+    def test_self_run_shell_command_always_exits_zero(self, host):
+        # run-shell -b puts the pane in view-mode when its command exits
+        # non-zero; the helper's status is in the log instead.
+        host.add_shell_pane("me:0.0", 101, [CLAUDE], "s1")
+        r = _invoke(host, ["--self"], env={"TMUX_PANE": "%0"})
+        assert r.exit_code == 0, r.output
+        (call,) = [c for c in host.calls if c[0] == "run-shell"]
+        assert call[2].endswith("; exit 0")
+
+    @pytest.mark.parametrize("rc", [1, 4])
+    def test_self_helper_exits_zero_and_logs_failure(self, tmp_path, rc):
+        fake_python = tmp_path / "python"
+        fake_python.write_text(f'#!/bin/sh\necho "FAILED   %3  boom"\nexit {rc}\n')
+        fake_python.chmod(0o755)
+        log = tmp_path / "restart.log"
+        cmd = sess.self_restart_command(str(fake_python), "%3", delay=0, extra=[], log=str(log))
+        done = subprocess.run(["/bin/sh", "-c", cmd], env={"PATH": "/usr/bin:/bin"})
+        assert done.returncode == 0
+        assert "FAILED   %3  boom" in log.read_text()
 
     def test_self_outside_tmux_is_usage_error(self, host):
         assert _invoke(host, ["--self"], env={"TMUX_PANE": ""}).exit_code == 2

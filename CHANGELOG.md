@@ -20,6 +20,17 @@ Format: [Semantic Versioning](https://semver.org/). Dates in ISO 8601.
   panes (it would create a new worktree); the session resumes in its existing worktree cwd.
 
 ### Fixed
+- `session restart`: Enter is sent only after the prompt line shows the typed `/exit` or nudge.
+  Claude Code renders typed text ~75 ms after `send-keys`, and the immediate re-check failed
+  every restart of an idle session, leaving `/exit` in the prompt line. The prompt line is now
+  polled for up to 3 s; on timeout the typed text is removed again and the restart fails. The
+  `--force` clear of a draft is polled the same way.
+- `session restart`: a nudge that cannot be sent after a successful restart (including a dialog
+  or a timeout while typing it) gives `SKIPPED` (exit 4) with the new pid, not `FAILED`.
+- `session restart`: a pane in tmux copy or view mode is `SKIPPED` before anything is typed
+  (keys would reach tmux, not Claude Code); `--force` leaves the mode first.
+- `session restart --self`: the helper command always exits 0 (its result is in the log), so
+  `tmux run-shell -b` no longer leaves the pane in view mode after a failed or skipped restart.
 - `session restart`: complete option arity for Claude Code, including hidden boolean
   (`--plan-mode-required`, `--init`, `-d2e`, …), variadic (`--channels`) and optional-value
   (`--rc`, `--remote`, `--project`) options. Unknown options never consume an argument that

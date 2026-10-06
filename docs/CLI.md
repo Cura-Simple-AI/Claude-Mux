@@ -422,7 +422,7 @@ claude-mux session restart --all --match '^agent-'     # one at a time
 | `--profile NAME` | Run `activate NAME` before restarting. Host only: refused with `--container`, because `activate` writes the host's config, which the container never sees |
 | `--nudge TEXT` | Message sent after resume. Default asks the agent to recreate its scheduled loops |
 | `--no-nudge` | Send no message after resume |
-| `--force` | Do not wait for idle; send Escape first, and clear unsent text in the prompt line. Open dialogs are still refused |
+| `--force` | Do not wait for idle; send Escape first, leave tmux copy/view mode, and clear unsent text in the prompt line. Open dialogs are still refused |
 | `--timeout SEC` | Seconds to wait for each step (default 300) |
 | `--self` | Restart the calling session's pane via a detached helper (`tmux run-shell -b`; `#` is escaped so tmux formats in `--nudge` are not expanded). The helper runs the caller's claude_mux, prepended to `PYTHONPATH`. Not with `--container` |
 | `--delay SEC` | With `--self`: seconds before the helper starts (default 5) |
@@ -436,27 +436,34 @@ claude-mux session restart --all --match '^agent-'     # one at a time
 
 1. **Refuse if a dialog is open.** Text typed into a selection dialog picks an answer, so a pane
    in the `dialog` state (see above) is reported as `SKIPPED` — even with `--force`.
-2. **Wait until idle** (unless `--force`, which sends Escape first).
-3. **Refuse if the prompt line holds unsent text.** Whatever is typed is appended to it, and Enter
+2. **Refuse if the pane is in tmux copy or view mode** (`#{pane_in_mode}`, e.g. after scrolling
+   with the mouse): keys would go to tmux, not to Claude Code, while `capture-pane` still shows
+   the screen below. Reported as `SKIPPED`; `--force` leaves the mode first
+   (`send-keys -X cancel`). Checked again before every text that is typed.
+3. **Wait until idle** (unless `--force`, which sends Escape first).
+4. **Refuse if the prompt line holds unsent text.** Whatever is typed is appended to it, and Enter
    would send the user's draft together with `/exit` as an ordinary message. Such a pane is
    reported as `SKIPPED`; with `--force` the line is cleared first (`C-u`, then backspaces) and
-   checked again. Placeholder text and prompt suggestions (rendered dim) do not count.
-4. **Log the relaunch command** (to stderr, or the `--self` log file) before anything is sent, so
+   polled until it is empty. Placeholder text and prompt suggestions (rendered dim) do not count.
+5. **Log the relaunch command** (to stderr, or the `--self` log file) before anything is sent, so
    the session can be relaunched by hand if the restart is interrupted.
-5. **Exit.** `/exit` is typed, then Enter is sent in a *separate* `send-keys` call. Immediately
-   before typing, the pane is captured again and checked for a dialog and an empty prompt line;
-   before Enter it is captured once more, and Enter is only sent when no dialog is open and the
-   prompt line shows exactly the typed text. Exit dialogs:
+6. **Exit.** `/exit` is typed, then Enter is sent in a *separate* `send-keys` call. Immediately
+   before typing, the pane is captured again and checked for a dialog and an empty prompt line.
+   Claude Code shows typed text only after a short delay (~75 ms measured), so the prompt line is
+   then polled every 50 ms for up to 3 s. Enter is sent only once the prompt line shows exactly
+   the typed text and no dialog is open. If a dialog appears, nothing more is sent. If the text
+   does not show up in time, the typed text is removed again with backspaces (only when the prompt
+   line still ends with, or is a prefix of, that text) and the restart fails. Exit dialogs:
    - worktree dialog → the option labelled **Keep**. An option labelled Remove is never chosen;
      if there is no Keep option the restart fails and the dialog is left untouched.
    - "Exit and stop tasks" → option 1.
    - any other dialog → the restart fails without answering.
-6. **Background sessions** (`claude attach`): restarted with `claude respawn <job>`, which
+7. **Background sessions** (`claude attach`): restarted with `claude respawn <job>`, which
    resumes the same conversation (killing the background process does not work — the daemon
    starts it again and the attach view stays open). `remain-on-exit` is set first; if the
-   `claude attach` client exits, the pane is re-attached with `tmux respawn-pane`. Steps 3, 5, 7
-   and 8 do not apply, and `--model` is refused because `claude respawn` keeps the session's settings.
-7. **Relaunch** with the original argv (`--agent`, `--worktree`, `--permission-mode`, `--model`, …)
+   `claude attach` client exits, the pane is re-attached with `tmux respawn-pane`. Steps 4, 6, 8
+   and 9 do not apply, and `--model` is refused because `claude respawn` keeps the session's settings.
+8. **Relaunch** with the original argv (`--agent`, `--worktree`, `--permission-mode`, `--model`, …)
    minus `--resume`, `--session-id`, `--fork-session` and `--continue`, plus `--resume <sessionId>`.
    A positional prompt from the original command line is dropped — with `--resume` it would be
    sent to the agent again as a new message. To tell option values from the prompt, the arity of
@@ -471,11 +478,12 @@ claude-mux session restart --all --match '^agent-'     # one at a time
    - Claude Code is the pane process itself: `remain-on-exit` is set before exit and the pane is
      relaunched with `tmux respawn-pane` in the session's cwd (`--worktree` is dropped because
      the cwd already is the worktree).
-8. **Verify:** a new pid, the same `sessionId` in the registry and a visible status line.
-9. **Nudge:** the text, then Enter in a separate call, with the same checks as for `/exit`.
+9. **Verify:** a new pid, the same `sessionId` in the registry and a visible status line.
+10. **Nudge:** the text, then Enter in a separate call, with the same checks as for `/exit`.
    Session-scoped cron jobs do not survive a resume, so the default nudge asks the agent to
-   recreate its scheduled loops. If the prompt line holds text by then, the nudge is not sent and
-   the result is `SKIPPED` (the session itself was restarted; the message says so).
+   recreate its scheduled loops. If the nudge cannot be sent safely — text in the prompt line,
+   copy/view mode, a dialog, or the typed text not shown in time — the result is `SKIPPED`, not
+   `FAILED`: the session itself was restarted, and the message says so (`pid a -> b, …; nudge: …`).
 
 Worktrees are never removed.
 
@@ -500,12 +508,21 @@ helper that sleeps `--delay` seconds and then runs `session restart <pane>` with
 options. The pane is found by walking up the process tree to the Claude process, which also works
 for background sessions shown through `claude attach` (they have no `$TMUX_PANE`); `$TMUX_PANE`
 is the fallback. The helper runs the same claude-mux package as the caller
-(log: `~/.claude-mux/session-restart.log`). End the turn right after calling it so the session
+(log: `~/.claude-mux/session-restart.log`). The helper command always exits 0 — its result is in
+the log — because `tmux run-shell -b` shows a non-zero exit status in view mode on the current
+pane, which would cover the restarted session. End the turn right after calling it so the session
 becomes idle.
 
 **`--all` output:** one line per session — `OK`, `SKIPPED` (dialog / own pane) or `FAILED`.
 
-Exit codes: `0` OK, `1` failed (any session with `--all`), `2` usage, `4` skipped (dialog open).
+Exit codes: `0` OK, `1` failed (any session with `--all`), `2` usage, `4` skipped (dialog open,
+draft, copy/view mode, or nudge not sent after a successful restart).
+
+**Known limitation.** A pane whose process is a non-interactive shell that waits for Claude Code
+(e.g. `tmux new-session 'cd dir && claude'`, i.e. `sh -c …`) is treated like a pane running an
+interactive shell. After `/exit` that shell ends and the pane closes, so the relaunch fails; the
+logged relaunch command can be used to start the session again in a new pane. Start sessions
+either directly (`tmux new-session claude …`) or from an interactive shell.
 
 ---
 

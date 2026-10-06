@@ -1374,8 +1374,8 @@ def cmd_session_restart(ctx, target, self_, all_, match, model, profile, nudge, 
         if force:
             extra.append("--force")
         log_file = CLAUDE_MUX_DIR / "session-restart.log"
-        cmd = sess.self_restart_command(sys.executable, pane, delay=delay, extra=extra)
-        cmd += f" >> {shlex_quote(str(log_file))} 2>&1"
+        cmd = sess.self_restart_command(sys.executable, pane, delay=delay, extra=extra,
+                                        log=str(log_file))
         try:
             sess.Tmux(host).run_shell_background(cmd)
         except sess.SessionError as exc:
@@ -1435,11 +1435,6 @@ def cmd_session_restart(ctx, target, self_, all_, match, model, profile, nudge, 
             click.echo(f"warning: {w}", err=True)
         click.echo(r.line())
     sys.exit({"OK": 0, "SKIPPED": 4, "FAILED": 1}[r.status])
-
-
-def shlex_quote(value: str) -> str:
-    import shlex
-    return shlex.quote(value)
 
 
 # ---------------------------------------------------------------------------

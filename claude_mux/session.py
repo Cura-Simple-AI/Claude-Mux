@@ -134,7 +134,7 @@ _OPTION_RE = re.compile(r"^\s*[❯>]?\s*(\d+)[.)]\s+(.*\S)\s*$")
 _FMT_SEP = "|~|"
 _PANE_FMT = _FMT_SEP.join([
     "#{session_name}:#{window_index}.#{pane_index}", "#{pane_id}", "#{pane_pid}",
-    "#{pane_current_command}", "#{pane_current_path}", "#{pane_dead}",
+    "#{pane_current_command}", "#{pane_current_path}", "#{pane_dead}", "#{pane_in_mode}",
 ])
 
 
@@ -249,11 +249,12 @@ class Tmux:
 
     @staticmethod
     def _parse(line: str) -> dict:
-        keys = ["target", "pane_id", "pane_pid", "command", "path", "dead"]
+        keys = ["target", "pane_id", "pane_pid", "command", "path", "dead", "in_mode"]
         parts = line.split(_FMT_SEP)
         d = dict(zip(keys, parts + [""] * (len(keys) - len(parts))))
         d["pane_pid"] = int(d["pane_pid"]) if d["pane_pid"].isdigit() else 0
         d["dead"] = d["dead"] == "1"
+        d["in_mode"] = d["in_mode"] == "1"
         return d
 
     def list_panes(self) -> list[dict]:
@@ -763,6 +764,11 @@ class RestartResult:
 class Restarter:
     """Restart one session safely. Every wait is polled with a timeout."""
 
+    #: Claude Code shows typed or erased text only after a short delay
+    #: (measured: ~75 ms), so the prompt line is polled before Enter.
+    RENDER_TIMEOUT = 3.0
+    RENDER_POLL = 0.05
+
     def __init__(self, host: LocalHost, tmux: Tmux | None = None, *,
                  sessions_dir: str | None = None, timeout: float = 300.0,
                  poll: float = 1.0, log=None):
@@ -815,9 +821,32 @@ class Restarter:
             raise _Skip(DIALOG_OPEN)
         return prompt_text(screen)
 
+    def _poll_prompt(self, info: SessionInfo, done) -> str | None:
+        """Capture the prompt line until ``done(text)`` or RENDER_TIMEOUT; return the last text."""
+        deadline = self.host.now() + self.RENDER_TIMEOUT
+        while True:
+            text = self._capture_prompt(info)
+            if done(text) or self.host.now() >= deadline:
+                return text
+            self.host.sleep(self.RENDER_POLL)
+
+    def _ensure_not_in_mode(self, info: SessionInfo, what: str, force: bool) -> None:
+        """In copy or view mode, keys go to tmux instead of Claude Code, while
+        ``capture-pane`` still shows the screen below. --force leaves the mode."""
+        if not self.tmux.pane(info.pane_id)["in_mode"]:
+            return
+        if force:
+            self.log(f"{info.pane_id}: leaving copy/view mode")
+            self.tmux.send_keys(info.pane_id, "-X", "cancel")
+            if not self.tmux.pane(info.pane_id)["in_mode"]:
+                return
+        raise _Skip(f"pane is in copy/view mode ({what} not sent"
+                    f"{'' if force else '; --force leaves the mode'})")
+
     def _ensure_empty_prompt(self, info: SessionInfo, what: str, force: bool) -> None:
         """Typing into a non-empty prompt would append to the user's draft and
         send both as one message. The draft is cleared only with --force."""
+        self._ensure_not_in_mode(info, what, force)
         text = self._capture_prompt(info)
         if text is None:
             raise _Skip(f"prompt line not found ({what} not sent)")
@@ -827,27 +856,45 @@ class Restarter:
             raise _Skip(f"unsent text in the prompt line ({what} not sent; --force clears it)")
         for _ in range(3):
             self.log(f"{info.pane_id}: clearing unsent text in the prompt line")
+            before = text
             self.tmux.send_keys(info.pane_id, "C-u")
-            text = self._capture_prompt(info)
+            # C-u clears only the current line of a multi-line draft: wait
+            # until the line is empty or has changed, not for a fixed time.
+            text = self._poll_prompt(info, lambda t: t != before)
             if text:
                 self.tmux.send_keys(info.pane_id, "-N", str(len(text)), "BSpace")
-                text = self._capture_prompt(info)
+                text = self._poll_prompt(info, lambda t: t == "")
             if text == "":
                 return
         raise _Skip(f"could not clear the prompt line ({what} not sent)")
 
     def _type_and_submit(self, info: SessionInfo, text: str, what: str, force: bool) -> None:
-        """Type ``text`` into an empty prompt, re-check, then Enter in a separate call."""
+        """Type ``text`` into an empty prompt; Enter only once the prompt line
+        shows exactly ``text`` and no dialog is open."""
         self._ensure_empty_prompt(info, what, force)
         self.tmux.send_literal(info.pane_id, text)
-        screen = self.tmux.capture(info.pane_id, styled=True)
-        if has_dialog(strip_ansi(screen)):
+        try:
+            shown = self._poll_prompt(info, lambda t: t is not None and _same_text(t, text))
+        except _Skip:
             # Enter would confirm the highlighted option of the dialog.
             raise SessionError(f"a dialog appeared while typing {what}; Enter not sent")
-        shown = prompt_text(screen)
-        if shown is None or not _same_text(shown, text):
-            raise SessionError(f"the prompt line changed while typing {what}; Enter not sent")
-        self.tmux.send_keys(info.pane_id, "Enter")
+        if shown is not None and _same_text(shown, text):
+            self.tmux.send_keys(info.pane_id, "Enter")
+            return
+        typed, seen = "".join(text.split()), "".join((shown or "").split())
+        # The keys are delivered in order, so backspaces remove exactly the
+        # typed text, as long as nothing was typed after it.
+        if shown is not None and (seen.endswith(typed) or typed.startswith(seen)):
+            self.tmux.send_keys(info.pane_id, "-N", str(len(text)), "BSpace")
+            removed = "; the typed text was removed"
+        else:
+            removed = ""
+        if shown and not typed.startswith(seen):
+            reason = f"the prompt line changed while typing {what}"
+        else:
+            reason = (f"the prompt line did not show the typed {what} "
+                      f"within {self.RENDER_TIMEOUT:g}s")
+        raise SessionError(f"{reason}; Enter not sent{removed}")
 
     def _exited(self, info: SessionInfo) -> bool:
         if self._alive(info.claude_pid):
@@ -963,6 +1010,9 @@ class Restarter:
             self.tmux.respawn(info.pane_id, info.cwd or self.host.home(), command)
             self._release_pane(info)
         else:
+            # Claude Code has exited: the command must reach the shell, so a
+            # copy/view mode entered meanwhile is left.
+            self._ensure_not_in_mode(info, "relaunch command", True)
             self.tmux.send_literal(info.pane_id, command)
             self.tmux.send_keys(info.pane_id, "Enter")
 
@@ -1007,6 +1057,7 @@ class Restarter:
             if info.state == "dialog":
                 # Pasting into a dialog would select an answer. Never do that.
                 raise _Skip(DIALOG_OPEN)
+            self._ensure_not_in_mode(info, "/exit", force)
             if force:
                 self.tmux.send_keys(info.pane_id, "Escape")
             else:
@@ -1034,8 +1085,9 @@ class Restarter:
             if nudge:
                 try:
                     self._nudge(info, nudge, force)
-                except _Skip as exc:
-                    result.status, result.message = "SKIPPED", f"{restarted}; {exc}"
+                except (_Skip, SessionError) as exc:
+                    # The session itself was restarted: not a failure.
+                    result.status, result.message = "SKIPPED", f"{restarted}; nudge: {exc}"
                     return result
             result.status, result.message = "OK", restarted
         except _Skip as exc:
@@ -1047,15 +1099,23 @@ class Restarter:
         return result
 
 
-def self_restart_command(python: str, target: str, *, delay: float, extra: list[str]) -> str:
+def self_restart_command(python: str, target: str, *, delay: float, extra: list[str],
+                         log: str | None = None) -> str:
     """Shell command (POSIX sh, as run by ``tmux run-shell``) for ``restart --self``.
 
     The helper runs from the tmux server's directory, so the package location
     is put in front of PYTHONPATH: the helper runs the same claude_mux as the
     caller. An existing PYTHONPATH is kept, since dependencies may be found
     only through it.
+
+    With ``log``, output is appended to it and the command always exits 0:
+    ``run-shell -b`` puts the current pane in view-mode to show a non-zero
+    exit status, which would cover the restarted session.
     """
     package_parent = str(Path(__file__).resolve().parent.parent)
     pythonpath = f'PYTHONPATH={shlex.quote(package_parent)}"${{PYTHONPATH:+:$PYTHONPATH}}"'
     inner = shlex.join([python, "-m", "claude_mux", "session", "restart", target, *extra])
-    return f"sleep {float(delay):g}; {pythonpath} {inner}"
+    command = f"sleep {float(delay):g}; {pythonpath} {inner}"
+    if log is not None:
+        command += f" >> {shlex.quote(log)} 2>&1; exit 0"
+    return command
