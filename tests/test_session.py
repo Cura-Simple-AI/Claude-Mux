@@ -900,6 +900,10 @@ class TestPromptLine:
     def test_no_prompt_box(self):
         assert sess.prompt_text("user@host:~$ \n") is None
 
+    def test_truncated_escape_sequences(self):
+        assert sess.strip_ansi("a\x1b") == "a"
+        assert sess.strip_ansi("\x1b]8;;http://x\x1b\\link\x1b[38;5;1mb") == "linkb"
+
     def test_same_text_accepts_wrapping_and_paste_markers(self):
         assert sess._same_text("/exit", "/exit")
         assert sess._same_text("Your session was\n restarted", "Your session was restarted")

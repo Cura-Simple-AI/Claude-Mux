@@ -432,9 +432,9 @@ def _styled_lines(screen: str) -> list[list[tuple[str, bool, bool]]]:
         ch = screen[i]
         if ch == "\x1b":
             m = _ESC_RE.match(screen, i)
-            if m.group(2) == "m":
+            if m and m.group(2) == "m":
                 dim, inverse = _apply_sgr(m.group(1), dim, inverse)
-            i = m.end()
+            i = m.end() if m else i + 1
             continue
         if ch == "\n":
             lines.append([])
