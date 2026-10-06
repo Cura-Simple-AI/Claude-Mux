@@ -133,8 +133,11 @@ class SessionError(Exception):
     """Raised when a restart step cannot be completed safely."""
 
 
-class _DialogVisible(Exception):
-    pass
+class _Skip(Exception):
+    """The pane is not in a state where typing is safe; nothing was typed."""
+
+
+DIALOG_OPEN = "dialog open (Enter to select/confirm)"
 
 
 # ---------------------------------------------------------------------------
@@ -254,8 +257,9 @@ class Tmux:
     def pane(self, target: str) -> dict:
         return self._parse(self._run("display-message", "-p", "-t", target, _PANE_FMT).strip())
 
-    def capture(self, target: str) -> str:
-        return self._run("capture-pane", "-p", "-t", target)
+    def capture(self, target: str, styled: bool = False) -> str:
+        """Pane contents; ``styled`` keeps the SGR escapes (``capture-pane -e``)."""
+        return self._run("capture-pane", "-p", *(["-e"] if styled else []), "-t", target)
 
     def send_literal(self, target: str, text: str) -> None:
         self._run("send-keys", "-t", target, "-l", text)
@@ -378,6 +382,94 @@ def dialog_region(screen: str) -> str:
             lines = lines[i + 1:]
             break
     return "\n".join(lines)
+
+
+#: Rules around the prompt box. The top rule may carry a title (``--name``).
+_BOX_RULE_RE = re.compile(r"^\s*[─━═]{2,}.*[─━═]{2,}\s*$")
+_ESC_RE = re.compile(r"\x1b(?:\[([0-9;:?]*)([@-~])|\][^\x07\x1b]*(?:\x07|\x1b\\)|[()][0-9A-Za-z]|.)",
+                     re.DOTALL)
+#: What Claude Code shows in the prompt instead of long or multi-line pasted text.
+_PASTE_MARKER_RE = re.compile(
+    r"\[(?:Pasted text #\d+(?: \+\d+ lines)?|\.\.\.Truncated text #\d+ \+\d+ lines\.\.\.)\]")
+
+
+def _apply_sgr(params: str, dim: bool, inverse: bool) -> tuple[bool, bool]:
+    parts = params.split(";") if params else [""]
+    i = 0
+    while i < len(parts):
+        p = parts[i].split(":")[0]
+        if p in ("", "0"):
+            dim = inverse = False
+        elif p == "2":
+            dim = True
+        elif p == "22":
+            dim = False
+        elif p == "7":
+            inverse = True
+        elif p == "27":
+            inverse = False
+        elif p in ("38", "48", "58") and ":" not in parts[i]:
+            i += {"5": 2, "2": 4}.get(parts[i + 1] if i + 1 < len(parts) else "", 0)
+        i += 1
+    return dim, inverse
+
+
+def _styled_lines(screen: str) -> list[list[tuple[str, bool, bool]]]:
+    """Lines of (character, dim, inverse) cells from ``capture-pane -e`` output."""
+    lines: list[list[tuple[str, bool, bool]]] = [[]]
+    dim = inverse = False
+    i = 0
+    while i < len(screen):
+        ch = screen[i]
+        if ch == "\x1b":
+            m = _ESC_RE.match(screen, i)
+            if m.group(2) == "m":
+                dim, inverse = _apply_sgr(m.group(1), dim, inverse)
+            i = m.end()
+            continue
+        if ch == "\n":
+            lines.append([])
+        else:
+            lines[-1].append((ch, dim, inverse))
+        i += 1
+    return lines
+
+
+def strip_ansi(screen: str) -> str:
+    return "\n".join("".join(c for c, _, _ in line) for line in _styled_lines(screen))
+
+
+def prompt_text(screen: str) -> str | None:
+    """Unsent text in Claude Code's prompt box, from a (styled) capture.
+
+    The prompt box is the ``❯`` line between the last two horizontal rules.
+    Returns "" when it is empty and None when there is no prompt box. A
+    placeholder or prompt suggestion is rendered dim (with the cursor on its
+    first character) and does not count as text.
+    """
+    lines = _styled_lines(screen)
+    plain = ["".join(c for c, _, _ in line) for line in lines]
+    rules = [i for i, t in enumerate(plain) if _RULE_RE.match(t) or _BOX_RULE_RE.match(t)]
+    if len(rules) < 2 or rules[-1] - rules[-2] < 2:
+        return None
+    top, bottom = rules[-2], rules[-1]
+    first = lines[top + 1]
+    k = next((j for j, (c, _, _) in enumerate(first) if not c.isspace()), None)
+    if k is None or first[k][0] not in "❯>":
+        return None
+    cells = first[k + 1:]
+    for line in lines[top + 2:bottom]:
+        cells = cells + [(" ", False, False)] + line
+    shown = [inverse for c, dim, inverse in cells if not dim and not c.isspace()]
+    if any(dim for _, dim, _ in cells) and len(shown) <= 1 and all(shown):
+        return ""
+    return " ".join("".join(c for c, dim, _ in cells if not dim).split())
+
+
+def _same_text(shown: str, typed: str) -> bool:
+    """Does the prompt line show exactly ``typed`` (wrapped, or collapsed as a paste)?"""
+    squash = "".join(shown.split())
+    return squash == "".join(typed.split()) or bool(_PASTE_MARKER_RE.fullmatch(shown.strip()))
 
 
 def pane_state(screen: str, registry_status: str | None) -> str:
@@ -703,9 +795,50 @@ class Restarter:
             status = self._registry().get(info.session_pid or -1, {}).get("status")
             state = pane_state(self.tmux.capture(info.pane_id), status)
             if state == "dialog":
-                raise _DialogVisible()
+                raise _Skip(DIALOG_OPEN)
             return state == "idle"
         self._wait(idle, "the session to become idle")
+
+    def _capture_prompt(self, info: SessionInfo) -> str | None:
+        """Fresh capture: raise _Skip on a dialog, else return the prompt text."""
+        screen = self.tmux.capture(info.pane_id, styled=True)
+        if has_dialog(strip_ansi(screen)):
+            raise _Skip(DIALOG_OPEN)
+        return prompt_text(screen)
+
+    def _ensure_empty_prompt(self, info: SessionInfo, what: str, force: bool) -> None:
+        """Typing into a non-empty prompt would append to the user's draft and
+        send both as one message. The draft is cleared only with --force."""
+        text = self._capture_prompt(info)
+        if text is None:
+            raise _Skip(f"prompt line not found ({what} not sent)")
+        if not text:
+            return
+        if not force:
+            raise _Skip(f"unsent text in the prompt line ({what} not sent; --force clears it)")
+        for _ in range(3):
+            self.log(f"{info.pane_id}: clearing unsent text in the prompt line")
+            self.tmux.send_keys(info.pane_id, "C-u")
+            text = self._capture_prompt(info)
+            if text:
+                self.tmux.send_keys(info.pane_id, "-N", str(len(text)), "BSpace")
+                text = self._capture_prompt(info)
+            if text == "":
+                return
+        raise _Skip(f"could not clear the prompt line ({what} not sent)")
+
+    def _type_and_submit(self, info: SessionInfo, text: str, what: str, force: bool) -> None:
+        """Type ``text`` into an empty prompt, re-check, then Enter in a separate call."""
+        self._ensure_empty_prompt(info, what, force)
+        self.tmux.send_literal(info.pane_id, text)
+        screen = self.tmux.capture(info.pane_id, styled=True)
+        if has_dialog(strip_ansi(screen)):
+            # Enter would confirm the highlighted option of the dialog.
+            raise SessionError(f"a dialog appeared while typing {what}; Enter not sent")
+        shown = prompt_text(screen)
+        if shown is None or not _same_text(shown, text):
+            raise SessionError(f"the prompt line changed while typing {what}; Enter not sent")
+        self.tmux.send_keys(info.pane_id, "Enter")
 
     def _exited(self, info: SessionInfo) -> bool:
         if self._alive(info.claude_pid):
@@ -713,10 +846,8 @@ class Restarter:
         pane = self.tmux.pane(info.pane_id)
         return pane["dead"] if info.mode == "direct" else pane["command"] in SHELLS
 
-    def _exit_interactive(self, info: SessionInfo) -> None:
-        # Text and Enter are sent in separate send-keys calls.
-        self.tmux.send_literal(info.pane_id, "/exit")
-        self.tmux.send_keys(info.pane_id, "Enter")
+    def _exit_interactive(self, info: SessionInfo, force: bool) -> None:
+        self._type_and_submit(info, "/exit", "/exit", force)
         seen: dict[str, int] = {}
 
         def exited():
@@ -767,7 +898,11 @@ class Restarter:
         if not job:
             raise SessionError("cannot tell the background job id from `claude attach`")
         self._hold_pane(info)
-        rc, _ = self.host.run([*claude_head(info.argv), "respawn", job])
+        respawn = [*claude_head(info.argv), "respawn", job]
+        self.log(f"{info.pane_id}: running {shlex.join(respawn)}; if this restart is "
+                 f"interrupted, re-attach with: tmux respawn-pane -k -t {info.pane_id} "
+                 f"{shlex.quote(shlex.join(info.argv))}")
+        rc, _ = self.host.run(respawn)
         if rc != 0:
             raise SessionError(f"claude respawn {job} failed (exit {rc})")
 
@@ -785,15 +920,27 @@ class Restarter:
                    "the re-attached session (status line)")
         return new_pid
 
-    def _relaunch(self, info: SessionInfo, argv: list[str], *, cd: bool = False) -> None:
+    def _relaunch_command(self, info: SessionInfo, argv: list[str], *, cd: bool) -> str:
         command = shlex.join(argv)
+        if info.mode == "shell" and cd:
+            # The shell is still in the launch dir, not in the worktree.
+            command = f"cd {shlex.quote(info.cwd)} && {command}"
+        return command
+
+    def _log_recovery(self, info: SessionInfo, command: str) -> None:
+        """Log how to relaunch by hand, before anything irreversible happens."""
+        if info.mode == "direct":
+            how = shlex.join(["tmux", "respawn-pane", "-k", "-t", info.pane_id, "-c",
+                              info.cwd or self.host.home(), command])
+        else:
+            how = f"type in the pane's shell: {command}"
+        self.log(f"{info.pane_id}: if this restart is interrupted, relaunch with: {how}")
+
+    def _relaunch(self, info: SessionInfo, command: str) -> None:
         if info.mode == "direct":
             self.tmux.respawn(info.pane_id, info.cwd or self.host.home(), command)
             self._release_pane(info)
         else:
-            if cd:
-                # The shell is still in the launch dir, not in the worktree.
-                command = f"cd {shlex.quote(info.cwd)} && {command}"
             self.tmux.send_literal(info.pane_id, command)
             self.tmux.send_keys(info.pane_id, "Enter")
 
@@ -809,14 +956,12 @@ class Restarter:
             return found[1]
         return self._wait(resumed, "the resumed session (new pid, same sessionId, status line)")
 
-    def _nudge(self, info: SessionInfo, text: str) -> None:
+    def _nudge(self, info: SessionInfo, text: str, force: bool) -> None:
         def ready():
             screen = self.tmux.capture(info.pane_id)
             return not has_dialog(screen) and _STATUS_LINE_RE.search(screen)
         self._wait(ready, "the resumed session to accept the nudge")
-        # Text and Enter in separate calls.
-        self.tmux.send_literal(info.pane_id, text)
-        self.tmux.send_keys(info.pane_id, "Enter")
+        self._type_and_submit(info, text, "nudge", force)
 
     def restart(self, target: str, *, model: str | None = None,
                 aliases: dict[str, str] | None = None,
@@ -839,8 +984,7 @@ class Restarter:
                                        "unless the next argument starts with '-'")
             if info.state == "dialog":
                 # Pasting into a dialog would select an answer. Never do that.
-                result.status, result.message = "SKIPPED", "dialog open (Enter to select/confirm)"
-                return result
+                raise _Skip(DIALOG_OPEN)
             if force:
                 self.tmux.send_keys(info.pane_id, "Escape")
             else:
@@ -854,17 +998,26 @@ class Restarter:
                                  and has_bare_worktree(info.argv))
                 argv = build_relaunch_argv(info.argv, info.session_id, model,
                                            drop_worktree=info.mode == "direct" or bare_worktree)
+                command = self._relaunch_command(info, argv, cd=bare_worktree)
+                # Checked here as well as right before typing: a draft found
+                # now must not cost the pane its remain-on-exit change.
+                self._ensure_empty_prompt(info, "/exit", force)
+                self._log_recovery(info, command)
                 if info.mode == "direct":
                     self._hold_pane(info)
-                self._exit_interactive(info)
-                self._relaunch(info, argv, cd=bare_worktree)
+                self._exit_interactive(info, force)
+                self._relaunch(info, command)
                 result.new_pid = self._verify(info)
+            restarted = f"pid {result.old_pid} -> {result.new_pid}, session {info.session_id}"
             if nudge:
-                self._nudge(info, nudge)
-            result.status = "OK"
-            result.message = f"pid {result.old_pid} -> {result.new_pid}, session {info.session_id}"
-        except _DialogVisible:
-            result.status, result.message = "SKIPPED", "dialog open (Enter to select/confirm)"
+                try:
+                    self._nudge(info, nudge, force)
+                except _Skip as exc:
+                    result.status, result.message = "SKIPPED", f"{restarted}; {exc}"
+                    return result
+            result.status, result.message = "OK", restarted
+        except _Skip as exc:
+            result.status, result.message = "SKIPPED", str(exc)
         except SessionError as exc:
             result.status, result.message = "FAILED", str(exc)
         finally:

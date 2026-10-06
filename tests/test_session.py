@@ -89,7 +89,6 @@ class FakeHost:
         self.killed: list[int] = []
         self.t = 0.0
         self.next_pid = 5000
-        self.typed: dict[str, str] = {}
         # behaviour knobs per pane
         self.dialogs: dict[str, list[str]] = {}
         self.answers: list[tuple[str, str]] = []
@@ -204,7 +203,7 @@ class FakeHost:
         if cmd == "display-message":
             return 0, self._fmt(pane) + "\n"
         if cmd == "capture-pane":
-            return 0, pane["screen"]
+            return 0, self.render(pane)
         if cmd == "send-keys":
             self._send(pane, args[args.index("-t") + 2:])
             return 0, ""
@@ -251,27 +250,32 @@ class FakeHost:
         sid = self.resume_session_override or argv[argv.index("--resume") + 1]
         self.register(pid, sid, cwd=cwd)
         pane.update(claude=pid, command="claude", screen=STATUS, launched=argv, launched_cwd=cwd)
+        if pane.get("draft_after_launch"):
+            pane["draft"] = pane.pop("draft_after_launch")
         if pane["mode"] == "shell":
             self.files[f"/proc/{pane['pane_pid']}/task/{pane['pane_pid']}/children"] = str(pid)
 
     def _send(self, pane, keys):
         t = pane["target"]
         if keys[0] == "-l":
-            self.typed[t] = self.typed.get(t, "") + keys[1]
             text = keys[1]
             if sess.has_dialog(pane["screen"]) and text.isdigit():
                 self.answers.append((t, text))
                 queue = self.dialogs.get(t, [])
                 if queue:
                     queue.pop(0)
-                self.typed[t] = ""
                 if queue:
                     pane["screen"] = queue[0]
                 else:
                     self._exit_claude(pane)
+                return
+            pane["typed"] = pane.get("typed", "") + text
+            if pane.get("on_type"):
+                pane.pop("on_type")(pane)
             return
         if keys == ["Enter"]:
-            text, self.typed[t] = self.typed.get(t, ""), ""
+            # Claude Code submits the whole prompt line: draft + typed text.
+            text = pane.pop("draft", "") + pane.pop("typed", "")
             if text == "/exit":
                 queue = self.dialogs.get(t, [])
                 if queue:
@@ -286,9 +290,29 @@ class FakeHost:
             elif text:
                 pane.setdefault("received", []).append(text)
             return
+        if keys == ["Escape"] and pane.get("on_escape"):
+            pane.pop("on_escape")(pane)
+            return
+        if keys == ["C-u"]:
+            line = pane.get("draft", "") + pane.get("typed", "")
+            # Kills to the start of the current line only.
+            pane["draft"], pane["typed"] = line.rsplit("\n", 1)[0] + "\n" if "\n" in line \
+                else "", ""
+            return
+        if keys[:1] == ["-N"] and keys[2:] == ["BSpace"]:
+            line = pane.get("draft", "") + pane.get("typed", "")
+            pane["draft"], pane["typed"] = line[:max(0, len(line) - int(keys[1]))], ""
+            return
         if keys == ["C-c", "C-c"] and pane.get("bg") and not self.files.get(
                 f"/proc/{pane['bg']}/cmdline"):
             self._exit_claude(pane)
+
+    def render(self, pane):
+        """The pane as captured: draft and typed text shown in the prompt line."""
+        line = pane.get("draft", "") + pane.get("typed", "")
+        if line and pane["command"] == "claude":
+            return pane["screen"].replace("\n❯ \n", "\n❯ " + line.replace("\n", "\n  ") + "\n", 1)
+        return pane["screen"]
 
     def _claude_respawn(self, job):
         """`claude respawn <job>`: new background pid, same session; the attach
@@ -791,6 +815,168 @@ class TestRestartTraps:
 
 
 # ---------------------------------------------------------------------------
+# Prompt line: drafts, re-checks before typing and Enter, recovery log
+# ---------------------------------------------------------------------------
+
+LIVE_RULE = "\x1b[38;5;244m" + "─" * 60 + "\n"
+LIVE_STATUS_LINE = "\x1b[39m  \x1b[90mOpus 5.5\x1b[38;5;246m ctx 30%\x1b[39m\n"
+
+
+def styled_prompt(line):
+    """A prompt box as captured with ``capture-pane -e`` from Claude Code 2.1.x."""
+    return "● done\n" + LIVE_RULE + "\x1b[39m❯\xa0" + line + "\n" + LIVE_RULE + LIVE_STATUS_LINE
+
+
+class TestPromptLine:
+    def test_empty_prompt_with_cursor(self):
+        assert sess.prompt_text(styled_prompt("\x1b[7m \x1b[0m")) == ""
+
+    def test_typed_draft(self):
+        assert sess.prompt_text(styled_prompt("half a \x1b[7mt\x1b[0mhought")) == "half a thought"
+
+    def test_dim_placeholder_is_not_a_draft(self):
+        # Placeholder and prompt suggestions: cursor on the first character,
+        # the rest dim (SGR 2).
+        line = '\x1b[7mT\x1b[0m\x1b[2mry "fix lint errors"\x1b[22m'
+        assert sess.prompt_text(styled_prompt(line)) == ""
+
+    def test_multiline_draft_and_titled_rule(self):
+        screen = ("── my-agent " + "─" * 40 + "\n❯ first line\n  second line\n"
+                  + "─" * 52 + "\n  ctx 3%\n")
+        assert sess.prompt_text(screen) == "first line second line"
+
+    def test_no_prompt_box(self):
+        assert sess.prompt_text("user@host:~$ \n") is None
+
+    def test_same_text_accepts_wrapping_and_paste_markers(self):
+        assert sess._same_text("/exit", "/exit")
+        assert sess._same_text("Your session was\n restarted", "Your session was restarted")
+        assert sess._same_text("[Pasted text #1 +3 lines]", "a\nb\nc\nd")
+        assert not sess._same_text("draft /exit", "/exit")
+
+
+class TestDraftAndRechecks:
+    def test_draft_is_never_submitted_with_exit(self, host):
+        # Seen live: "/exit" was appended to an unsent draft and the agent
+        # received "draft text /exit" as a normal message.
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid")
+        host.panes["a:0.0"]["draft"] = "half a thought"
+        r = restarter(host).restart("a:0.0")
+        assert r.status == "SKIPPED" and "unsent text" in r.message
+        assert host.sends("a:0.0") == []
+        assert host.panes["a:0.0"]["draft"] == "half a thought"
+        assert "received" not in host.panes["a:0.0"]
+        assert host.panes["a:0.0"]["claude"] == 101
+
+    def test_draft_in_direct_pane_does_not_touch_remain_on_exit(self, host):
+        host.add_direct_pane("d:0.0", 700, [CLAUDE], "sid-d")
+        host.panes["d:0.0"]["draft"] = "wip"
+        r = restarter(host).restart("d:0.0")
+        assert r.status == "SKIPPED"
+        assert not [c for c in host.calls if c[0] == "set-option"]
+
+    @pytest.mark.parametrize("draft", ["half a thought", "line one\nline two"])
+    def test_force_clears_the_draft_first(self, host, draft):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid")
+        host.panes["a:0.0"]["draft"] = draft
+        r = restarter(host).restart("a:0.0", force=True, nudge="hi")
+        assert r.status == "OK", r.message
+        assert ["send-keys", "-t", "%0", "C-u"] in host.calls
+        assert host.panes["a:0.0"]["received"] == ["hi"]
+
+    def test_draft_before_nudge_is_never_appended_to(self, host):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid")
+        host.panes["a:0.0"]["draft_after_launch"] = "typed during the restart"
+        r = restarter(host).restart("a:0.0", nudge="hi")
+        assert r.status == "SKIPPED" and "nudge not sent" in r.message
+        assert "pid 101 ->" in r.message
+        assert "received" not in host.panes["a:0.0"]
+        assert host.panes["a:0.0"]["draft"] == "typed during the restart"
+
+    def test_force_clears_draft_before_nudge(self, host):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid")
+        host.panes["a:0.0"]["draft_after_launch"] = "typed during the restart"
+        r = restarter(host).restart("a:0.0", nudge="hi", force=True)
+        assert r.status == "OK", r.message
+        assert host.panes["a:0.0"]["received"] == ["hi"]
+
+    def test_dialog_appearing_while_typing_exit_gets_no_enter(self, host):
+        # Enter in a permission prompt approves option 1 ("Yes").
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid")
+        host.panes["a:0.0"]["on_type"] = lambda p: p.update(screen=REAL_PERMISSION_PROMPT)
+        r = restarter(host).restart("a:0.0", nudge=None)
+        assert r.status == "FAILED" and "Enter not sent" in r.message
+        assert not [c for c in host.sends("a:0.0") if c[-1] == "Enter"]
+
+    def test_text_typed_by_someone_else_while_typing_gets_no_enter(self, host):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid")
+        host.panes["a:0.0"]["on_type"] = lambda p: p.update(draft="user ")
+        r = restarter(host).restart("a:0.0", nudge=None)
+        assert r.status == "FAILED" and "prompt line changed" in r.message
+        assert not [c for c in host.sends("a:0.0") if c[-1] == "Enter"]
+        assert "received" not in host.panes["a:0.0"]
+
+    def test_dialog_after_force_escape_is_rechecked(self, host):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid", screen=WORKING)
+        host.panes["a:0.0"]["on_escape"] = lambda p: p.update(screen=REAL_PERMISSION_PROMPT)
+        r = restarter(host).restart("a:0.0", force=True, nudge=None)
+        assert r.status == "SKIPPED" and "dialog" in r.message
+        assert [c[-1] for c in host.sends("a:0.0")] == ["Escape"]
+
+    def test_dialog_appearing_while_typing_nudge_gets_no_enter(self, host):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid")
+        r = sess.Restarter(host, timeout=60, poll=1)
+        real_launch = host._launch
+
+        def launch(pane, argv, cwd):
+            real_launch(pane, argv, cwd)
+            pane["on_type"] = lambda p: p.update(screen=REAL_PERMISSION_PROMPT)
+        host._launch = launch
+        result = r.restart("a:0.0", nudge="hi")
+        assert result.status == "FAILED" and "Enter not sent" in result.message
+        assert "received" not in host.panes["a:0.0"]
+
+
+class TestRecoveryLog:
+    def _events(self, host):
+        events = []
+        return events, (lambda m: events.append((len(host.calls), m)))
+
+    def _exit_index(self, host):
+        return next(i for i, c in enumerate(host.calls) if c[-1] == "/exit")
+
+    def test_shell_pane_logs_relaunch_command_before_exit(self, host):
+        argv = [CLAUDE, "--agent", "dev", "--worktree", "--model", "claude-opus-5-5"]
+        host.add_shell_pane("a:0.0", 101, argv, "sid", cwd="/work/wt x")
+        events, log = self._events(host)
+        r = restarter(host, log=log).restart("a:0.0", nudge=None)
+        assert r.status == "OK", r.message
+        (at, msg), = [e for e in events if "relaunch with" in e[1]]
+        assert at <= self._exit_index(host)
+        expected = shlex.join([CLAUDE, "--agent", "dev", "--model", "claude-opus-5-5",
+                               "--resume", "sid"])
+        assert msg.endswith(f"cd {shlex.quote('/work/wt x')} && {expected}")
+
+    def test_direct_pane_logs_respawn_pane_command_before_exit(self, host):
+        host.add_direct_pane("d:0.0", 700, [CLAUDE, "--agent", "dev"], "sid-d")
+        events, log = self._events(host)
+        r = restarter(host, log=log).restart("d:0.0", nudge=None)
+        assert r.status == "OK", r.message
+        (at, msg), = [e for e in events if "relaunch with" in e[1]]
+        assert at <= self._exit_index(host)
+        cmd = msg.split("relaunch with: ", 1)[1]
+        assert shlex.split(cmd) == ["tmux", "respawn-pane", "-k", "-t", "%0", "-c", "/work",
+                                    shlex.join([CLAUDE, "--agent", "dev", "--resume", "sid-d"])]
+
+    def test_background_session_logs_reattach_command_before_respawn(self, host):
+        host.add_attach_pane("bg:0.0", 400, 401, "cbf58c04-aaaa")
+        events, log = self._events(host)
+        r = restarter(host, log=log).restart("bg:0.0", nudge=None)
+        assert r.status == "OK", r.message
+        assert any("re-attach with: tmux respawn-pane" in m for _, m in events)
+
+
+# ---------------------------------------------------------------------------
 # CLI: --all, --self, --profile, usage
 # ---------------------------------------------------------------------------
 
@@ -810,7 +996,8 @@ class TestRestartCli:
         host.add_shell_pane("c:0.0", 301, [CLAUDE], "s3")
         host.dialogs["c:0.0"] = [UNKNOWN_DIALOG]
         r = _invoke(host, ["--all", "--no-nudge", "--timeout", "20"])
-        lines = [line.split()[:2] for line in r.output.splitlines() if line.strip()]
+        lines = [line.split()[:2] for line in r.output.splitlines()
+                 if line.split()[:1] in (["OK"], ["SKIPPED"], ["FAILED"])]
         assert lines == [["OK", "a:0.0"], ["SKIPPED", "b:0.0"], ["FAILED", "c:0.0"]]
         assert r.exit_code == 1
 

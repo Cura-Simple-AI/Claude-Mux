@@ -1292,7 +1292,8 @@ def cmd_session_list(container, container_user, as_json):
               help="Message sent after resume (default: ask the agent to recreate scheduled loops)")
 @click.option("--no-nudge", is_flag=True, help="Do not send any message after resume")
 @click.option("--force", is_flag=True,
-              help="Do not wait for idle; send Escape first. Open dialogs are still refused")
+              help="Do not wait for idle; send Escape first and clear unsent text in the "
+                   "prompt line. Open dialogs are still refused")
 @click.option("--timeout", default=300.0, show_default=True, type=float,
               help="Seconds to wait for each step")
 @click.option("--delay", default=5.0, show_default=True, type=float,
@@ -1310,6 +1311,8 @@ def cmd_session_restart(ctx, target, self_, all_, match, model, profile, nudge, 
     \b
     Safety rules:
       - Refuses when a dialog or permission prompt is open in the pane.
+      - Refuses when the prompt line holds unsent text (--force clears it);
+        /exit and the nudge are never appended to a draft.
       - Waits until the session is idle unless --force.
       - Exit dialogs: "Keep worktree" is always answered Keep (never Remove);
         "Exit and stop tasks" is answered with option 1.

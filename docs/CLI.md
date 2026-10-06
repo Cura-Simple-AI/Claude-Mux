@@ -422,7 +422,7 @@ claude-mux session restart --all --match '^agent-'     # one at a time
 | `--profile NAME` | Run `activate NAME` before restarting. Host only: refused with `--container`, because `activate` writes the host's config, which the container never sees |
 | `--nudge TEXT` | Message sent after resume. Default asks the agent to recreate its scheduled loops |
 | `--no-nudge` | Send no message after resume |
-| `--force` | Do not wait for idle; send Escape first. Open dialogs are still refused |
+| `--force` | Do not wait for idle; send Escape first, and clear unsent text in the prompt line. Open dialogs are still refused |
 | `--timeout SEC` | Seconds to wait for each step (default 300) |
 | `--self` | Restart the calling session's pane via a detached helper (`tmux run-shell -b`; `#` is escaped so tmux formats in `--nudge` are not expanded). The helper runs the caller's claude_mux, prepended to `PYTHONPATH`. Not with `--container` |
 | `--delay SEC` | With `--self`: seconds before the helper starts (default 5) |
@@ -437,17 +437,26 @@ claude-mux session restart --all --match '^agent-'     # one at a time
 1. **Refuse if a dialog is open.** Text typed into a selection dialog picks an answer, so a pane
    in the `dialog` state (see above) is reported as `SKIPPED` — even with `--force`.
 2. **Wait until idle** (unless `--force`, which sends Escape first).
-3. **Exit.** `/exit` is typed, then Enter is sent in a *separate* `send-keys` call. Exit dialogs:
+3. **Refuse if the prompt line holds unsent text.** Whatever is typed is appended to it, and Enter
+   would send the user's draft together with `/exit` as an ordinary message. Such a pane is
+   reported as `SKIPPED`; with `--force` the line is cleared first (`C-u`, then backspaces) and
+   checked again. Placeholder text and prompt suggestions (rendered dim) do not count.
+4. **Log the relaunch command** (to stderr, or the `--self` log file) before anything is sent, so
+   the session can be relaunched by hand if the restart is interrupted.
+5. **Exit.** `/exit` is typed, then Enter is sent in a *separate* `send-keys` call. Immediately
+   before typing, the pane is captured again and checked for a dialog and an empty prompt line;
+   before Enter it is captured once more, and Enter is only sent when no dialog is open and the
+   prompt line shows exactly the typed text. Exit dialogs:
    - worktree dialog → the option labelled **Keep**. An option labelled Remove is never chosen;
      if there is no Keep option the restart fails and the dialog is left untouched.
    - "Exit and stop tasks" → option 1.
    - any other dialog → the restart fails without answering.
-4. **Background sessions** (`claude attach`): restarted with `claude respawn <job>`, which
+6. **Background sessions** (`claude attach`): restarted with `claude respawn <job>`, which
    resumes the same conversation (killing the background process does not work — the daemon
    starts it again and the attach view stays open). `remain-on-exit` is set first; if the
-   `claude attach` client exits, the pane is re-attached with `tmux respawn-pane`. Steps 5-6
-   do not apply, and `--model` is refused because `claude respawn` keeps the session's settings.
-5. **Relaunch** with the original argv (`--agent`, `--worktree`, `--permission-mode`, `--model`, …)
+   `claude attach` client exits, the pane is re-attached with `tmux respawn-pane`. Steps 3, 5, 7
+   and 8 do not apply, and `--model` is refused because `claude respawn` keeps the session's settings.
+7. **Relaunch** with the original argv (`--agent`, `--worktree`, `--permission-mode`, `--model`, …)
    minus `--resume`, `--session-id`, `--fork-session` and `--continue`, plus `--resume <sessionId>`.
    A positional prompt from the original command line is dropped — with `--resume` it would be
    sent to the agent again as a new message. To tell option values from the prompt, the arity of
@@ -461,9 +470,11 @@ claude-mux session restart --all --match '^agent-'     # one at a time
    - Claude Code is the pane process itself: `remain-on-exit` is set before exit and the pane is
      relaunched with `tmux respawn-pane` in the session's cwd (`--worktree` is dropped because
      the cwd already is the worktree).
-6. **Verify:** a new pid, the same `sessionId` in the registry and a visible status line.
-7. **Nudge:** the text, then Enter in a separate call. Session-scoped cron jobs do not survive a
-   resume, so the default nudge asks the agent to recreate its scheduled loops.
+8. **Verify:** a new pid, the same `sessionId` in the registry and a visible status line.
+9. **Nudge:** the text, then Enter in a separate call, with the same checks as for `/exit`.
+   Session-scoped cron jobs do not survive a resume, so the default nudge asks the agent to
+   recreate its scheduled loops. If the prompt line holds text by then, the nudge is not sent and
+   the result is `SKIPPED` (the session itself was restarted; the message says so).
 
 Worktrees are never removed.
 

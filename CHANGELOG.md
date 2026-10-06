@@ -32,6 +32,13 @@ Format: [Semantic Versioning](https://semver.org/). Dates in ISO 8601.
   executable as the session (`node cli.js` for node installs, not `node respawn`).
   `remain-on-exit` is restored to the pane's own previous value — also for attached panes and
   after failures — instead of being unset.
+- `session restart`: `/exit` and the nudge are never typed into a prompt line that holds unsent
+  text — they were appended to the draft and sent as one message. Such panes are `SKIPPED`;
+  `--force` clears the line first. Right before typing and right before Enter the pane is
+  captured again: a dialog that appeared in the meantime, or a prompt line that does not show
+  exactly the typed text, stops the restart without Enter (also after the `--force` Escape).
+- `session restart`: the relaunch command is logged before `/exit` is sent, so an interrupted
+  restart (for example a `--self` helper that dies) can be finished by hand.
 
 ---
 
