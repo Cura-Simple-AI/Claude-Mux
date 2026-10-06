@@ -371,6 +371,10 @@ class FakeHost:
     def _render_now(self, pane):
         """Draft and typed text shown in the prompt line."""
         line = pane.get("draft", "") + pane.get("typed", "")
+        width = pane.get("wrap_width")
+        if width and line:
+            # Hard wrap in the middle of words, as an attach view does.
+            line = "\n".join(line[i:i + width] for i in range(0, len(line), width))
         if line and pane["command"] == "claude":
             return pane["screen"].replace("\n❯ \n", "\n❯ " + line.replace("\n", "\n  ") + "\n", 1)
         return pane["screen"]
@@ -1076,6 +1080,24 @@ class TestLateRendering:
         r = restarter(host).restart("a:0.0", nudge=None)
         assert r.status == "FAILED" and "Enter not sent" in r.message
         assert [c[-1] for c in host.sends("a:0.0")] == ["/exit"]
+
+    def test_long_wrapped_nudge_on_slow_attach_pane_is_submitted(self, host):
+        # Issue #16: a >200 character nudge wrapped over several lines of a
+        # background (`claude attach`) pane, redrawn slower than 3s, was typed
+        # but never submitted.
+        nudge = "Re-create your scheduled loops after the restart. " * 5
+        assert len(nudge) > 200
+        host.add_attach_pane("bg:0.0", 400, 401, "cbf58c04-aaaa")
+        real_launch = host._launch
+
+        def launch(pane, argv, cwd):
+            real_launch(pane, argv, cwd)
+            pane["wrap_width"] = 60
+            host.render_delay = 100  # captures: ~5s at RENDER_POLL
+        host._launch = launch
+        r = restarter(host).restart("bg:0.0", nudge=nudge)
+        assert r.status == "OK" and "not submitted" not in r.line(), r.line()
+        assert host.panes["bg:0.0"]["received"] == [nudge]
 
     def test_nudge_never_rendered_after_successful_restart_is_skipped(self, host):
         host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid")
