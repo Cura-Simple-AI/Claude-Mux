@@ -371,6 +371,10 @@ class FakeHost:
     def _render_now(self, pane):
         """Draft and typed text shown in the prompt line."""
         line = pane.get("draft", "") + pane.get("typed", "")
+        width = pane.get("wrap_width")
+        if width and line:
+            # Hard wrap in the middle of words, as an attach view does.
+            line = "\n".join(line[i:i + width] for i in range(0, len(line), width))
         if line and pane["command"] == "claude":
             return pane["screen"].replace("\n❯ \n", "\n❯ " + line.replace("\n", "\n  ") + "\n", 1)
         return pane["screen"]
@@ -411,6 +415,12 @@ class FakeHost:
 @pytest.fixture()
 def host():
     return FakeHost()
+
+
+def _attach_screen(body, below=()):
+    """A 47-column pane: conversation, the prompt box, then status lines."""
+    rule = "\u2500" * 47
+    return "\n".join(["\u25cf done", "", rule, *body, rule, *below])
 
 
 def restarter(host, **kw):
@@ -1077,22 +1087,168 @@ class TestLateRendering:
         assert r.status == "FAILED" and "Enter not sent" in r.message
         assert [c[-1] for c in host.sends("a:0.0")] == ["/exit"]
 
-    def test_nudge_never_rendered_after_successful_restart_is_skipped(self, host):
+    def test_long_wrapped_nudge_on_slow_attach_pane_is_submitted(self, host):
+        # Issue #16: a >200 character nudge wrapped over several lines of a
+        # background (`claude attach`) pane, redrawn slower than 3s, was typed
+        # but never submitted.
+        nudge = "Re-create your scheduled loops after the restart. " * 5
+        assert len(nudge) > 200
+        host.add_attach_pane("bg:0.0", 400, 401, "cbf58c04-aaaa")
+        real_launch = host._launch
+
+        def launch(pane, argv, cwd):
+            real_launch(pane, argv, cwd)
+            pane["wrap_width"] = 60
+            host.render_delay = 100  # captures: ~5s at RENDER_POLL
+        host._launch = launch
+        r = restarter(host).restart("bg:0.0", nudge=nudge)
+        assert r.status == "OK" and "not submitted" not in r.line(), r.line()
+        assert host.panes["bg:0.0"]["received"] == [nudge]
+
+    def test_nudge_never_rendered_after_successful_restart_is_ok_not_submitted(self, host):
+        # The restart worked, so the result is OK (not SKIPPED) -- scripts and
+        # `--all` summaries must not read a successful restart as a skip.
         host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid")
         _never_render_after_launch(host)
         r = restarter(host).restart("a:0.0", nudge="hi")
-        assert r.status == "SKIPPED", r.message
+        assert r.status == "OK" and r.nudge_submitted is False, r.message
+        assert r.line().startswith("OK (nudge not submitted)")
         assert "pid 101 ->" in r.message and "nudge" in r.message
         assert host.panes["a:0.0"]["claude"] != 101
         assert "received" not in host.panes["a:0.0"]
         assert host.panes["a:0.0"].get("typed", "") == ""
 
-    def test_nudge_timeout_exit_code_is_skipped_not_failed(self, host):
+    def test_nudge_timeout_exit_code_is_zero_with_not_submitted_label(self, host):
         host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid")
         _never_render_after_launch(host)
         r = _invoke(host, ["a:0.0", "--nudge", "hi"])
-        assert r.exit_code == 4, r.output
-        assert r.output.splitlines()[-1].startswith("SKIPPED")
+        assert r.exit_code == 0, r.output
+        assert r.output.splitlines()[-1].startswith("OK (nudge not submitted)")
+
+    def test_unconfirmable_nudge_prints_the_submit_command(self, host):
+        # After typing, no prompt box can be found in the (attach) view: the text may sit in
+        # the prompt line, so the exact command to submit it is printed.
+        host.add_attach_pane("bg:0.0", 400, 401, "cbf58c04-aaaa")
+        real_launch = host._launch
+
+        def launch(pane, argv, cwd):
+            real_launch(pane, argv, cwd)
+            pane["on_type"] = lambda p: p.update(
+                screen="attach view without a prompt box\n  main · Opus 5.5 ctx 17%\n")
+        host._launch = launch
+        r = restarter(host).restart("bg:0.0", nudge="hi")
+        assert r.status == "OK" and r.nudge_submitted is False, r.message
+        assert "check the pane, then submit with: tmux send-keys -t %0 C-m" in r.message
+        assert "received" not in host.panes["bg:0.0"]
+        assert ["send-keys", "-t", "%0", "Enter"] not in host.calls
+
+    def test_typed_text_visible_but_prompt_box_unparsed_is_not_submitted_and_logged(self, host):
+        # Issue #16's logged signature: the text is on screen, but prompt_text()
+        # recognises no prompt box (None). Deliberate behaviour: Enter is not
+        # sent, the result is "OK (nudge not submitted)" with a hint, and the
+        # last capture goes to the restart log for the root cause.
+        host.add_attach_pane("bg:0.0", 400, 401, "cbf58c04-aaaa")
+        real_launch = host._launch
+        screen = _attach_screen(["\u276f\u00a0hi"], below=["\u2500" * 47, "  \u23f5\u23f5 bypass permissions on"])  # separator under the box
+        assert sess.prompt_text(screen) is None
+
+        def launch(pane, argv, cwd):
+            real_launch(pane, argv, cwd)
+            pane["on_type"] = lambda p: p.update(screen=screen)
+        host._launch = launch
+        logs = []
+        r = restarter(host, log=logs.append).restart("bg:0.0", nudge="hi")
+        assert r.status == "OK" and r.nudge_submitted is False, r.message
+        assert "Enter not sent" in r.message and "C-m" in r.message
+        assert ["send-keys", "-t", "%0", "Enter"] not in host.calls
+        text = "\n".join(logs)
+        assert "no prompt box recognised after typing nudge" in text
+        assert "last two rules are adjacent" in text or "prompt marker" in text
+        assert "hi" in text and "bypass permissions on" in text  # the capture itself
+
+    def test_diagnostic_log_keeps_only_the_last_non_empty_lines(self, host):
+        host.add_attach_pane("bg:0.0", 400, 401, "cbf58c04-aaaa")
+        real_launch = host._launch
+        noise = [f"history line {i}" for i in range(40)]
+        screen = "\n".join(noise + ["", "no box here", ""])
+
+        def launch(pane, argv, cwd):
+            real_launch(pane, argv, cwd)
+            pane["on_type"] = lambda p: p.update(screen=screen)
+        host._launch = launch
+        logs = []
+        restarter(host, log=logs.append).restart("bg:0.0", nudge="hi")
+        shown = [m for m in logs if "capture lines" not in m and "history line" in m or "no box here" in m]
+        assert len(shown) == sess.PROMPT_DIAG_LINES
+        assert "no box here" in shown[-1] and "history line 26" in shown[0]
+        assert "0 horizontal rule(s) found" in "\n".join(logs)
+
+    def test_nudge_submitted_is_none_without_nudge_and_true_after_enter(self, host):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE], "sid")
+        assert restarter(host).restart("a:0.0", nudge=None).nudge_submitted is None
+        host.add_shell_pane("b:0.0", 201, [CLAUDE], "sid2")
+        r = restarter(host).restart("b:0.0", nudge="hi")
+        assert r.nudge_submitted is True and not r.line().startswith("OK (nudge")
+        assert r.to_dict()["nudge_submitted"] is True
+
+
+class TestPromptTextWithStatusLines:
+    """Measured live on a `claude attach` pane (47x26): the prompt line starts
+    with ❯ + NBSP, continuation lines are indented by two spaces, the box is
+    delimited by ─ rules, and THREE status lines sit below it: a custom
+    statusline script, the branch line and the permission-mode line."""
+
+    BELOW = ["  Troels 5t 22%\u219202:00 7d 36%", "  \u2387 main \u00b7 fix/16-restart-nudge-enter\u2026",
+             "  \u23f5\u23f5 bypass permissions on \u00b7 PR #17"]
+    BODY = ["\u276f\u00a0Re-create your scheduled loops after the", "  restart. Re-create your scheduled"]
+    WANT = "Re-create your scheduled loops after the restart. Re-create your scheduled"
+
+    def test_three_status_lines(self):
+        assert sess.prompt_text(_attach_screen(self.BODY, below=self.BELOW)) == self.WANT
+
+    @pytest.mark.parametrize("below", [[], BELOW[1:], BELOW[:1], [""] + BELOW])
+    def test_missing_or_extra_status_lines_do_not_matter(self, below):
+        assert sess.prompt_text(_attach_screen(self.BODY, below=below)) == self.WANT
+
+    def test_styled_capture_with_sgr_codes(self):
+        body = ["\x1b[39m\u276f\x1b[0m\u00a0\x1b[1mhello\x1b[0m"]
+        assert sess.prompt_text(_attach_screen(body, below=self.BELOW)) == "hello"
+
+    def test_a_rule_like_line_below_the_box_hides_the_prompt(self):
+        # Candidate for #16, NOT confirmed: the parser takes the LAST two rules,
+        # so a separator drawn under the box makes it pick the wrong pair.
+        below = [self.BELOW[0], "\u2500" * 47, *self.BELOW[1:]]
+        assert sess.prompt_text(_attach_screen(self.BODY, below=below)) is None
+        assert "rule" in sess.no_prompt_reason(_attach_screen(self.BODY, below=below))
+
+    def test_input_scrolled_so_the_first_visible_line_has_no_marker(self):
+        # Candidate for #16, NOT confirmed: a very long input may scroll inside
+        # the box, so the line under the top rule no longer starts with ❯.
+        body = ["  middle of a very long wrapped nudge", "  and its tail"]
+        screen = _attach_screen(body, below=self.BELOW)
+        assert sess.prompt_text(screen) is None
+        assert "prompt marker" in sess.no_prompt_reason(screen)
+
+    def test_clipped_long_nudge_is_submitted_by_its_prefix(self, host):
+        nudge = "Re-create your scheduled loops after the restart. " * 5
+        host.add_attach_pane("bg:0.0", 400, 401, "cbf58c04-aaaa")
+        real_launch = host._launch
+        real_render = host._render_now
+
+        def launch(pane, argv, cwd):
+            real_launch(pane, argv, cwd)
+            pane["clip"] = True
+        host._launch = launch
+
+        def render(pane):
+            if pane.get("clip") and pane.get("typed"):
+                shown = dict(pane, typed=pane["typed"][:90] + "…")
+                return real_render(shown)
+            return real_render(pane)
+        host._render_now = render
+        r = restarter(host).restart("bg:0.0", nudge=nudge)
+        assert r.status == "OK" and r.nudge_submitted, r.line()
+        assert host.panes["bg:0.0"]["received"] == [nudge]
 
     @pytest.mark.parametrize("draft", ["half a thought", "line one\nline two"])
     def test_force_clear_rendered_late(self, host, draft):

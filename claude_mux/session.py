@@ -142,6 +142,18 @@ class SessionError(Exception):
     """Raised when a restart step cannot be completed safely."""
 
 
+class NudgeNotConfirmed(SessionError):
+    """The typed nudge never showed in the prompt line, so Enter was not sent.
+
+    The session itself was restarted. ``pending`` is True when the text may
+    still sit in the prompt line (it was not removed again).
+    """
+
+    def __init__(self, message: str, pending: bool):
+        super().__init__(message)
+        self.pending = pending
+
+
 class _Skip(Exception):
     """The pane is not in a state where typing is safe; nothing was typed."""
 
@@ -476,6 +488,22 @@ def prompt_text(screen: str) -> str | None:
     return " ".join("".join(c for c, dim, _ in cells if not dim).split())
 
 
+#: Capture lines kept in the log when the prompt box is not recognised.
+PROMPT_DIAG_LINES = 15
+
+
+def no_prompt_reason(screen: str) -> str:
+    """Why ``prompt_text`` found no prompt box (for diagnostics only)."""
+    plain = strip_ansi(screen).split("\n")
+    rules = [i for i, t in enumerate(plain) if _RULE_RE.match(t) or _BOX_RULE_RE.match(t)]
+    if len(rules) < 2:
+        return f"{len(rules)} horizontal rule(s) found, 2 needed"
+    if rules[-1] - rules[-2] < 2:
+        return "the last two rules are adjacent: no box content"
+    first = plain[rules[-2] + 1].lstrip()
+    return f"first line below the box's top rule does not start with a prompt marker: {first[:20]!r}"
+
+
 def _same_text(shown: str, typed: str) -> bool:
     """Does the prompt line show exactly ``typed`` (wrapped, or collapsed as a paste)?"""
     squash = "".join(shown.split())
@@ -744,6 +772,25 @@ def choose_dialog_answer(screen: str) -> int:
 # Restart
 # ---------------------------------------------------------------------------
 
+#: Leading non-space characters of the typed text that must show in the prompt
+#: line when the whole text is not matched (an attach view may wrap or clip it).
+PREFIX_CHARS = 32
+#: Captures in a row that must show the same prefix before Enter is sent, so a
+#: half-rendered line is never submitted.
+PREFIX_STABLE_POLLS = 4
+
+
+def _shows_prefix(shown: str, typed: str) -> bool:
+    """Does the prompt line show the start of ``typed``, and nothing but ``typed``?
+
+    Whitespace is ignored (wrapping), a trailing ellipsis (clipping) is allowed.
+    The line may be shorter than ``typed`` but never longer or different.
+    """
+    a = "".join(shown.split()).rstrip("…")
+    b = "".join(typed.split())
+    n = min(len(b), PREFIX_CHARS)
+    return len(a) >= n and len(a) <= len(b) and b.startswith(a)
+
 @dataclass
 class RestartResult:
     target: str
@@ -753,9 +800,13 @@ class RestartResult:
     old_pid: int | None = None
     new_pid: int | None = None
     warnings: list[str] = field(default_factory=list)
+    #: None: no nudge attempted (or it was skipped); True: Enter was sent after typing it;
+    #: False: the restart worked but the nudge could not be confirmed, so Enter was not sent
+    nudge_submitted: bool | None = None
 
     def line(self) -> str:
-        return f"{self.status:<8} {self.target}  {self.message}".rstrip()
+        label = self.status if self.nudge_submitted is not False else f"{self.status} (nudge not submitted)"
+        return f"{label:<8} {self.target}  {self.message}".rstrip()
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -767,6 +818,8 @@ class Restarter:
     #: Claude Code shows typed or erased text only after a short delay
     #: (measured: ~75 ms), so the prompt line is polled before Enter.
     RENDER_TIMEOUT = 3.0
+    #: A background (`claude attach`) pane redraws slower.
+    ATTACH_RENDER_TIMEOUT = 15.0
     RENDER_POLL = 0.05
 
     def __init__(self, host: LocalHost, tmux: Tmux | None = None, *,
@@ -778,6 +831,7 @@ class Restarter:
         self.timeout = timeout
         self.poll = poll
         self.log = log or (lambda msg: None)
+        self._last_screen = ""
         #: pane id -> the pane's own remain-on-exit value before the restart
         self._remain_prior: dict[str, str | None] = {}
 
@@ -817,13 +871,25 @@ class Restarter:
     def _capture_prompt(self, info: SessionInfo) -> str | None:
         """Fresh capture: raise _Skip on a dialog, else return the prompt text."""
         screen = self.tmux.capture(info.pane_id, styled=True)
+        self._last_screen = screen
         if has_dialog(strip_ansi(screen)):
             raise _Skip(DIALOG_OPEN)
         return prompt_text(screen)
 
-    def _poll_prompt(self, info: SessionInfo, done) -> str | None:
-        """Capture the prompt line until ``done(text)`` or RENDER_TIMEOUT; return the last text."""
-        deadline = self.host.now() + self.RENDER_TIMEOUT
+    def _log_unparsed_prompt(self, info: SessionInfo, what: str) -> None:
+        """Keep the last capture when no prompt box was recognised after typing
+        (#16), so the next occurrence shows why instead of leaving a guess."""
+        screen = self._last_screen
+        plain = strip_ansi(screen)
+        tail = [line for line in plain.split("\n") if line.strip()][-PROMPT_DIAG_LINES:]
+        self.log(f"{info.pane_id}: no prompt box recognised after typing {what} "
+                 f"({no_prompt_reason(screen)}); last {len(tail)} non-empty capture lines:")
+        for line in tail:
+            self.log(f"{info.pane_id}:   {line!r}")
+
+    def _poll_prompt(self, info: SessionInfo, done, timeout: float | None = None) -> str | None:
+        """Capture the prompt line until ``done(text)`` or the timeout; return the last text."""
+        deadline = self.host.now() + (self.RENDER_TIMEOUT if timeout is None else timeout)
         while True:
             text = self._capture_prompt(info)
             if done(text) or self.host.now() >= deadline:
@@ -873,12 +939,29 @@ class Restarter:
         shows exactly ``text`` and no dialog is open."""
         self._ensure_empty_prompt(info, what, force)
         self.tmux.send_literal(info.pane_id, text)
+        timeout = self.ATTACH_RENDER_TIMEOUT if info.attached else self.RENDER_TIMEOUT
+        stable = {"text": None, "n": 0}
+
+        def done(t):
+            if t is None:
+                return False
+            if _same_text(t, text):
+                return True
+            # Wrapped or clipped text: accept the prefix once it has stopped changing.
+            if t and _shows_prefix(t, text):
+                stable["n"] = stable["n"] + 1 if t == stable["text"] else 1
+                stable["text"] = t
+                return stable["n"] >= PREFIX_STABLE_POLLS
+            stable["text"], stable["n"] = None, 0
+            return False
+
         try:
-            shown = self._poll_prompt(info, lambda t: t is not None and _same_text(t, text))
+            shown = self._poll_prompt(info, done, timeout)
         except _Skip:
             # Enter would confirm the highlighted option of the dialog.
             raise SessionError(f"a dialog appeared while typing {what}; Enter not sent")
-        if shown is not None and _same_text(shown, text):
+        if shown is not None and (_same_text(shown, text) or (
+                shown and _shows_prefix(shown, text) and stable["n"] >= PREFIX_STABLE_POLLS)):
             self.tmux.send_keys(info.pane_id, "Enter")
             return
         typed, seen = "".join(text.split()), "".join((shown or "").split())
@@ -890,11 +973,13 @@ class Restarter:
         else:
             removed = ""
         if shown and not typed.startswith(seen):
-            reason = f"the prompt line changed while typing {what}"
-        else:
-            reason = (f"the prompt line did not show the typed {what} "
-                      f"within {self.RENDER_TIMEOUT:g}s")
-        raise SessionError(f"{reason}; Enter not sent{removed}")
+            raise SessionError(f"the prompt line changed while typing {what}; "
+                               f"Enter not sent{removed}")
+        if shown is None:
+            self._log_unparsed_prompt(info, what)
+        raise NudgeNotConfirmed(
+            f"the prompt line did not show the typed {what} within {timeout:g}s; "
+            f"Enter not sent{removed}", pending=not removed)
 
     def _exited(self, info: SessionInfo) -> bool:
         if self._alive(info.claude_pid):
@@ -1085,6 +1170,14 @@ class Restarter:
             if nudge:
                 try:
                     self._nudge(info, nudge, force)
+                    result.nudge_submitted = True
+                except NudgeNotConfirmed as exc:
+                    # Restarted, but the nudge cannot be confirmed: not a skip.
+                    hint = (f"; check the pane, then submit with: tmux send-keys -t {info.pane_id} C-m"
+                            if exc.pending else "")
+                    result.status, result.nudge_submitted = "OK", False
+                    result.message = f"{restarted}; nudge: {exc}{hint}"
+                    return result
                 except (_Skip, SessionError) as exc:
                     # The session itself was restarted: not a failure.
                     result.status, result.message = "SKIPPED", f"{restarted}; nudge: {exc}"
