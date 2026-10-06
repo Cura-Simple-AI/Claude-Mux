@@ -450,7 +450,10 @@ claude-mux session restart --all --match '^agent-'     # one at a time
 5. **Relaunch** with the original argv (`--agent`, `--worktree`, `--permission-mode`, `--model`, …)
    minus `--resume`, `--session-id`, `--fork-session` and `--continue`, plus `--resume <sessionId>`.
    A positional prompt from the original command line is dropped — with `--resume` it would be
-   sent to the agent again as a new message.
+   sent to the agent again as a new message. To tell option values from the prompt, the arity of
+   every Claude Code option is known, including hidden ones (`--plan-mode-required`,
+   `--agent-id`, `--channels a b`, `--rc [name]`, …). An unknown option is assumed to take one
+   value unless the next argument starts with `-`, and the restart reports a warning for it.
    - Pane runs a shell: wait for the shell, then type the command. A bare `--worktree` (no name)
      is dropped and the command is prefixed with `cd <session cwd> &&`: a bare `--worktree`
      creates a new worktree on every launch, and the shell is still in the launch directory.

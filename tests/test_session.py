@@ -414,6 +414,50 @@ class TestArgvAndModel:
             CLAUDE, "--add-dir", "/a", "/b", "--worktree", "--debug", "api",
             "--permission-mode", "plan", "--resume", "sid"]
 
+    @pytest.mark.parametrize("flag", ["--plan-mode-required", "--init", "--hard-fail",
+                                      "-d2e", "--reply-on-resume", "--enable-auto-mode",
+                                      "--session-mirror", "-v"])
+    def test_hidden_boolean_flags_do_not_swallow_the_prompt(self, flag):
+        # `claude --plan-mode-required "prompt"` must not keep the prompt as
+        # the flag's value: it would be sent again on resume.
+        assert sess.build_relaunch_argv([CLAUDE, flag, "do the task", "--model", "m"],
+                                        "sid") == [CLAUDE, flag, "--model", "m",
+                                                   "--resume", "sid"]
+
+    @pytest.mark.parametrize("flag", ["--channels", "--dangerously-load-development-channels"])
+    def test_variadic_channels_keep_every_value(self, flag):
+        argv = [CLAUDE, flag, "a", "b", "--model", "m"]
+        assert sess.build_relaunch_argv(argv, "sid") == [CLAUDE, flag, "a", "b", "--model",
+                                                         "m", "--resume", "sid"]
+
+    @pytest.mark.parametrize("flag", ["--rc", "--remote", "--project"])
+    def test_optional_value_flag_followed_by_option(self, flag):
+        assert sess.build_relaunch_argv([CLAUDE, flag, "--model", "opus"], "sid") == [
+            CLAUDE, flag, "--model", "opus", "--resume", "sid"]
+
+    def test_unknown_flag_never_swallows_a_following_option(self):
+        argv = [CLAUDE, "--brand-new", "--model", "opus", "--other-new", "v", "prompt"]
+        groups, prompt = sess.split_claude_args(argv[1:])
+        assert groups == [["--brand-new"], ["--model", "opus"], ["--other-new", "v"]]
+        assert prompt == ["prompt"]
+        assert sess.unknown_flags(argv) == ["--brand-new", "--other-new"]
+
+    def test_value_flag_takes_a_value_starting_with_dash(self):
+        groups, _ = sess.split_claude_args(["--append-system-prompt", "-x", "--verbose"])
+        assert groups == [["--append-system-prompt", "-x"], ["--verbose"]]
+
+    def test_agent_team_flags_are_kept_with_their_values(self):
+        argv = [CLAUDE, "--agent-id", "a@t", "--team-name", "t", "--plan-mode-required",
+                "--agent-color", "blue", "start"]
+        assert sess.unknown_flags(argv) == []
+        assert sess.build_relaunch_argv(argv, "sid") == [*argv[:-1], "--resume", "sid"]
+
+    def test_restart_warns_about_unknown_flags(self, host):
+        host.add_shell_pane("a:0.0", 101, [CLAUDE, "--brand-new", "x"], "sid")
+        r = restarter(host).restart("a:0.0", nudge=None)
+        assert r.status == "OK", r.message
+        assert any("--brand-new" in w for w in r.warnings)
+
     def test_restart_does_not_resend_initial_prompt(self, host):
         host.add_shell_pane("a:0.0", 101, [CLAUDE, "--agent", "dev", "fix the bug"], "sid")
         r = restarter(host).restart("a:0.0", nudge=None)

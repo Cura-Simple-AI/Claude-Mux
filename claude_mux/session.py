@@ -53,26 +53,59 @@ SHELLS = {"bash", "zsh", "sh", "fish", "dash", "ksh", "-bash", "-zsh", "-sh"}
 #: ``--resume <sessionId>`` on relaunch.
 _SESSION_FLAGS = {"--resume", "-r", "--session-id", "--fork-session", "--continue", "-c"}
 
-#: How Claude Code's options consume values (from ``claude --help``). Any other
-#: option is assumed to take exactly one value. Needed to tell option values
-#: from the positional prompt, which must not be replayed on resume.
+#: How Claude Code's options consume values. Needed to tell option values from
+#: the positional prompt, which must not be replayed on resume. Taken from
+#: ``claude --help`` plus the hidden options in the argument scanner of the
+#: Claude Code CLI itself (2.1.x). Hidden options matter: agent-team panes are
+#: launched with ``--agent-id``, ``--team-name``, ``--plan-mode-required`` etc.
 _BOOL_FLAGS = {
-    "--allow-dangerously-skip-permissions", "--ax-screen-reader", "--bg", "--background",
-    "--bare", "--brief", "--chrome", "--no-chrome", "-c", "--continue",
-    "--dangerously-skip-permissions", "--desktop", "--disable-slash-commands",
-    "--exclude-dynamic-system-prompt-sections", "--fork-session", "--forward-subagent-text",
-    "--ide", "--include-hook-events", "--include-partial-messages",
-    "--no-session-persistence", "-p", "--print", "--replay-user-messages", "--restricted",
-    "--safe-mode", "--strict-mcp-config", "--tmux", "--verbose", "-h", "--help",
+    "-d2e", "--debug-to-stderr", "--verbose", "-p", "--print", "--bare", "--safe-mode",
+    "--init", "--init-only", "--maintenance", "--include-hook-events",
+    "--include-partial-messages", "--forward-subagent-text", "--session-mirror",
+    "--await-claim", "--await-initialize", "--dangerously-skip-permissions",
+    "--allow-dangerously-skip-permissions", "--replay-user-messages", "--enable-auth-status",
+    "--restricted", "--exclude-dynamic-system-prompt-sections", "-c", "--continue",
+    "--fork-session", "--deep-link-origin", "--no-session-persistence", "--reply-on-resume",
+    "--ide", "--desktop", "--strict-mcp-config", "--disable-slash-commands", "--chrome",
+    "--no-chrome", "--tmux", "--enable-auto-mode", "--bg", "--background", "--brief",
+    "--ax-screen-reader", "--plan-mode-required", "--hard-fail",
+    "--dangerously-allow-browser-network-access", "--local",
+    "-h", "--help", "-v", "-V", "--version",
 }
+#: Take the next argument only when it does not start with "-".
 _OPTIONAL_VALUE_FLAGS = {
-    "--cloud", "-d", "--debug", "--from-pr", "--prompt-suggestions", "--remote-control",
-    "-r", "--resume", "--teleport", "-w", "--worktree",
+    "-d", "--debug", "-r", "--resume", "--from-pr", "-w", "--worktree", "--teleport",
+    "--cloud", "--remote", "--project", "--remote-control", "--rc", "--prompt-suggestions",
 }
+#: Take every following argument up to the next one that starts with "-".
 _VARIADIC_FLAGS = {
-    "--add-dir", "--allowedTools", "--allowed-tools", "--betas", "--disallowedTools",
-    "--disallowed-tools", "--file", "--mcp-config", "--tools",
+    "--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools", "--tools",
+    "--add-dir", "--mcp-config", "--betas", "--file", "--channels",
+    "--dangerously-load-development-channels",
 }
+#: Always take exactly one value, even one that starts with "-".
+_VALUE_FLAGS = {
+    "--prefill", "--prefill-b64", "--deep-link-repo", "--deep-link-last-fetch",
+    "--deep-link-cwd-b64", "--handle-uri", "--settings", "--managed-settings",
+    "--setting-sources", "--client-data-url", "--watch-artifact",
+    "--watch-artifact-no-autoreact", "--team-name", "--agent-id", "--agent-name",
+    "--agent-color", "--parent-session-id", "--agent-type", "--model", "--agent", "--routine",
+    "--effort", "--permission-mode", "--inherit-permission-mode", "--proactivity",
+    "--debug-file", "--system-prompt", "--system-prompt-file", "--append-system-prompt",
+    "--append-system-prompt-file", "--system-prompt-snapshot",
+    "--append-subagent-system-prompt", "--append-subagent-system-prompt-file",
+    "--plan-mode-instructions", "--permission-prompt-tool", "--permission-prompts",
+    "--json-schema", "--fallback-model", "--advisor", "--agents", "--name", "-n",
+    "--plugin-dir", "--plugin-dir-no-mcp", "--plugin-url",
+    "--remote-control-session-name-prefix", "--sdk-url", "--exec", "-m", "--thinking",
+    "--thinking-display", "--max-thinking-tokens", "--max-turns", "--max-budget-usd",
+    "--task-budget", "--autocompact", "--rewind-files", "--resume-session-at",
+    "--resume-drops-turn", "--workload", "--output-format", "--input-format",
+    "--teammate-mode", "--messaging-socket-path", "--session-id", "--environment", "--pool",
+    "--ref", "--on-branch", "--correlation-id", "--forward-home-settings",
+    "--project-config-root", "--attach-serve",
+}
+_KNOWN_FLAGS = _BOOL_FLAGS | _OPTIONAL_VALUE_FLAGS | _VARIADIC_FLAGS | _VALUE_FLAGS
 
 #: Footer of a dialog. Exit and trust dialogs say "Enter to confirm", older
 #: selection lists "Enter to select"; permission prompts have no Enter hint
@@ -503,15 +536,28 @@ def split_claude_args(args: list[str]) -> tuple[list[list[str]], list[str]]:
             while i < len(args) and not args[i].startswith("-"):
                 group.append(args[i])
                 i += 1
-        elif flag in _OPTIONAL_VALUE_FLAGS:
-            if i < len(args) and not args[i].startswith("-"):
+        elif flag in _VALUE_FLAGS:
+            if i < len(args):
                 group.append(args[i])
                 i += 1
-        elif i < len(args):
+        elif i < len(args) and not args[i].startswith("-"):
+            # Optional-value flags, and unknown flags (assumed to take a value).
             group.append(args[i])
             i += 1
         groups.append(group)
     return groups, positional
+
+
+def unknown_flags(argv: list[str]) -> list[str]:
+    """Options in a Claude Code argv whose arity is not known."""
+    groups, _prompt = split_claude_args(_claude_args(argv))
+    return [g[0].split("=", 1)[0] for g in groups
+            if g[0].split("=", 1)[0] not in _KNOWN_FLAGS]
+
+
+def claude_head(argv: list[str]) -> list[str]:
+    """The executable part of a Claude Code argv (``node cli.js`` for node launches)."""
+    return argv[:2] if os.path.basename(argv[0]) == "node" else argv[:1]
 
 
 def has_bare_worktree(argv: list[str]) -> bool:
@@ -534,7 +580,7 @@ def build_relaunch_argv(argv: list[str], session_id: str, model: str | None = No
     directory itself (direct panes, and shell panes with a bare
     ``--worktree``).
     """
-    head = argv[:2] if os.path.basename(argv[0]) == "node" else argv[:1]
+    head = claude_head(argv)
     groups, _prompt = split_claude_args(_claude_args(argv))
     drop = set(_SESSION_FLAGS)
     if model:
@@ -759,6 +805,9 @@ class Restarter:
             model, warning = resolve_model(model or original, aliases)
             if warning:
                 result.warnings.append(warning)
+            for flag in [] if info.attached else unknown_flags(info.argv):
+                result.warnings.append(f"unknown option {flag}: assumed to take one value "
+                                       "unless the next argument starts with '-'")
             if info.state == "dialog":
                 # Pasting into a dialog would select an answer. Never do that.
                 result.status, result.message = "SKIPPED", "dialog open (Enter to select/confirm)"

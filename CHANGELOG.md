@@ -19,6 +19,12 @@ Format: [Semantic Versioning](https://semver.org/). Dates in ISO 8601.
 - `session restart`: a bare `--worktree` in the original command line is not replayed in shell
   panes (it would create a new worktree); the session resumes in its existing worktree cwd.
 
+### Fixed
+- `session restart`: complete option arity for Claude Code, including hidden boolean
+  (`--plan-mode-required`, `--init`, `-d2e`, …), variadic (`--channels`) and optional-value
+  (`--rc`, `--remote`, `--project`) options. Unknown options never consume an argument that
+  starts with `-`, and are reported as warnings.
+
 ---
 
 ## [0.1.3] — 2026-04-25
