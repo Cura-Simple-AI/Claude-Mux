@@ -493,11 +493,55 @@ def cmd_blacklist(name, model, remove_model, do_list, as_json):
 # probe — real inference test (same as TUI "Test" button)
 # ---------------------------------------------------------------------------
 
+def _probe_quota(name, all_subs, as_json):
+    """Implementation of `probe --quota`. Exits via sys.exit."""
+    from claude_mux.quota import measure_quota, format_row, NOT_OAUTH
+
+    cm, sync, im, fm = _managers()
+    if all_subs:
+        subs = [s for s in cm.subscriptions if s.get("auth_type") == "oauth"]
+    elif name:
+        sub = _find_sub(cm, name)
+        if not sub:
+            click.echo(f"Error: subscription '{name}' not found", err=True)
+            sys.exit(3)
+        subs = [sub]
+    else:
+        sub_id = sync.detect_active()
+        if not sub_id:
+            click.echo("Error: no active subscription", err=True)
+            sys.exit(3)
+        sub = cm.get_subscription(sub_id)
+        if not sub:
+            click.echo(f"Error: active subscription '{sub_id}' not found in config", err=True)
+            sys.exit(3)
+        subs = [sub]
+
+    results = [measure_quota(s) for s in subs]
+    if as_json:
+        click.echo(json.dumps(results))
+    else:
+        for r in results:
+            click.echo(format_row(r))
+
+    # Non-OAuth profiles are neutral; an OAuth profile that was not measured is a failure.
+    oauth = [r for r in results if r.get("reason") != NOT_OAUTH]
+    reached = [r for r in oauth if r["measured"] or r.get("http_code") or r.get("network_error")]
+    if not any(r["measured"] for r in results) and not reached:
+        sys.exit(2)
+    if any(not r["measured"] for r in oauth):
+        sys.exit(4)
+
+
 @cli.command("probe")
 @click.argument("name", required=False)
 @click.option("--model", default="", help="Model override (default: haiku map, then sonnet map, then claude-haiku-4-5-20251001)")
+@click.option("--quota", is_flag=True,
+              help="Measure OAuth rate-limit usage (week / 5h) instead of testing the proxy")
+@click.option("--all", "all_subs", is_flag=True,
+              help="With --quota: measure every subscription with auth_type oauth")
 @click.option("--json", "as_json", is_flag=True)
-def cmd_probe(name, model, as_json):
+def cmd_probe(name, model, quota, all_subs, as_json):
     """Send a real inference request to a subscription's proxy.
 
     Same as pressing the Test button in the TUI — posts a message to
@@ -505,8 +549,31 @@ def cmd_probe(name, model, as_json):
 
     NAME: subscription name or id (defaults to active subscription).
 
-    Exit code 4 if the request fails.
+    With --quota, OAuth subscriptions are measured directly against
+    api.anthropic.com (no proxy needed): one 1-token haiku call per profile,
+    reading the anthropic-ratelimit-unified-* headers (also on HTTP 429).
+    Prints name | HTTP code | week % | week reset | 5h % | 5h reset | status.
+    The token is never printed or logged. Non-OAuth profiles print
+    "cannot be measured" and do not fail the run. Reset times use the host's
+    local time zone (honours TZ) and print its name, e.g. CET.
+
+    \b
+    Exit codes:
+      0  success (--quota: every OAuth profile measured)
+      2  --quota: unmeasurable (nothing could be measured)
+      3  subscription not found / not running
+      4  request failed (--quota: an OAuth profile failed or was not measured)
     """
+    if all_subs and not quota:
+        raise click.UsageError("--all requires --quota")
+    if quota and model:
+        raise click.UsageError("--model cannot be combined with --quota")
+    if quota and all_subs and name:
+        raise click.UsageError("NAME cannot be combined with --all")
+    if quota:
+        _probe_quota(name, all_subs, as_json)
+        return
+
     import urllib.request
     import time as _time
 
