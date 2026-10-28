@@ -174,6 +174,38 @@ Exit code `4` if health check fails.
 
 ---
 
+### `claude-mux probe [name]`
+
+Send a real inference request to a subscription's local proxy (default), or with `--quota`
+measure OAuth rate-limit usage.
+
+```bash
+claude-mux probe deepseek                 # proxy inference test
+claude-mux probe acct-a --quota           # one OAuth profile
+claude-mux probe --quota --all            # every subscription with auth_type oauth
+claude-mux probe --quota --all --json     # machine-readable
+```
+
+With `--quota` no proxy is needed: one 1-token haiku call per OAuth profile goes directly to
+`api.anthropic.com` (`anthropic-beta: oauth-2025-04-20`) and the `anthropic-ratelimit-unified-*`
+headers are read — also on HTTP 429. The token is never printed, logged or put in an error
+message; network errors print the exception type only.
+
+```
+acct-a | HTTP 200 | week 42 % | week resets Wed 29/10 14:00 | 5h 7 % | 5h resets Tue 28/10 19:00 | status allowed
+deepseek | cannot be measured: not an OAuth profile
+```
+
+**JSON fields:** `name`, `measured`, `http_code`, `week_pct`, `week_reset_epoch`,
+`five_hour_pct`, `five_hour_reset_epoch`, `status` (plus `reason` when not measured).
+
+**Exit codes (`--quota`):** `0` all measured · `2` unmeasurable (no OAuth profile to measure) ·
+`3` subscription not found · `4` at least one request failed.
+
+**TUI equivalent:** none — the TUI has no quota view, so this CLI command stands on its own.
+
+---
+
 ### `claude-mux edit <name>`
 
 Edit a subscription's settings interactively or via flags.
@@ -596,6 +628,7 @@ claude-mux test || claude-mux failover
 | `x` | `claude-mux failover` | Manual failover |
 | `h` | `claude-mux --help` | Help |
 | `q` | (exit TUI) | — |
+| — | `claude-mux probe --quota [--all]` | Measure OAuth week / 5h rate-limit usage (no TUI view) |
 | — | `claude-mux active` | Print active subscription name |
 | — | `claude-mux init` | Install Claude Code status line |
 | — | `claude-mux session list` | List Claude Code sessions in tmux (TUI view may follow) |
