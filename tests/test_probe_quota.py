@@ -210,3 +210,107 @@ class TestProbeQuota:
         # old path: oauth sub has no proxy port -> "not running", exit 3
         assert r.exit_code == 3
         assert "not running" in _all_output(r)
+
+
+class TestExitSemantics:
+    def test_all_with_unmeasured_oauth_profile_is_not_exit_0(self, runner, tmp_dir):
+        cm = _setup(tmp_dir)
+        cm.add_subscription("empty", "", "", auth_type="oauth")
+        with patch("claude_mux.quota.urllib.request.urlopen", return_value=_ok_response()):
+            r = _run(runner, cm, ["--quota", "--all"])
+        assert "acct-a | HTTP 200" in r.output
+        assert "empty | cannot be measured: no token stored" in r.output
+        assert r.exit_code == 4
+
+    def test_single_oauth_without_token_is_unmeasurable_exit_2(self, runner, tmp_dir):
+        cm = hs.ConfigManager(data_file=tmp_dir / "subs.json")
+        cm.add_subscription("empty", "", "", auth_type="oauth")
+        r = _run(runner, cm, ["empty", "--quota"])
+        assert r.exit_code == 2
+
+    def test_http_error_without_headers_does_not_crash(self, runner, tmp_dir):
+        cm = _setup(tmp_dir)
+        err = urllib.error.HTTPError("https://api.anthropic.com/v1/messages",
+                                     502, "bad gateway", None, None)
+        with patch("claude_mux.quota.urllib.request.urlopen", side_effect=err):
+            r = _run(runner, cm, ["acct-a", "--quota"])
+        assert r.exception is None or isinstance(r.exception, SystemExit)
+        assert r.exit_code == 4
+        assert "502" in r.output
+
+    def test_401_text_says_rejected_or_expired(self, runner, tmp_dir):
+        cm = _setup(tmp_dir)
+        with patch("claude_mux.quota.urllib.request.urlopen",
+                   side_effect=_http_error(401, headers={})):
+            r = _run(runner, cm, ["acct-a", "--quota"])
+        assert "token rejected or expired" in r.output
+        assert SENTINEL not in _all_output(r)
+
+    def test_active_id_missing_from_config_exit_3(self, runner, tmp_dir):
+        cm = _setup(tmp_dir)
+        sync = MagicMock()
+        sync.detect_active.return_value = "ghost-id"
+        with patch("claude_mux.cli._managers", return_value=(cm, sync, None, None)):
+            r = runner.invoke(cli, ["probe", "--quota"])
+        assert r.exception is None or isinstance(r.exception, SystemExit)
+        assert r.exit_code == 3
+        assert "not found" in _all_output(r)
+
+
+class TestUsageErrors:
+    def test_all_without_quota_rejected(self, runner, tmp_dir):
+        r = _run(runner, _setup(tmp_dir), ["--all"])
+        assert r.exit_code == 2
+        assert "--all" in _all_output(r) and "--quota" in _all_output(r)
+
+    def test_model_with_quota_rejected(self, runner, tmp_dir):
+        r = _run(runner, _setup(tmp_dir), ["acct-a", "--quota", "--model", "x"])
+        assert r.exit_code == 2
+        assert "--model" in _all_output(r)
+
+    def test_name_with_all_rejected(self, runner, tmp_dir):
+        with patch("claude_mux.quota.urllib.request.urlopen") as m:
+            r = _run(runner, _setup(tmp_dir), ["acct-a", "--quota", "--all"])
+        assert r.exit_code == 2
+        m.assert_not_called()
+
+
+class TestResetTimeZone:
+    # 1793200000 = 2026-10-28 15:06:40 UTC (CET in Copenhagen: DST ended 25/10)
+    # 1774800000 = 2026-03-29 16:00:00 UTC (CEST: DST began 29/03)
+    @pytest.fixture()
+    def tz(self, monkeypatch):
+        import time
+
+        def _set(name):
+            monkeypatch.setenv("TZ", name)
+            time.tzset()
+        yield _set
+        monkeypatch.undo()
+        time.tzset()
+
+    def test_utc_names_zone(self, tz):
+        tz("UTC")
+        assert quota._local(1793200000) == "Wed 28/10 15:06 UTC"
+
+    def test_copenhagen_winter_names_cet(self, tz):
+        tz("Europe/Copenhagen")
+        assert quota._local(1793200000) == "Wed 28/10 16:06 CET"
+
+    def test_copenhagen_summer_names_cest(self, tz):
+        tz("Europe/Copenhagen")
+        assert quota._local(1774800000) == "Sun 29/03 18:00 CEST"
+
+    def test_dst_change_two_instants(self, tz):
+        tz("Europe/Copenhagen")
+        # 2026-03-29 00:30 UTC (01:30 CET) and 02:30 UTC (04:30 CEST)
+        assert quota._local(1774744200) == "Sun 29/03 01:30 CET"
+        assert quota._local(1774751400) == "Sun 29/03 04:30 CEST"
+
+    def test_row_contains_zone(self, tz):
+        tz("Europe/Copenhagen")
+        row = quota.format_row({"name": "a", "measured": True, "http_code": 200,
+                                "week_pct": 1.0, "week_reset_epoch": 1793200000,
+                                "five_hour_pct": 2.0, "five_hour_reset_epoch": 1793100000,
+                                "status": "allowed"})
+        assert "CET" in row

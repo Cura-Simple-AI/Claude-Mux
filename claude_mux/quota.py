@@ -16,6 +16,7 @@ import urllib.request
 API_URL = "https://api.anthropic.com/v1/messages"
 QUOTA_MODEL = "claude-haiku-4-5-20251001"
 _PREFIX = "anthropic-ratelimit-unified-"
+NOT_OAUTH = "not an OAuth profile"
 
 
 def _num(value):
@@ -62,7 +63,7 @@ def measure_quota(sub: dict, timeout: int = 30) -> dict:
     """
     name = sub.get("name", "")
     if sub.get("auth_type") != "oauth":
-        return {"name": name, "measured": False, "reason": "not an OAuth profile"}
+        return {"name": name, "measured": False, "reason": NOT_OAUTH}
     token = sub.get("api_key")
     if not token:
         return {"name": name, "measured": False, "reason": "no token stored"}
@@ -83,7 +84,7 @@ def measure_quota(sub: dict, timeout: int = 30) -> dict:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 code, headers = resp.status, resp.headers
         except urllib.error.HTTPError as e:
-            code, headers = e.code, e.headers
+            code, headers = e.code, (e.headers or {})
     except Exception as e:  # report the type only: a message could echo the request
         return {"name": name, "measured": False, "reason": type(e).__name__,
                 "network_error": True}
@@ -91,7 +92,10 @@ def measure_quota(sub: dict, timeout: int = 30) -> dict:
     q = parse_quota_headers(headers)
     result = {"name": name, "measured": _has_quota(q), "http_code": code, **q}
     if not result["measured"]:
-        result["reason"] = f"HTTP {code} without quota headers"
+        reason = f"HTTP {code} without quota headers"
+        if code == 401:
+            reason = "HTTP 401 (token rejected or expired)"
+        result["reason"] = reason
     return result
 
 
@@ -100,10 +104,11 @@ def _pct(v):
 
 
 def _local(epoch):
+    """Render an epoch in the host's local zone (honours TZ), naming the zone."""
     if epoch is None:
         return "-"
     return (datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc)
-            .astimezone().strftime("%a %d/%m %H:%M"))
+            .astimezone().strftime("%a %d/%m %H:%M %Z"))
 
 
 def format_row(r: dict) -> str:

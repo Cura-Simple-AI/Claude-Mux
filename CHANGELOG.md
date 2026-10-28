@@ -12,8 +12,10 @@ Format: [Semantic Versioning](https://semver.org/). Dates in ISO 8601.
 - `probe --quota [--all] [--json]`: measures OAuth rate-limit usage (week and 5h utilization, reset
   times, status) with one 1-token haiku call per OAuth profile directly against api.anthropic.com,
   reading the `anthropic-ratelimit-unified-*` headers (also on HTTP 429). The token is never
-  printed or logged; network errors show the exception type only. Exit codes: 0 all measured,
-  2 unmeasurable, 4 a request failed. Plain `probe` is unchanged.
+  printed or logged; network errors show the exception type only. Reset times name the host time zone (honours `TZ`).
+  Exit codes: 0 all OAuth profiles measured, 2 unmeasurable, 3 subscription not found, 4 a request
+  failed or an OAuth profile was not measured. `--all` without `--quota`, `--model` with `--quota`
+  and NAME with `--all` are usage errors. Plain `probe` is unchanged.
 - `session list` and `session restart` (single pane, `--self`, `--all`): safe exit and resume of
   Claude Code sessions in tmux — refuses open dialogs, always keeps worktrees, expands short
   model aliases, nudges the agent to recreate scheduled loops after resume.

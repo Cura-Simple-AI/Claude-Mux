@@ -495,7 +495,7 @@ def cmd_blacklist(name, model, remove_model, do_list, as_json):
 
 def _probe_quota(name, all_subs, as_json):
     """Implementation of `probe --quota`. Exits via sys.exit."""
-    from claude_mux.quota import measure_quota, format_row
+    from claude_mux.quota import measure_quota, format_row, NOT_OAUTH
 
     cm, sync, im, fm = _managers()
     if all_subs:
@@ -511,7 +511,11 @@ def _probe_quota(name, all_subs, as_json):
         if not sub_id:
             click.echo("Error: no active subscription", err=True)
             sys.exit(3)
-        subs = [cm.get_subscription(sub_id)]
+        sub = cm.get_subscription(sub_id)
+        if not sub:
+            click.echo(f"Error: active subscription '{sub_id}' not found in config", err=True)
+            sys.exit(3)
+        subs = [sub]
 
     results = [measure_quota(s) for s in subs]
     if as_json:
@@ -520,10 +524,12 @@ def _probe_quota(name, all_subs, as_json):
         for r in results:
             click.echo(format_row(r))
 
-    attempted = [r for r in results if r["measured"] or r.get("http_code") or r.get("network_error")]
-    if not any(r["measured"] for r in results) and not attempted:
+    # Non-OAuth profiles are neutral; an OAuth profile that was not measured is a failure.
+    oauth = [r for r in results if r.get("reason") != NOT_OAUTH]
+    reached = [r for r in oauth if r["measured"] or r.get("http_code") or r.get("network_error")]
+    if not any(r["measured"] for r in results) and not reached:
         sys.exit(2)
-    if any(not r["measured"] for r in attempted):
+    if any(not r["measured"] for r in oauth):
         sys.exit(4)
 
 
@@ -548,15 +554,22 @@ def cmd_probe(name, model, quota, all_subs, as_json):
     reading the anthropic-ratelimit-unified-* headers (also on HTTP 429).
     Prints name | HTTP code | week % | week reset | 5h % | 5h reset | status.
     The token is never printed or logged. Non-OAuth profiles print
-    "cannot be measured" and do not fail the run.
+    "cannot be measured" and do not fail the run. Reset times use the host's
+    local time zone (honours TZ) and print its name, e.g. CET.
 
     \b
     Exit codes:
-      0  success (--quota: every profile measured)
-      2  --quota: unmeasurable (no OAuth profile to measure)
+      0  success (--quota: every OAuth profile measured)
+      2  --quota: unmeasurable (nothing could be measured)
       3  subscription not found / not running
-      4  request failed (--quota: at least one request failed)
+      4  request failed (--quota: an OAuth profile failed or was not measured)
     """
+    if all_subs and not quota:
+        raise click.UsageError("--all requires --quota")
+    if quota and model:
+        raise click.UsageError("--model cannot be combined with --quota")
+    if quota and all_subs and name:
+        raise click.UsageError("NAME cannot be combined with --all")
     if quota:
         _probe_quota(name, all_subs, as_json)
         return

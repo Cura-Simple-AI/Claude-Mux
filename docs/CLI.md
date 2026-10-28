@@ -192,15 +192,27 @@ headers are read — also on HTTP 429. The token is never printed, logged or put
 message; network errors print the exception type only.
 
 ```
-acct-a | HTTP 200 | week 42 % | week resets Wed 29/10 14:00 | 5h 7 % | 5h resets Tue 28/10 19:00 | status allowed
+acct-a | HTTP 200 | week 42 % | week resets Wed 29/10 14:00 CET | 5h 7 % | 5h resets Tue 28/10 19:00 CET | status allowed
 deepseek | cannot be measured: not an OAuth profile
+```
+
+**Time zone:** reset times are shown in the host's local zone and the zone is printed (`CET`,
+`CEST`, `UTC`, …). The tool never hard-codes a zone; set `TZ` to choose one:
+
+```bash
+TZ=Europe/Copenhagen claude-mux probe --quota
 ```
 
 **JSON fields:** `name`, `measured`, `http_code`, `week_pct`, `week_reset_epoch`,
 `five_hour_pct`, `five_hour_reset_epoch`, `status` (plus `reason` when not measured).
 
-**Exit codes (`--quota`):** `0` all measured · `2` unmeasurable (no OAuth profile to measure) ·
-`3` subscription not found · `4` at least one request failed.
+**Exit codes (`--quota`):** `0` every OAuth profile measured · `2` unmeasurable (nothing could be
+measured, e.g. no OAuth profile) · `3` subscription not found (also: active subscription missing
+from the config) · `4` at least one request failed or an OAuth profile was not measured (e.g. no
+token stored). Non-OAuth profiles are skipped and do not affect the code.
+
+`--all` requires `--quota`; `--model` and NAME cannot be combined with `--quota` / `--all`
+respectively (usage error, exit 2).
 
 **TUI equivalent:** none — the TUI has no quota view, so this CLI command stands on its own.
 
