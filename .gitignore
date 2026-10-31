@@ -1,1 +1,38 @@
-claude_mux/__pycache__/*.pyc
+# Python bytecode and cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python build artifacts (note: claude_mux.egg-info/ is tracked and must remain)
+dist/
+build/
+
+# Python testing and analysis
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+htmlcov/
+
+# AI agent and editor files
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+AGENTS.md
+.cursor/
+.aider*
+.codex/
+
+# Environment files and logs
+.env
+.env.*
+*.log
