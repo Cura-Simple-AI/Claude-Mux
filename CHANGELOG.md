@@ -26,6 +26,12 @@ Format: [Semantic Versioning](https://semver.org/). Dates in ISO 8601.
 - `session restart`: a bare `--worktree` in the original command line is not replayed in shell
   panes (it would create a new worktree); the session resumes in its existing worktree cwd.
 
+### Changed
+- **Behaviour change (security):** the proxy now listens on `127.0.0.1` only (it used to listen on all
+  interfaces and send `Access-Control-Allow-Origin: *`), and refuses requests with an `Origin` header, CORS
+  preflights (`OPTIONS`) and non-local `Host` headers. Reaching a proxy from another machine no longer works.
+  Restart running proxies to apply it (an old `LISTEN_ADDR=:<port>` also means loopback now).
+
 ### Fixed
 - `session restart --nudge` on background (`claude attach`) panes (#16, root cause not yet
   reproduced — the issue stays open): more tolerant verification of the typed nudge (a long

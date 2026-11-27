@@ -4,8 +4,14 @@ claude-mux proxy — lightweight reverse proxy for Anthropic API.
 Reads from env:
   PROXY_TARGET_URL   upstream base (e.g. https://api.anthropic.com/v1)
   PROXY_AUTH_TOKEN   Bearer token sent to upstream
-  LISTEN_ADDR        bind address (default :18080)
+  LISTEN_ADDR        bind address (default 127.0.0.1:18080; an empty host also
+                     means 127.0.0.1 — the proxy injects the user's credentials,
+                     so it must not be reachable from the network)
   LOG_FILE           optional log file path (default stderr)
+
+Only local, non-browser clients are served: requests with an Origin header,
+CORS preflights and Host headers other than localhost are refused, so web pages
+(including DNS-rebinding attacks) cannot use the proxy.
 
 Usage:
   python3 -m claude_mux.proxy
@@ -22,7 +28,8 @@ import urllib.error
 import urllib.request
 
 LOG_FILE = os.environ.get("LOG_FILE")
-LISTEN_ADDR = os.environ.get("LISTEN_ADDR", ":18080")
+LISTEN_ADDR = os.environ.get("LISTEN_ADDR", "127.0.0.1:18080")
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 TARGET_URL = os.environ.get("PROXY_TARGET_URL", "").rstrip("/")
 AUTH_TOKEN = os.environ.get("PROXY_AUTH_TOKEN", "")
 # When set, log full request/response headers and bodies to stdout
@@ -151,6 +158,25 @@ def _parse_sse_usage(body: bytes) -> tuple:
     return model, input_tokens, output_tokens
 
 
+def _host_name(host_header: str) -> str:
+    """'localhost:18080' -> 'localhost', '[::1]:18080' -> '::1'."""
+    if host_header.startswith("["):
+        return host_header[1:host_header.find("]")]
+    return host_header.rsplit(":", 1)[0] if ":" in host_header else host_header
+
+
+def _refuse_browser_request(method: str, headers: dict) -> tuple[int, str] | None:
+    """Refuse anything a web page could send; Claude Code and the CLI send none of it."""
+    if method == "OPTIONS":
+        return 405, "CORS preflight is not supported: the proxy serves local clients only"
+    if "origin" in headers:
+        return 403, "requests from web pages (Origin header) are not allowed"
+    host = headers.get("host", "")
+    if host and _host_name(host).lower() not in _LOCAL_HOSTS:
+        return 403, f"unexpected Host header {host!r}: the proxy serves localhost only"
+    return None
+
+
 def _handle(conn, addr):
     """Handle one connection — read request, forward, stream response."""
     try:
@@ -158,6 +184,14 @@ def _handle(conn, addr):
         if req is None:
             return
         method, path, headers, body, qs = req
+
+        refusal = _refuse_browser_request(method, headers)
+        if refusal:
+            status, reason = refusal
+            _log_request(method, path, status, 0)
+            err = json.dumps({"error": {"type": "forbidden", "message": reason}}).encode()
+            _send_response(conn, status, err, ctype="application/json")
+            return
 
         # Health check
         if path == "/health":
@@ -230,7 +264,6 @@ def _handle(conn, addr):
                     f"Content-Type: {ctype}\r\n"
                     f"Transfer-Encoding: chunked\r\n"
                     f"Connection: close\r\n"
-                    f"Access-Control-Allow-Origin: *\r\n"
                     f"\r\n"
                 ).encode()
                 try:
@@ -361,14 +394,13 @@ def _parse_request(conn):
 def _send_response(conn, status: int, body: bytes, ctype: str = "application/json"):
     """Send HTTP/1.1 response."""
     status_text = {200: "OK", 400: "Bad Request", 401: "Unauthorized",
-                   404: "Not Found", 429: "Too Many Requests", 500: "Internal Server Error",
+                   403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed", 429: "Too Many Requests", 500: "Internal Server Error",
                    502: "Bad Gateway", 503: "Service Unavailable"}.get(status, "Unknown")
     resp = (
         f"HTTP/1.1 {status} {status_text}\r\n"
         f"Content-Type: {ctype}\r\n"
         f"Content-Length: {len(body)}\r\n"
         f"Connection: close\r\n"
-        f"Access-Control-Allow-Origin: *\r\n"
         f"\r\n"
     ).encode()
     try:
@@ -383,9 +415,10 @@ def _send_response(conn, status: int, body: bytes, ctype: str = "application/jso
 
 
 def main():
-    host, _, port_str = LISTEN_ADDR.partition(":")
+    host, _, port_str = LISTEN_ADDR.rpartition(":")
     port = int(port_str) if port_str else 18080
-    bind_addr = (host or "0.0.0.0", port)
+    # No host means loopback — never all interfaces (see LISTEN_ADDR above).
+    bind_addr = (host or "127.0.0.1", port)
 
     if not TARGET_URL:
         print("PROXY_TARGET_URL not set", file=sys.stderr)

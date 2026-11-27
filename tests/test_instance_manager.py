@@ -48,7 +48,7 @@ class TestGenerateEnvBearer:
         with patch.dict("os.environ", {"DS_KEY": "x"}):
             env_path = im.generate_env(sub["id"])
         content = env_path.read_text()
-        assert "LISTEN_ADDR=:18085" in content
+        assert "LISTEN_ADDR=127.0.0.1:18085" in content
 
     def test_sets_model_maps(self, tmp_setup):
         cm, im, _ = tmp_setup
