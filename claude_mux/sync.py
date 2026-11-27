@@ -26,6 +26,8 @@ log = logging.getLogger("claude-mux")
 
 
 _MODEL_ENV_KEYS = {k for k in PROVIDER_ENV_KEYS if k.endswith("_MODEL")}
+# The user's own pins: never removed, but they still tell which models were in use.
+_USER_MODEL_ENV_KEYS = {"ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL"}
 
 
 class ProxyNotRunningError(RuntimeError):
@@ -315,7 +317,7 @@ class SyncManager:
 
         # Models the previous provider served: settings.json env (what Claude Code was
         # using) and the model list of the previously active subscription.
-        previous_models = {v for k, v in env_block.items() if k in _MODEL_ENV_KEYS and isinstance(v, str)}
+        previous_models = {v for k, v in env_block.items() if k in _MODEL_ENV_KEYS | _USER_MODEL_ENV_KEYS and isinstance(v, str)}
         previous_sub = next((s for s in self.cm.subscriptions if s["name"] == self.read_active_name()), None)
         if previous_sub:
             previous_models |= set(previous_sub.get("available_models", []))
@@ -328,8 +330,17 @@ class SyncManager:
 
         # 4. A pinned model id that only the previous provider served would break the
         # new one. Any other pin is the user's own choice and is left alone.
+        # An OAuth profile without a fetched model list is "don't know", not "offers
+        # nothing": moving between two OAuth profiles (both Anthropic) keeps the pin.
+        offer_unknown = (
+            auth_type == "oauth"
+            and previous_sub is not None
+            and previous_sub.get("auth_type") == "oauth"
+            and not sub.get("available_models")
+        )
         pinned = settings.get("model")
-        if isinstance(pinned, str) and pinned not in CLAUDE_MODEL_ALIASES and pinned in previous_models:
+        if (isinstance(pinned, str) and pinned not in CLAUDE_MODEL_ALIASES and pinned in previous_models
+                and not offer_unknown):
             offered = {v for k, v in merged.items() if k in _MODEL_ENV_KEYS}
             offered |= set(sub.get("available_models", []))
             if pinned not in offered:

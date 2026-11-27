@@ -37,14 +37,15 @@ Format: [Semantic Versioning](https://semver.org/). Dates in ISO 8601.
   preflights (`OPTIONS`) and non-local `Host` headers. Reaching a proxy from another machine no longer works.
   Restart running proxies to apply it (an old `LISTEN_ADDR=:<port>` also means loopback now).
 - Activating a provider rewrites every provider-specific key in `~/.claude/settings.json`
-  (`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_MODEL`,
-  `ANTHROPIC_SMALL_FAST_MODEL`, `ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL`): each is set for
-  the new provider or removed. Previously, tiers without a model mapping kept the previous
-  provider's model names, so e.g. after switching (or failing over) from DeepSeek to Claude Max,
-  Claude Code requested `deepseek-reasoner` from Anthropic. A top-level `"model"` is removed only if
-  it pins an id the previous provider served and the new one does not offer; a model you pinned
-  yourself (e.g. `claude-opus-5-5`), aliases (`opus`, `sonnet`, ...), your own `ANTHROPIC_API_KEY`
-  and all other settings are kept.
+  (`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`,
+  `ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL`): each is set for the new provider or removed.
+  Previously, tiers without a model mapping kept the previous provider's model names, so e.g. after
+  switching (or failing over) from DeepSeek to Claude Max, Claude Code requested `deepseek-reasoner`
+  from Anthropic. A top-level `"model"` is removed only if it pins an id the previous provider served
+  and the new one does not offer; a switch between two OAuth profiles keeps it when the new profile
+  has no fetched model list yet. A model you pinned yourself (e.g. `claude-opus-5-5`), aliases
+  (`opus`, `sonnet`, ...), your own `ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL` and
+  `ANTHROPIC_API_KEY` (claude-mux never writes them) and all other settings are kept.
 - Activating a proxy provider whose proxy is not running is refused (CLI exit code 1, TUI
   notification) instead of pointing Claude Code at `http://localhost:0`. `failover` skips such
   providers.

@@ -108,13 +108,14 @@ claude-mux activate deepseek --json
 ```
 
 Updates `~/.claude/settings.json` with the correct env vars. All provider-specific keys
-(`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_MODEL`,
-`ANTHROPIC_SMALL_FAST_MODEL`, `ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL`) are set for the new
-provider or removed, so nothing of the previous provider is left behind; a model tier without a
-mapping falls back to Claude Code's default. A top-level `"model"` is only removed if it pins a
-model id that the previous provider served and the new one does not offer; a model you pinned
-yourself (e.g. `claude-opus-5-5`) and aliases such as `opus` are kept. Your other settings and env
-vars (including your own `ANTHROPIC_API_KEY`) are not touched.
+(`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`,
+`ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL`) are set for the new provider or removed, so nothing
+of the previous provider is left behind; a model tier without a mapping falls back to Claude Code's
+default. A top-level `"model"` is only removed if it pins a model id that the previous provider
+served and the new one does not offer (switching between two OAuth profiles keeps it while the new
+profile has no fetched model list); a model you pinned yourself (e.g. `claude-opus-5-5`) and aliases
+such as `opus` are kept. Your other settings and env vars (including your own `ANTHROPIC_API_KEY`,
+`ANTHROPIC_MODEL` and `ANTHROPIC_SMALL_FAST_MODEL`) are not touched.
 
 Proxy providers (bearer, Copilot, Gemini, OAuth via proxy) must be running: activating one that is
 stopped, or whose proxy no longer listens on its port (e.g. after a crash), exits with code 1 and a

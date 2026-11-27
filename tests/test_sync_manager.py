@@ -154,3 +154,36 @@ class TestPinnedModel:
         settings = _run_sync(cm, self._oauth_profile(cm), tmp_path, settings_path)
         assert settings["env"]["ANTHROPIC_API_KEY"] == "sk-user"
         assert settings["env"]["MY_VAR"] == "1"
+
+    def test_users_own_env_model_pins_are_not_touched(self, tmp_setup):
+        """ANTHROPIC_MODEL / ANTHROPIC_SMALL_FAST_MODEL are Claude Code's own pin
+        mechanism; claude-mux never writes them, so activation must not remove them."""
+        cm, tmp_path, settings_path = tmp_setup
+        settings_path.write_text(json.dumps({"env": {
+            "ANTHROPIC_MODEL": "claude-opus-5-5",
+            "ANTHROPIC_SMALL_FAST_MODEL": "claude-haiku-5-5",
+        }}))
+        settings = _run_sync(cm, self._oauth_profile(cm), tmp_path, settings_path)
+        assert settings["env"]["ANTHROPIC_MODEL"] == "claude-opus-5-5"
+        assert settings["env"]["ANTHROPIC_SMALL_FAST_MODEL"] == "claude-haiku-5-5"
+
+    def test_oauth_switch_keeps_pin_when_new_profile_model_list_is_unknown(self, tmp_setup):
+        """An empty/unfetched available_models means "don't know", not "not offered"."""
+        cm, tmp_path, settings_path = tmp_setup
+        settings_path.write_text(json.dumps({"model": "claude-opus-5-5", "env": {}}))
+        a = self._oauth_profile(cm, "profile-a")
+        cm.update_subscription_models(a["id"], ["claude-opus-5-5", "claude-sonnet-5-5"], 0.0)
+        _run_sync(cm, a, tmp_path, settings_path)
+        settings = _run_sync(cm, self._oauth_profile(cm, "profile-b"), tmp_path, settings_path)
+        assert settings["model"] == "claude-opus-5-5"
+
+    def test_oauth_switch_removes_pin_when_new_profile_list_is_known_and_lacks_it(self, tmp_setup):
+        cm, tmp_path, settings_path = tmp_setup
+        settings_path.write_text(json.dumps({"model": "claude-opus-5-5", "env": {}}))
+        a = self._oauth_profile(cm, "profile-a")
+        cm.update_subscription_models(a["id"], ["claude-opus-5-5"], 0.0)
+        _run_sync(cm, a, tmp_path, settings_path)
+        b = self._oauth_profile(cm, "profile-b")
+        cm.update_subscription_models(b["id"], ["claude-sonnet-5-5"], 0.0)
+        settings = _run_sync(cm, b, tmp_path, settings_path)
+        assert "model" not in settings

@@ -93,14 +93,13 @@ SETTINGS_KEYS_TO_REMOVE = {
 # Provider-specific keys in settings.json["env"]: endpoint, credentials and model
 # selection. claude-mux owns these — on every activation each one is either set
 # for the new provider or removed, so nothing from the previous provider lingers.
-# Keys not listed here (the user's own env vars, e.g. their ANTHROPIC_API_KEY, which
-# claude-mux never writes) are never touched.
+# Keys not listed here (the user's own env vars, e.g. their ANTHROPIC_API_KEY,
+# ANTHROPIC_MODEL and ANTHROPIC_SMALL_FAST_MODEL, which claude-mux never writes)
+# are never touched.
 PROVIDER_ENV_KEYS = {
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_AUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN",
-    "ANTHROPIC_MODEL",
-    "ANTHROPIC_SMALL_FAST_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
     "ANTHROPIC_DEFAULT_SONNET_MODEL",
     "ANTHROPIC_DEFAULT_OPUS_MODEL",

@@ -146,7 +146,7 @@ def test_switch_to_claude_max_leaves_nothing_of_the_previous_provider(cli, upstr
         "env": {
             "MY_OWN_VAR": "keep-me",
             "ANTHROPIC_API_KEY": "sk-user-own-key",    # the user's own: never touched
-            "ANTHROPIC_MODEL": "deepseek-chat",
+            "ANTHROPIC_MODEL": "deepseek-chat",        # the user's own pins: never touched
             "ANTHROPIC_SMALL_FAST_MODEL": "deepseek-chat",
         },
     })
@@ -160,6 +160,8 @@ def test_switch_to_claude_max_leaves_nothing_of_the_previous_provider(cli, upstr
     assert s["env"] == {
         "MY_OWN_VAR": "keep-me",
         "ANTHROPIC_API_KEY": "sk-user-own-key",
+        "ANTHROPIC_MODEL": "deepseek-chat",
+        "ANTHROPIC_SMALL_FAST_MODEL": "deepseek-chat",
         "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-max",
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         "ANTHROPIC_DISABLE_TELEMETRY": "true",
