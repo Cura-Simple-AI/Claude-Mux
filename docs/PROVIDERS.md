@@ -143,6 +143,8 @@ Claude Code → http://localhost:<port> → proxy → api.anthropic.com
                               Forwards: all Claude Code headers unchanged
 ```
 
+The proxy is local-only: it listens on `127.0.0.1`, and refuses requests with an `Origin` header, `OPTIONS` preflights and non-local `Host` headers (behaviour change; it was previously reachable from the network).
+
 The proxy forwards all request headers from Claude Code transparently (including `anthropic-beta`, `anthropic-version`, etc.) and injects `Authorization: Bearer <token>` if the client doesn't supply auth.
 
 **View logs:**

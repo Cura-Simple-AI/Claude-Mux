@@ -87,7 +87,9 @@ class InstanceManager:
 
         # Fill in known values
         self._set_line(lines, "ANTHROPIC_BASE_URL", sub["provider_url"])
-        self._set_line(lines, "LISTEN_ADDR", f":{port}")
+        # Loopback only: the proxy attaches the user's credentials to every request,
+        # so it must never be reachable from the network.
+        self._set_line(lines, "LISTEN_ADDR", f"127.0.0.1:{port}")
         self._set_line(lines, "MODEL_MAP_HAIKU", sub.get("model_maps", {}).get("haiku", ""))
         self._set_line(lines, "MODEL_MAP_SONNET", sub.get("model_maps", {}).get("sonnet", ""))
         self._set_line(lines, "MODEL_MAP_OPUS", sub.get("model_maps", {}).get("opus", ""))
