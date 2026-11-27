@@ -952,14 +952,10 @@ def cmd_force_model(name, model, tier, reset, as_json):
         sys.exit(3)
 
     if reset:
-        # update_subscription merges model_maps — to delete a key we must replace directly
+        # update_subscription merges model_maps — to delete a key we must replace them
         maps = dict(sub.get("model_maps", {}))
         maps.pop(tier, None)
-        for s in cm._data["subscriptions"]:
-            if s["id"] == sub["id"]:
-                s["model_maps"] = maps
-                cm._save()
-                break
+        cm.set_model_maps(sub["id"], maps)
         if as_json:
             click.echo(json.dumps({"ok": True, "name": sub["name"], "action": "reset", "tier": tier}))
         else:

@@ -13,14 +13,23 @@ import subprocess
 from pathlib import Path
 
 from claude_mux.config import (
+    CLAUDE_MODEL_ALIASES,
     CLAUDE_MUX_DIR,
-    SETTINGS_KEYS_TO_REMOVE,
+    PROVIDER_ENV_KEYS,
     ConfigManager,
     fetch_copilot_models,
     _atomic_write,
+    _port_is_available,
 )
 
 log = logging.getLogger("claude-mux")
+
+
+_MODEL_ENV_KEYS = {k for k in PROVIDER_ENV_KEYS if k.endswith("_MODEL")}
+
+
+class ProxyNotRunningError(RuntimeError):
+    """Activation refused: the subscription's local proxy is not running."""
 
 
 def extract_response_body(raw: str, code: int, max_len: int = 500) -> str:
@@ -230,17 +239,38 @@ class SyncManager:
         """Sync sub_id's .env → settings.json for Claude Code.
 
         Steps:
-        1. Copy instance .env to ~/.claude-mux/.env
-        2. Merge relevant keys (only MERGE_KEYS) to ~/.claude/settings.json
-        3. Set CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
-        4. Set ANTHROPIC_DISABLE_TELEMETRY=true
-        5. Write ~/.claude-mux/active-name for statusline
+        1. Refuse proxy providers whose proxy is not running (no port assigned) —
+           writing them would point Claude Code at http://localhost:0.
+        2. Copy instance .env to ~/.claude-mux/.env
+        3. Rewrite the provider-specific keys (PROVIDER_ENV_KEYS) in
+           ~/.claude/settings.json["env"]: each is set for the new provider or
+           removed, so no endpoint, credential or model name of the previous
+           provider is left behind. Other env vars are preserved.
+        4. Drop settings.json["model"] only if it pins a model id that the previous
+           provider served and the new one does not offer. Any other pin, and
+           aliases such as "opus", are kept.
+        5. Set CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1, ANTHROPIC_DISABLE_TELEMETRY=true
+        6. Write ~/.claude-mux/active-name for statusline
         """
         sub = self.cm.get_subscription(sub_id)
         if sub is None:
             raise ValueError(f"Subscription {sub_id} not found")
 
-        # 1. Copy instance .env to ~/.claude-mux/.env
+        auth_type = sub.get("auth_type", "bearer")
+        port = self.cm.get_instance_port(sub_id)
+        if auth_type not in ("oauth", "direct"):
+            hint = f"start it first (TUI: s, CLI: claude-mux start {sub['name']})"
+            if not port:
+                raise ProxyNotRunningError(
+                    f"'{sub['name']}' is served through a local proxy that is not running — {hint}"
+                )
+            if _port_is_available(port):
+                raise ProxyNotRunningError(
+                    f"'{sub['name']}' is served through a local proxy that is not running "
+                    f"(nothing is listening on port {port}) — {hint}"
+                )
+
+        # 2. Copy instance .env to ~/.claude-mux/.env
         # Import here to avoid circular import
         from claude_mux.instance import InstanceManager
         im = InstanceManager(self.cm)
@@ -248,76 +278,62 @@ class SyncManager:
         CLAUDE_MUX_DIR.mkdir(parents=True, exist_ok=True)
         shutil.copy2(inst_env, self.CLAUDE_MUX_DOT_ENV)
 
-        # 3. Merge to settings.json
+        # 3. Build the provider-specific env block from scratch
         settings = self._load_settings()
         env_block = settings.setdefault("env", {})
 
-        auth_type = sub.get("auth_type", "bearer")
         api_key = self._resolve_api_key(sub)
         provider_url = sub.get("provider_url", "")
-        port = self.cm.get_instance_port(sub_id) or 0
-        listen_addr = f"http://localhost:{port}"
+        listen_addr = f"http://localhost:{port or 0}"
 
-        # Build settings env block
-        merged = {}
-
+        merged: dict[str, str] = {}
         if auth_type == "oauth":
-            # Claude Max: remove proxy vars, set OAuth token directly
-            merged["ANTHROPIC_BASE_URL"] = None
-            merged["ANTHROPIC_AUTH_TOKEN"] = None
+            # Claude Max: no proxy, OAuth token directly
             if api_key:
                 merged["CLAUDE_CODE_OAUTH_TOKEN"] = api_key
-        elif auth_type == "oauth_proxy":
-            # OAuth via local proxy — Claude peger på localhost, token sendes af proxy
-            merged["ANTHROPIC_BASE_URL"] = listen_addr
-            if api_key:
-                merged["ANTHROPIC_AUTH_TOKEN"] = api_key
-            merged["CLAUDE_CODE_OAUTH_TOKEN"] = None
         elif auth_type == "direct":
             # Direct Anthropic-compatible API (e.g. z.ai) — no proxy needed
             merged["ANTHROPIC_BASE_URL"] = provider_url
             if api_key:
                 merged["ANTHROPIC_AUTH_TOKEN"] = api_key
-            merged["CLAUDE_CODE_OAUTH_TOKEN"] = None
         else:
+            # bearer, gh_token, oauth_proxy, x-goog-api-key: Claude points at the local proxy
             merged["ANTHROPIC_BASE_URL"] = listen_addr
             if api_key:
                 merged["ANTHROPIC_AUTH_TOKEN"] = api_key
-            # Clear OAuth token so Claude doesn't use it instead of proxy
-            merged["CLAUDE_CODE_OAUTH_TOKEN"] = None
-        merged["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
-        merged["ANTHROPIC_DISABLE_TELEMETRY"] = "true"
 
-        # Map model maps to settings via ANTHROPIC_DEFAULT_*_MODEL.
-        # If force_model is set on the subscription, all three aliases map to it.
+        # Model maps → ANTHROPIC_DEFAULT_*_MODEL. force_model maps all three tiers
+        # to one model. Tiers without a mapping are removed (Claude Code defaults).
         model_maps = sub.get("model_maps", {})
         force_model = sub.get("force_model", "")
-        _aliases = (
-            ("haiku", "ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-            ("sonnet", "ANTHROPIC_DEFAULT_SONNET_MODEL"),
-            ("opus", "ANTHROPIC_DEFAULT_OPUS_MODEL"),
-        )
-        if force_model and force_model != "__none__":
-            # Force all aliases to the same model — override any model_maps
-            for _, env_key in _aliases:
+        for tier in ("haiku", "sonnet", "opus"):
+            env_key = f"ANTHROPIC_DEFAULT_{tier.upper()}_MODEL"
+            if force_model and force_model != "__none__":
                 merged[env_key] = force_model
-        else:
-            for map_key, env_key in _aliases:
-                if model_maps.get(map_key):
-                    merged[env_key] = model_maps[map_key]
-                # Empty model_map → leave existing env var untouched (don't write None)
+            elif model_maps.get(tier):
+                merged[env_key] = model_maps[tier]
 
-        # Clear deprecated custom model keys
-        for key in SETTINGS_KEYS_TO_REMOVE:
+        # Models the previous provider served: settings.json env (what Claude Code was
+        # using) and the model list of the previously active subscription.
+        previous_models = {v for k, v in env_block.items() if k in _MODEL_ENV_KEYS and isinstance(v, str)}
+        previous_sub = next((s for s in self.cm.subscriptions if s["name"] == self.read_active_name()), None)
+        if previous_sub:
+            previous_models |= set(previous_sub.get("available_models", []))
+
+        for key in PROVIDER_ENV_KEYS:
             env_block.pop(key, None)
+        env_block.update(merged)
+        env_block["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+        env_block["ANTHROPIC_DISABLE_TELEMETRY"] = "true"
 
-        # Merge: preserve existing env vars, update/overwrite with merged.
-        # None values = remove key (used by OAuth to clear proxy)
-        for key, val in merged.items():
-            if val is None:
-                env_block.pop(key, None)
-            else:
-                env_block[key] = val
+        # 4. A pinned model id that only the previous provider served would break the
+        # new one. Any other pin is the user's own choice and is left alone.
+        pinned = settings.get("model")
+        if isinstance(pinned, str) and pinned not in CLAUDE_MODEL_ALIASES and pinned in previous_models:
+            offered = {v for k, v in merged.items() if k in _MODEL_ENV_KEYS}
+            offered |= set(sub.get("available_models", []))
+            if pinned not in offered:
+                del settings["model"]
 
         self._save_settings(settings)
 
@@ -330,9 +346,10 @@ class SyncManager:
 
         return {
             "default": sub["name"],
-            "port": port,
+            "port": port or 0,
             "base_url": listen_addr,
-            "keys_updated": list(merged.keys()),
+            "keys_updated": sorted(set(merged) | {"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+                                                  "ANTHROPIC_DISABLE_TELEMETRY"}),
         }
 
     # ------------------------------------------------------------------

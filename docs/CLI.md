@@ -107,9 +107,20 @@ claude-mux activate claude-max
 claude-mux activate deepseek --json
 ```
 
-Updates `~/.claude/settings.json` with the correct env vars.
+Updates `~/.claude/settings.json` with the correct env vars. All provider-specific keys
+(`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_MODEL`,
+`ANTHROPIC_SMALL_FAST_MODEL`, `ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL`) are set for the new
+provider or removed, so nothing of the previous provider is left behind; a model tier without a
+mapping falls back to Claude Code's default. A top-level `"model"` is only removed if it pins a
+model id that the previous provider served and the new one does not offer; a model you pinned
+yourself (e.g. `claude-opus-5-5`) and aliases such as `opus` are kept. Your other settings and env
+vars (including your own `ANTHROPIC_API_KEY`) are not touched.
 
-**TUI equivalent:** `Enter` (Set Default)
+Proxy providers (bearer, Copilot, Gemini, OAuth via proxy) must be running: activating one that is
+stopped, or whose proxy no longer listens on its port (e.g. after a crash), exits with code 1 and a
+hint to run `claude-mux start <name>` first, leaving settings.json unchanged.
+
+**TUI equivalent:** `Enter` or `1`–`9` (switches immediately)
 
 ---
 
@@ -120,6 +131,11 @@ Start the proxy for a subscription (pm2).
 ```bash
 claude-mux start deepseek
 ```
+
+Waits until the proxy accepts connections (up to 10 s). If it does not — for example because the
+API key variable is not exported — the command exits with code 1, prints the proxy's own error
+output and removes the pm2 process. Proxies listen on `127.0.0.1` only and refuse requests from web
+pages, since they attach your credentials to every request.
 
 **TUI equivalent:** `s` (Start)
 

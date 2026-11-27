@@ -1,0 +1,11 @@
+# Coverage for the E2E suite: `make coverage-e2e`.
+# patch = subprocess measures every Python process the tests start (CLI runs,
+# proxies launched through the pm2 stand-in, the status line script, ...).
+[run]
+source = claude_mux
+parallel = true
+patch = subprocess
+sigterm = true
+
+[report]
+precision = 1

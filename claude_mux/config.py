@@ -30,6 +30,8 @@ def _check_and_install_deps():
 
 _check_and_install_deps()
 
+import contextlib
+import functools
 import json
 import logging
 import os
@@ -37,9 +39,15 @@ import re
 import shutil
 import socket
 import subprocess
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover — non-POSIX: thread lock only
+    fcntl = None
 
 # Safe subscription name: alphanumeric, dots, hyphens, underscores; max 100 chars.
 # Prevents path traversal (no slashes) and shell injection.
@@ -81,6 +89,26 @@ SETTINGS_KEYS_TO_REMOVE = {
     "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME",
     "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION",
 }
+
+# Provider-specific keys in settings.json["env"]: endpoint, credentials and model
+# selection. claude-mux owns these — on every activation each one is either set
+# for the new provider or removed, so nothing from the previous provider lingers.
+# Keys not listed here (the user's own env vars, e.g. their ANTHROPIC_API_KEY, which
+# claude-mux never writes) are never touched.
+PROVIDER_ENV_KEYS = {
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+} | SETTINGS_KEYS_TO_REMOVE
+
+# Provider-neutral model aliases for settings.json["model"] (Claude Code resolves
+# them through ANTHROPIC_DEFAULT_*_MODEL), so they survive a provider switch.
+CLAUDE_MODEL_ALIASES = {"default", "sonnet", "opus", "haiku", "opusplan", "sonnet[1m]", "opus[1m]"}
 
 # --- .env template keys ---
 
@@ -254,16 +282,78 @@ def _atomic_write(path: Path, data: dict):
     path.chmod(0o600)
 
 
+def _reads(method):
+    """Re-read subscriptions.json first if another process changed it."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        self._refresh()
+        return method(self, *args, **kwargs)
+    return wrapper
+
+
+def _mutates(method):
+    """Run a read-modify-write under the config lock, on fresh data."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._locked():
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
 class ConfigManager:
     """Central config manager for ~/.claude-mux/subscriptions.json.
 
-    No caching — every CRUD operation reads/writes directly to disk.
+    The file is shared by every claude-mux process (TUI, CLI, session helpers).
+    Reads pick up changes made by other processes (cheap stat check), and every
+    change is a locked read-modify-write on fresh data, so a long-running TUI
+    never writes a stale copy over subscriptions added from the CLI.
     """
 
     def __init__(self, data_file: Path | None = None):
         self._data_file: Path = data_file or SUBSCRIPTIONS_FILE
+        self._lock_file: Path = self._data_file.with_name(self._data_file.name + ".lock")
+        self._thread_lock = threading.RLock()
+        self._lock_depth = 0
+        self._disk_sig: tuple | None = None
         self._ensure_dir()
         self._data = self._load()
+
+    # --- Cross-process consistency ---
+
+    def _signature(self) -> tuple | None:
+        try:
+            st = self._data_file.stat()
+        except OSError:
+            return None
+        return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+    def _refresh(self):
+        """Reload if the file on disk is not the version we last read or wrote."""
+        with self._thread_lock:  # waits while another thread is mid-change
+            if self._lock_depth:
+                return  # this thread is inside a locked change: data is already fresh
+            if self._signature() != self._disk_sig:
+                self._data = self._load()
+
+    @contextlib.contextmanager
+    def _locked(self):
+        """Exclusive lock (threads + processes) around a read-modify-write."""
+        with self._thread_lock:
+            fd = None
+            if self._lock_depth == 0:
+                if fcntl is not None:
+                    fd = os.open(self._lock_file, os.O_RDWR | os.O_CREAT, 0o600)
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                if self._signature() != self._disk_sig:
+                    self._data = self._load()
+            self._lock_depth += 1
+            try:
+                yield
+            finally:
+                self._lock_depth -= 1
+                if fd is not None:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    os.close(fd)
 
     # --- Directory setup ---
 
@@ -273,6 +363,7 @@ class ConfigManager:
     # --- Load / Save ---
 
     def _load(self) -> dict:
+        self._disk_sig = self._signature()
         if not self._data_file.exists():
             import copy
             return copy.deepcopy(EMPTY_SUBSCRIPTIONS)
@@ -293,6 +384,7 @@ class ConfigManager:
         if len(data["subscriptions"]) != before_count:
             # Persist migration so it doesn't re-run on next start
             _atomic_write(self._data_file, data)
+            self._disk_sig = self._signature()
         return data
 
     @staticmethod
@@ -321,13 +413,16 @@ class ConfigManager:
 
     def _save(self):
         _atomic_write(self._data_file, self._data)
+        self._disk_sig = self._signature()
 
     @property
+    @_reads
     def subscriptions(self) -> list:
         return list(self._data.get("subscriptions", []))
 
     # --- Subscription CRUD ---
 
+    @_mutates
     def add_subscription(
         self,
         name: str,
@@ -372,12 +467,14 @@ class ConfigManager:
         self._save()
         return sub
 
+    @_reads
     def get_subscription(self, sub_id: str) -> dict | None:
         for sub in self._data["subscriptions"]:
             if sub["id"] == sub_id:
                 return sub
         return None
 
+    @_mutates
     def update_subscription(self, sub_id: str, **kwargs) -> dict | None:
         sub = self.get_subscription(sub_id)
         if sub is None:
@@ -399,6 +496,7 @@ class ConfigManager:
         self._save()
         return sub
 
+    @_mutates
     def delete_subscription(self, sub_id: str) -> bool:
         before = len(self._data["subscriptions"])
         self._data["subscriptions"] = [
@@ -415,10 +513,12 @@ class ConfigManager:
     # --- Default instance (fallback for detect_active) ---
 
     @property
+    @_reads
     def default_instance(self) -> str | None:
         """Return configured default subscription id, or None."""
         return self._data.get("default_instance")
 
+    @_mutates
     def set_default(self, sub_id: str) -> bool:
         """Set the default subscription. Returns False if sub_id not found."""
         if not self.get_subscription(sub_id):
@@ -427,8 +527,20 @@ class ConfigManager:
         self._save()
         return True
 
+    @_mutates
+    def set_model_maps(self, sub_id: str, model_maps: dict) -> bool:
+        """Replace (not merge) a subscription's model maps. False if not found."""
+        sub = self.get_subscription(sub_id)
+        if sub is None:
+            return False
+        sub["model_maps"] = dict(model_maps)
+        sub["updated_at"] = _now()
+        self._save()
+        return True
+
     # --- Model cache + blacklist ---
 
+    @_mutates
     def update_subscription_models(
         self,
         sub_id: str,
@@ -445,6 +557,7 @@ class ConfigManager:
         self._save()
         return True
 
+    @_mutates
     def add_blacklisted_model(self, sub_id: str, model_id: str) -> bool:
         """Add model_id to sub's blacklist. Returns False if sub not found."""
         sub = self.get_subscription(sub_id)
@@ -457,6 +570,7 @@ class ConfigManager:
             self._save()
         return True
 
+    @_mutates
     def remove_blacklisted_model(self, sub_id: str, model_id: str) -> bool:
         """Remove model_id from sub's blacklist. Returns False if sub not found."""
         sub = self.get_subscription(sub_id)
@@ -469,6 +583,7 @@ class ConfigManager:
             self._save()
         return True
 
+    @_reads
     def get_blacklisted_models(self, sub_id: str) -> list[str]:
         """Return list of blacklisted model IDs for sub, or [] if sub not found."""
         sub = self.get_subscription(sub_id)
@@ -478,6 +593,7 @@ class ConfigManager:
 
     # --- Port allocation ---
 
+    @_reads
     def _allocate_port(self) -> int:
         """Find next available port (18080+). Check port bind before allocation."""
         used_ports = {
@@ -496,12 +612,14 @@ class ConfigManager:
 
     # --- Instance helpers ---
 
+    @_reads
     def get_instance_port(self, sub_id: str) -> int | None:
         inst = self._data.get("instances", {}).get(sub_id)
         if inst and isinstance(inst, dict):
             return inst.get("port")
         return None
 
+    @_mutates
     def set_instance_port(self, sub_id: str, port: int):
         self._data.setdefault("instances", {})
         if sub_id not in self._data["instances"]:
@@ -509,6 +627,7 @@ class ConfigManager:
         self._data["instances"][sub_id]["port"] = port
         self._save()
 
+    @_mutates
     def clear_instance_port(self, sub_id: str):
         """Release port on stop — so it can be reused by others."""
         inst = self._data.get("instances", {}).get(sub_id)
@@ -516,12 +635,14 @@ class ConfigManager:
             del inst["port"]
             self._save()
 
+    @_reads
     def get_pm2_name(self, sub_id: str) -> str | None:
         inst = self._data.get("instances", {}).get(sub_id)
         if inst and isinstance(inst, dict):
             return inst.get("pm2_name")
         return None
 
+    @_reads
     def get_instance_dir(self, sub_id: str) -> Path | None:
         """Return the instance directory (where .env, logs are stored)."""
         sub = self.get_subscription(sub_id)

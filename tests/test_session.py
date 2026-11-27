@@ -1198,7 +1198,7 @@ class TestPromptTextWithStatusLines:
     delimited by ─ rules, and THREE status lines sit below it: a custom
     statusline script, the branch line and the permission-mode line."""
 
-    BELOW = ["  Troels 5t 22%\u219202:00 7d 36%", "  \u2387 main \u00b7 fix/16-restart-nudge-enter\u2026",
+    BELOW = ["  profile-a 5t 22%\u219202:00 7d 36%", "  \u2387 main \u00b7 fix/16-restart-nudge-enter\u2026",
              "  \u23f5\u23f5 bypass permissions on \u00b7 PR #17"]
     BODY = ["\u276f\u00a0Re-create your scheduled loops after the", "  restart. Re-create your scheduled"]
     WANT = "Re-create your scheduled loops after the restart. Re-create your scheduled"

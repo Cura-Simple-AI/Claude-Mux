@@ -56,6 +56,8 @@ class InstanceManager:
         str(Path.home() / ".local" / "bin" / "heimsense"),
     )
     ECOSYSTEM_PATH = Path.home() / ".ecosystem.config.js"
+    # How long `start` waits for the proxy to accept connections before giving up.
+    STARTUP_TIMEOUT = 10.0
 
     def __init__(self, config: ConfigManager):
         self.cm = config
@@ -174,7 +176,7 @@ class InstanceManager:
         if not is_oauth_proxy and not Path(proxy_bin).exists():
             raise FileNotFoundError(
                 f"heimsense binary not found at {proxy_bin}. "
-                f"Install: curl -fsSL https://raw.githubusercontent.com/cura-ai/claude-mux/main/scripts/install.sh | bash"
+                f"Install: curl -fsSL https://raw.githubusercontent.com/Cura-Simple-AI/Claude-Mux/main/install.sh | bash"
             )
 
         inst_dir = CLAUDE_MUX_DIR / "instances" / sub["name"]
@@ -213,11 +215,41 @@ class InstanceManager:
             err = result.stderr.strip() or result.stdout.strip()
             log.error("PM2 start failed for %s: %s", pm2_name, err)
             raise RuntimeError(f"PM2 start failed: {err}")
+
+        # pm2 accepting the command does not mean the proxy runs: it may exit at once
+        # (missing key, bad config). Only report success once it accepts connections.
+        if not self._wait_until_listening(port, self.STARTUP_TIMEOUT):
+            reason = self._log_tail(err_log) or self._log_tail(out_log)
+            subprocess.run(["pm2", "delete", pm2_name], capture_output=True, text=True)
+            self.cm.clear_instance_port(sub_id)
+            log.error("Proxy %s did not start on port %s: %s", pm2_name, port, reason)
+            raise RuntimeError(
+                f"proxy for '{sub['name']}' did not start (nothing listening on port {port} "
+                f"after {self.STARTUP_TIMEOUT:g}s)" + (f": {reason}" if reason else "")
+            )
         log.info("PM2 startet %s (port %s, pid se pm2 status)", pm2_name, port)
         self._regenerate_ecosystem()
         self._http_cleared.add(sub_id)
         self._pm2_save()
         return {"name": pm2_name, "port": port, "status": "started"}
+
+    @staticmethod
+    def _wait_until_listening(port: int, timeout: float) -> bool:
+        deadline = time.time() + timeout
+        while True:
+            if not _port_is_available(port, timeout=0.5):  # something accepts connections
+                return True
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.1)
+
+    @staticmethod
+    def _log_tail(path: Path, lines: int = 5) -> str:
+        try:
+            text = path.read_text(errors="replace").strip()
+        except OSError:
+            return ""
+        return " | ".join(text.splitlines()[-lines:])
 
     def stop(self, sub_id: str) -> dict:
         """Stop claude-mux via PM2."""
@@ -321,9 +353,15 @@ class InstanceManager:
         pm2_name = self.cm.get_pm2_name(sub_id)
         if pm2_name is None:
             return {"status": "unknown", "pm2_name": None}
-        result = subprocess.run(
-            ["pm2", "jlist"], capture_output=True, text=True,
-        )
+        try:
+            result = subprocess.run(
+                ["pm2", "jlist"], capture_output=True, text=True,
+            )
+        except OSError as e:
+            # pm2 is optional (only needed for proxy providers) — report status
+            # as unknown instead of crashing callers such as the TUI table.
+            log.warning("pm2 jlist unavailable: %s", e)
+            return {"status": "unknown", "pm2_name": pm2_name, "error": "pm2 not found"}
         if result.returncode != 0:
             log.warning("pm2 jlist failed: %s", result.stderr.strip())
             return {"status": "unknown", "pm2_name": pm2_name, "error": result.stderr.strip()}

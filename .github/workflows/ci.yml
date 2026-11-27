@@ -5,11 +5,13 @@ on:
     paths:
       - 'claude_mux/**'
       - 'tests/**'
+      - 'e2e/**'
       - 'pyproject.toml'
   pull_request:
     paths:
       - 'claude_mux/**'
       - 'tests/**'
+      - 'e2e/**'
       - 'pyproject.toml'
 
 jobs:
@@ -38,3 +40,28 @@ jobs:
 
       - name: Verify package imports cleanly
         run: python -c "import claude_mux; print('claude-mux', claude_mux.__version__)"
+
+  e2e:
+    name: End-to-end (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      # Own pytest process (HOME is isolated before claude_mux is imported).
+      # The tmux/Claude Code session tests are left out of CI.
+      - name: Run end-to-end tests
+        run: pytest e2e -q --tb=short --ignore=e2e/test_e2e_sessions.py

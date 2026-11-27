@@ -25,14 +25,51 @@ Format: [Semantic Versioning](https://semver.org/). Dates in ISO 8601.
   `--container`.
 - `session restart`: a bare `--worktree` in the original command line is not replayed in shell
   panes (it would create a new worktree); the session resumes in its existing worktree cwd.
+- End-to-end test suite (`e2e/`, `make test-e2e`, `make coverage-e2e`, see `e2e/README.md`): the
+  CLI and the proxy run as real processes, the TUI is driven through Textual's Pilot, and Claude
+  Code sessions run in a real (private) tmux server. Provider APIs are a local fake server and
+  `pm2`/`heimsense`/`claude`/`gh` are stand-in executables. Known open bugs are recorded as strict
+  `xfail` tests and listed in `KNOWN_ISSUES.md`.
 
 ### Changed
 - **Behaviour change (security):** the proxy now listens on `127.0.0.1` only (it used to listen on all
   interfaces and send `Access-Control-Allow-Origin: *`), and refuses requests with an `Origin` header, CORS
   preflights (`OPTIONS`) and non-local `Host` headers. Reaching a proxy from another machine no longer works.
   Restart running proxies to apply it (an old `LISTEN_ADDR=:<port>` also means loopback now).
+- Activating a provider rewrites every provider-specific key in `~/.claude/settings.json`
+  (`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_MODEL`,
+  `ANTHROPIC_SMALL_FAST_MODEL`, `ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL`): each is set for
+  the new provider or removed. Previously, tiers without a model mapping kept the previous
+  provider's model names, so e.g. after switching (or failing over) from DeepSeek to Claude Max,
+  Claude Code requested `deepseek-reasoner` from Anthropic. A top-level `"model"` is removed only if
+  it pins an id the previous provider served and the new one does not offer; a model you pinned
+  yourself (e.g. `claude-opus-5-5`), aliases (`opus`, `sonnet`, ...), your own `ANTHROPIC_API_KEY`
+  and all other settings are kept.
+- Activating a proxy provider whose proxy is not running is refused (CLI exit code 1, TUI
+  notification) instead of pointing Claude Code at `http://localhost:0`. `failover` skips such
+  providers.
+- TUI: `Enter` activates the highlighted provider immediately, like `1`-`9` (docs/KEYBOARD.md said
+  Enter no longer activated; README, QUICKSTART and CLI.md said it did). The unused
+  health-check-and-confirm activation path was removed.
+- The install hint shown when `heimsense` is missing now points to
+  `Cura-Simple-AI/Claude-Mux/main/install.sh` (it pointed to a non-existent repository path).
 
 ### Fixed
+- TUI: `j`/`k`/`n`/`p` navigation, `1`-`9` activation and the `/` filter did nothing: a second
+  `on_key` method (added for the `r` key) replaced the real key handler. The two are merged; the
+  `r`-while-typing interception is dropped (it never worked: inputs consume the key). Main-screen
+  keys are now ignored while a dialog or the log viewer is open.
+- TUI: the selection could jump to another row after a table refresh (stale highlight events from
+  the table rebuild), so `Enter` could activate a provider other than the one shown. Closing the
+  filter with `Enter` now keeps the first match selected, as documented.
+- The running TUI no longer loses providers added with the CLI meanwhile: `ConfigManager` reloads
+  `subscriptions.json` when another process changed it, and every change is a locked
+  read-modify-write (`subscriptions.json.lock`), also safe between threads and parallel CLI runs.
+- TUI no longer crashes on start when `pm2` is not installed (status shows `unknown`).
+- `start` reported success for proxies that exited immediately (e.g. API key variable not
+  exported), and such providers could then be activated, pointing Claude Code at a dead port.
+  `start` now waits up to 10 s for the proxy to accept connections; otherwise it fails with the
+  proxy's own error output and removes the pm2 process.
 - `session restart --nudge` on background (`claude attach`) panes (#16, root cause not yet
   reproduced — the issue stays open): more tolerant verification of the typed nudge (a long
   wrapped or clipped text is matched by its prefix once stable for four captures; attach panes

@@ -19,7 +19,8 @@ Claude Mux is optimized for iPhone SSH keyboards (Blink Shell, a-Shell, SSH.app)
 | `h` | `?` | Show help modal |
 | `q` | — | Quit |
 
-> **Note:** `Enter` no longer activates a provider. Use the **Activate** button or press `1`–`9`.
+> **Note:** `Enter` and `1`–`9` switch immediately (no confirmation). Proxy providers must be
+> started first (`s`); activating a stopped proxy provider is refused with a hint.
 
 ## List navigation
 
@@ -27,6 +28,7 @@ Claude Mux is optimized for iPhone SSH keyboards (Blink Shell, a-Shell, SSH.app)
 |---|---|---|
 | `↓` | `j`, `n` | Next subscription |
 | `↑` | `k`, `p` | Previous subscription |
+| `Enter` | — | Activate the highlighted provider |
 | `1`–`9` | — | Activate provider N directly (skips `*current settings` row) |
 
 **iPhone tip:** `j`/`k` (vi-style) and `n`/`p` work without arrow keys.
@@ -37,6 +39,7 @@ Claude Mux is optimized for iPhone SSH keyboards (Blink Shell, a-Shell, SSH.app)
 |---|---|
 | Click **Activate** button | OAuth / direct providers — writes token to settings.json |
 | Click **Sync settings** button | Bearer/proxy providers — updates settings.json to point to local proxy |
+| Press `Enter` | Activate the highlighted provider (same as Activate/Sync button) |
 | Press `1`–`9` | Instant activation by row number (same as Activate/Sync button) |
 
 Active provider is marked with `●` in the list and in the detail panel.
@@ -45,7 +48,7 @@ Active provider is marked with `●` in the list and in the detail panel.
 
 1. Press `/` — filter input appears; active filter shown in header as `/ <query>`
 2. Type to filter by provider name (case-insensitive)
-3. Press `Enter` or `Escape` to close filter
+3. Press `Enter` to close the filter and keep the first match selected, or `Escape` to close it
 
 ## Modals and pop-ups
 
@@ -100,8 +103,8 @@ Recommended settings:
 
 ```
 Add provider:      +  →  [type name]  →  Enter  →  [press 1-8]  →  [type key]  →  Enter
-Activate (OAuth):  [select with j/k]  →  [Activate button]   OR   1-9
-Sync (bearer):     [select with j/k]  →  [Sync settings button]  OR  1-9
+Activate (OAuth):  [select with j/k]  →  Enter   OR   1-9
+Sync (bearer):     [select with j/k]  →  s (start proxy)  →  Enter   OR   1-9
 Test:              t
 Filter:            / [type query] Enter
 Failover check:    x
@@ -112,5 +115,5 @@ Quit:              q  →  j
 
 ```
 TUI:  r + e d s t l L x / h ? q
-Nav:  j k n p 1-9
+Nav:  j k n p Enter 1-9
 ```
