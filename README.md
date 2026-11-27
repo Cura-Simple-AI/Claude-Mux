@@ -34,6 +34,8 @@ claude-mux removes all of that.
 ## How it works
 
 claude-mux sits between Claude Code and your providers via a local proxy.
+The proxy listens on `127.0.0.1` only and refuses requests from web pages, because it attaches
+your API key or OAuth token to every request it forwards.
 
 It multiplexes requests across providers and automatically switches when needed.
 
@@ -156,6 +158,7 @@ Full reference: [docs/KEYBOARD.md](docs/KEYBOARD.md)
 - [KEYBOARD.md](docs/KEYBOARD.md) — All keyboard shortcuts
 - [FAILOVER.md](docs/FAILOVER.md) — Automatic failover and auto-resume
 - [CLI.md](docs/CLI.md) — Full CLI reference
+- [KNOWN_ISSUES.md](KNOWN_ISSUES.md) — Open bugs and limitations
 
 ---
 

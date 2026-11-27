@@ -73,7 +73,7 @@ claude-mux automatically checks for missing Python packages at startup and offer
 2. Enter a name (e.g. "claude-max" or "deepseek")
 3. Select provider with `1-8` or `j`/`k` + `Enter`
 4. Follow provider-specific setup (API key or OAuth)
-5. Press `Enter` to activate as default
+5. Press `Enter` to activate as default (proxy providers such as DeepSeek: press `s` to start the proxy first)
 
 ## Typical workflow
 

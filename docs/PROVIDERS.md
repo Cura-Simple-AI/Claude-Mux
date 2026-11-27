@@ -34,7 +34,7 @@ export DEEPSEEK_API_KEY=sk-...
 **Setup in TUI:**
 1. `+` → name: deepseek → select `1 DeepSeek`
 2. API Key env: `DEEPSEEK_API_KEY`
-3. Press Enter / Activate
+3. Press `s` to start the proxy, then `Enter` to activate
 
 ---
 
@@ -132,7 +132,7 @@ Same OAuth token as #5, but traffic is routed through a local pm2 proxy instead 
 **Setup in TUI:**
 1. `+` → name: e.g. `claude-max-proxy` → select `5b Claude (OAuth via proxy)`
 2. API Key env: the same env var holding your OAuth token (e.g. `CLAUDE_CODE_OAUTH_TOKEN`)
-3. Press Enter / Activate — proxy starts automatically via pm2
+3. Press `s` to start the proxy (via pm2), then `Enter` to activate
 
 **How it works:**
 

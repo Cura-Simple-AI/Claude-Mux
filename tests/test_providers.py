@@ -8,6 +8,14 @@ from unittest.mock import patch, MagicMock
 import pytest
 import claude_mux as hs
 
+
+@pytest.fixture(autouse=True)
+def _proxy_port_is_listening():
+    """Unit tests of the settings merge use made-up proxy ports; pretend something listens.
+    The real "is the proxy running" check is covered end to end in e2e/."""
+    with patch("claude_mux.sync._port_is_available", return_value=False):
+        yield
+
 PROVIDERS = [
     ("deepseek",   "https://api.deepseek.com/v1",                               "bearer",       "DEEPSEEK_API_KEY",          {"haiku": "deepseek-chat", "sonnet": "deepseek-chat", "opus": "deepseek-reasoner"}),
     ("anthropic",  "https://api.anthropic.com/v1",                              "bearer",       "ANTHROPIC_API_KEY",         {}),

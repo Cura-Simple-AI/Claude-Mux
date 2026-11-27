@@ -502,6 +502,7 @@ class HelpModal(ModalScreen):
 [bold yellow]Navigation[/bold yellow]
   j / n / ↓   Move down  (iPhone: j or n)
   k / p / ↑   Move up    (iPhone: k or p)
+  Enter        Activate the highlighted provider
   1-9          Activate provider N directly (skips current-settings row)
   /            Filter providers by name (Enter/Esc to close)
   h / ?        Show this help
@@ -512,7 +513,7 @@ class HelpModal(ModalScreen):
   e         Edit subscription (model maps, force-model, fields)
   d         Delete subscription (confirm: j=yes, n=no)
   R         Reauth (renew OAuth token)
-  Activate  Switch Claude Code to this provider (button / 1-9)
+  Activate  Switch Claude Code to this provider (Enter / 1-9 / button)
 
 [bold yellow]Proxy providers[/bold yellow]
   s         Start / Stop (toggle)
@@ -1037,7 +1038,7 @@ class AddWizard(ModalScreen):
                 if not Path(InstanceManager.HEIMSENSE_BIN).exists():
                     self.app.notify(
                         "heimsense not installed — you can add this subscription but cannot start it until heimsense is installed.\n"
-                        "Install: curl -fsSL https://raw.githubusercontent.com/cura-ai/claude-mux/main/install.sh | bash",
+                        "Install: curl -fsSL https://raw.githubusercontent.com/Cura-Simple-AI/Claude-Mux/main/install.sh | bash",
                         title="heimsense missing",
                         severity="warning",
                         timeout=12,
@@ -2339,11 +2340,23 @@ class HeimsenseApp(App):
 
     def _on_data_table_row_highlighted(self, event: DataTable.RowHighlighted):
         """Arrow keys → update details."""
+        # _refresh_table rebuilds the table (clear() resets the cursor to row 0), so
+        # highlight events can arrive after the cursor has already moved on. Acting on
+        # such a stale event would silently select another provider — and Enter would
+        # then activate the wrong one.
+        if event.cursor_row != event.data_table.cursor_row:
+            return
         self._selected_id = event.row_key.value
         self._show_detail()
 
     def on_key(self, event):
-        """j/k/n/p as alternative to ↑/↓; 1-9 instant-activate; / open filter."""
+        """j/k/n/p as alternative to ↑/↓; 1-9 instant-activate; / open filter.
+
+        Enter (activate the highlighted row) arrives as DataTable.RowSelected.
+        """
+        # Keys that bubble up from a modal or the log viewer are not for the main screen
+        if len(self.screen_stack) > 1:
+            return
         # Don't intercept keys when filter input is focused
         filter_input = self.query_one("#filter-input", Input)
         if self.focused is filter_input:
@@ -2374,6 +2387,12 @@ class HeimsenseApp(App):
                     self._do_activate(target_id)
                     event.stop()
 
+    def on_data_table_row_selected(self, event: DataTable.RowSelected):
+        """Enter (or clicking the highlighted row): activate it immediately."""
+        target_id = event.row_key.value
+        if target_id and target_id != "__current__":
+            self._do_activate(target_id)
+
     def _close_filter(self):
         """Clear and hide the filter input."""
         filter_input = self.query_one("#filter-input", Input)
@@ -2388,6 +2407,11 @@ class HeimsenseApp(App):
         if event.input.id == "filter-input":
             self._filter_text = event.value
             self._refresh_table()
+            # Keep the selection on a visible match (Enter closes the filter on it)
+            if self._sorted_rows and self._selected_id not in self._sorted_rows:
+                self._selected_id = self._sorted_rows[0]
+                self.query_one("#inst-table", DataTable).move_cursor(row=0)
+                self._show_detail()
 
     def on_input_submitted(self, event: Input.Submitted):
         """Close filter on Enter — jump to first result."""
@@ -2514,7 +2538,7 @@ class HeimsenseApp(App):
             log.warning("heimsense binary not found for %s", sub_id)
             self.notify(
                 "heimsense not installed — bearer providers require it.\n"
-                "Install: curl -fsSL https://raw.githubusercontent.com/cura-ai/claude-mux/main/install.sh | bash",
+                "Install: curl -fsSL https://raw.githubusercontent.com/Cura-Simple-AI/Claude-Mux/main/install.sh | bash",
                 title="heimsense missing",
                 severity="error",
                 timeout=10,
@@ -2587,46 +2611,6 @@ class HeimsenseApp(App):
             self.notify("No PM2 name for this subscription", severity="error", timeout=3)
             return
         self.push_screen(LogViewer(pm2_name))
-
-    async def action_activate(self):
-        """Activate selected subscription — health-check first, confirm if failing."""
-        import asyncio
-        sub_id = self._selected_id
-        if not sub_id or sub_id == "__current__":
-            return
-        sub = self.cm.get_subscription(sub_id)
-        if not sub:
-            return
-        current_active = self._active_id
-        # Already active — just refresh
-        if current_active == sub_id:
-            self.notify(f"{sub['name']} is already active", timeout=3)
-            return
-
-        # Health-check before switching
-        self.notify(f"Checking {sub['name']}…", title="Activating", timeout=3)
-        loop = asyncio.get_running_loop()
-        ok, reason = await loop.run_in_executor(None, self.failover.test_health, sub_id)
-
-        if not ok:
-            msg = (
-                f"[bold red]Health check failed[/bold red]\n\n"
-                f"{sub['name']}: {reason}\n\n"
-                f"Activate anyway?"
-            )
-            confirm = ConfirmModal("Activate anyway?", msg)
-            self.push_screen(confirm, lambda result, sid=sub_id: self._do_activate(sid) if result else None)
-            return
-
-        # Check passed — confirm if displacing another active provider
-        if current_active and current_active != sub_id:
-            cur_sub = self.cm.get_subscription(current_active)
-            cur_name = cur_sub["name"] if cur_sub else current_active
-            msg = f"Switch active provider?\n\nFrom: {cur_name}\nTo: {sub['name']}"
-            confirm = ConfirmModal("Switch Provider", msg)
-            self.push_screen(confirm, lambda ok, sid=sub_id: self._do_activate(sid) if ok else None)
-        else:
-            self._do_activate(sub_id)
 
     def _do_activate(self, sub_id: str):
         """Execute provider switch after optional confirmation."""
@@ -2787,14 +2771,6 @@ class HeimsenseApp(App):
             self.call_from_thread(self._show_detail)
 
         self.run_worker(_do_fetch, thread=True)
-
-    def on_key(self, event) -> None:
-        """Intercept r/R at app level so it works even when an Input is focused."""
-        from textual.widgets import Input
-        focused = self.focused
-        if isinstance(focused, Input) and event.key == "r":
-            event.stop()
-            self.action_restart()
 
     def _background_health_check(self):
         """Periodic health-check in background thread — auto-switches on failure.
@@ -3231,7 +3207,14 @@ if __name__ == "__main__":
         # Test 3: SyncManager
         sub = cm.add_subscription("sync-test", "https://sync.test", "SYNC_KEY")
         sync = SyncManager(cm)
-        result = sync.sync_default(sub["id"])
+        # sync_default refuses a proxy provider whose port nobody listens on, so let this
+        # test listen on a free loopback port (no real proxy is started).
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            cm.set_instance_port(sub["id"], listener.getsockname()[1])
+            result = sync.sync_default(sub["id"])
         assert result["default"] == "sync-test"
         assert result["base_url"].startswith("http://localhost:")
         assert "ANTHROPIC_BASE_URL" in result["keys_updated"]

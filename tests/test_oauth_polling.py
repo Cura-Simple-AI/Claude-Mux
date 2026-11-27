@@ -31,7 +31,7 @@ class TestOAuthTokenExtraction:
                 break
             if "Your OAuth token" in line:
                 try:
-                    next(it, "")  # tom linje
+                    next(it, "")  # empty line
                     tok = next(it, "").strip()
                     if tok.startswith("sk-"):
                         token = tok

@@ -196,17 +196,17 @@ class TestDetectActiveViaClaudeAuthStatus:
         matches settings.json — NOT simply the first in the list."""
         import claude_mux.sync as _sync_mod
 
-        sub_first = cm.add_subscription("troels", "", "", auth_type="oauth")
-        cm.update_subscription(sub_first["id"], api_key="sk-ant-TROELS")
-        sub_second = cm.add_subscription("ada", "", "", auth_type="oauth")
-        cm.update_subscription(sub_second["id"], api_key="sk-ant-ADA")
+        sub_first = cm.add_subscription("profile-a", "", "", auth_type="oauth")
+        cm.update_subscription(sub_first["id"], api_key="sk-ant-PROFILE_A")
+        sub_second = cm.add_subscription("profile-b", "", "", auth_type="oauth")
+        cm.update_subscription(sub_second["id"], api_key="sk-ant-PROFILE_B")
 
         sync = SyncManager(cm)
         monkeypatch.setattr(SyncManager, "SETTINGS_PATH", tmp_path / "settings.json")
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
 
-        # Activate ada: write ada's token to settings.json
-        _write_settings(sync, {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-ADA"})
+        # Activate profile-b: write profile-b's token to settings.json
+        _write_settings(sync, {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-PROFILE_B"})
 
         # claude auth status returns no base URL → OAuth path
         monkeypatch.setattr(_sync_mod.subprocess, "run",
@@ -218,15 +218,15 @@ class TestDetectActiveViaClaudeAuthStatus:
         """Token-match also works when the active sub happens to be first."""
         import claude_mux.sync as _sync_mod
 
-        sub_first = cm.add_subscription("troels", "", "", auth_type="oauth")
-        cm.update_subscription(sub_first["id"], api_key="sk-ant-TROELS")
-        cm.add_subscription("ada", "", "", auth_type="oauth")  # second, not activated
+        sub_first = cm.add_subscription("profile-a", "", "", auth_type="oauth")
+        cm.update_subscription(sub_first["id"], api_key="sk-ant-PROFILE_A")
+        cm.add_subscription("profile-b", "", "", auth_type="oauth")  # second, not activated
 
         sync = SyncManager(cm)
         monkeypatch.setattr(SyncManager, "SETTINGS_PATH", tmp_path / "settings.json")
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
 
-        _write_settings(sync, {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-TROELS"})
+        _write_settings(sync, {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-PROFILE_A"})
         monkeypatch.setattr(_sync_mod.subprocess, "run",
                             _mock_claude_run(_make_claude_auth_output()))
 
@@ -236,8 +236,8 @@ class TestDetectActiveViaClaudeAuthStatus:
         """No token in settings → fallback: return first oauth sub (pre-fix behaviour)."""
         import claude_mux.sync as _sync_mod
 
-        sub_first = cm.add_subscription("troels", "", "", auth_type="oauth")
-        cm.add_subscription("ada", "", "", auth_type="oauth")
+        sub_first = cm.add_subscription("profile-a", "", "", auth_type="oauth")
+        cm.add_subscription("profile-b", "", "", auth_type="oauth")
 
         sync = SyncManager(cm)
         monkeypatch.setattr(SyncManager, "SETTINGS_PATH", tmp_path / "settings.json")

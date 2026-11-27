@@ -9,6 +9,14 @@ import pytest
 import claude_mux as hs
 
 
+@pytest.fixture(autouse=True)
+def _proxy_port_is_listening():
+    """Unit tests of the settings merge use made-up proxy ports; pretend something listens.
+    The real "is the proxy running" check is covered end to end in e2e/."""
+    with patch("claude_mux.sync._port_is_available", return_value=False):
+        yield
+
+
 def make_cm_sync(tmp_path, settings_path):
     cm = hs.ConfigManager(data_file=tmp_path / "subs.json")
 
@@ -87,8 +95,8 @@ class TestSyncMergeExistingSettings:
         finally:
             shutil.rmtree(d)
 
-    def test_model_maps_empty_values_not_written(self):
-        """Tomme model maps skal IKKE overskriv eksisterende settings."""
+    def test_model_maps_empty_removes_previous_provider_models(self):
+        """Empty model maps remove the previous provider's model settings (Claude Code defaults)."""
         d = Path(tempfile.mkdtemp())
         try:
             sp = d / "settings.json"
@@ -104,8 +112,7 @@ class TestSyncMergeExistingSettings:
                 with patch("shutil.copy2"):
                     sync.sync_default(sub["id"])
             s = json.loads(sp.read_text())
-            # Tomme maps → IKKE overskriv eksisterende model settings
-            # (SyncManager skriver kun hvis model_maps.get("x") er truthy)
-            assert s["env"].get("ANTHROPIC_DEFAULT_SONNET_MODEL") == "previous-sonnet"
+            # Empty maps → the previous provider's model name must not linger
+            assert "ANTHROPIC_DEFAULT_SONNET_MODEL" not in s["env"]
         finally:
             shutil.rmtree(d)

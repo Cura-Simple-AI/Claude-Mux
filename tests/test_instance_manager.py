@@ -48,7 +48,7 @@ class TestGenerateEnvBearer:
         with patch.dict("os.environ", {"DS_KEY": "x"}):
             env_path = im.generate_env(sub["id"])
         content = env_path.read_text()
-        assert "LISTEN_ADDR=127.0.0.1:18085" in content
+        assert "LISTEN_ADDR=127.0.0.1:18085" in content  # loopback only, never all interfaces
 
     def test_sets_model_maps(self, tmp_setup):
         cm, im, _ = tmp_setup
@@ -214,7 +214,10 @@ class TestInstanceStart:
                         with patch("claude_mux.instance.subprocess.run", side_effect=fake_run):
                             with patch.object(hs.InstanceManager, "_regenerate_ecosystem"):
                                 with patch.object(hs.InstanceManager, "_pm2_save"):
-                                    result = im.start(sub["id"])
+                                    # no real proxy runs here; the wait is covered by e2e/
+                                    with patch.object(hs.InstanceManager, "_wait_until_listening",
+                                                      return_value=True):
+                                        result = im.start(sub["id"])
 
         assert result["status"] == "started"
         pm2_start = next(args for args in calls if args[:2] == ["pm2", "start"])
