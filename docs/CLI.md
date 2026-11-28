@@ -1,8 +1,9 @@
 # CLI Reference
 
 claude-mux provides a command-line interface for the TUI actions (see the
-[parity table](#tui--cli-parity-table) for the few without one). Scripts, CI pipelines, and automation use the CLI; the TUI is
-a convenience layer on top of the same logic. `cm` is a short alias for `claude-mux`.
+[parity table](#tui--cli-parity-table) for the few without one). Scripts, CI pipelines, and
+automation use the CLI; the TUI is a convenience layer on top of the same logic. `cm` is a short
+alias for `claude-mux`.
 
 **Design principles:** [CLI Guidelines](https://clig.dev/) — subcommands, `--json` for scripting, stderr for errors, exit codes, `--help` on every command.
 
@@ -274,11 +275,15 @@ claude-mux edit deepseek --sonnet deepseek-reasoner
 | `--opus TEXT` | Model alias for the opus tier |
 | `--json` | Output as JSON |
 
-Exits with code 2 if no option is passed. Changing `--url` or `--auth` re-fetches the model list. A
-subscription cannot be renamed and its port cannot be set; ports are assigned when the proxy starts.
+Exits with code 2 if no option is passed. Changing `--url` or `--auth` re-fetches the model list. The
+CLI cannot rename a subscription or store a literal API key (there is no `--name` or `--api-key`),
+and the port cannot be set; ports are assigned when the proxy starts.
 
 > The TUI edit wizard locks the provider URL and auth type of an existing subscription. The CLI does
 > not; to switch provider in the TUI, add a new subscription.
+>
+> Renaming a subscription and saving a literal API key are TUI-only: the edit wizard offers both,
+> the CLI has no equivalent (see the [parity table](#tui--cli-parity-table)).
 
 **TUI equivalent:** `e` (Edit)
 
@@ -310,8 +315,9 @@ claude-mux status --json
 ```
 
 **Output:** one line per subscription, `name: status [port=N] [active]`. Status is `oauth` for OAuth
-subscriptions (no proxy), `stopped` when no proxy port is assigned, otherwise the pm2 status
-(for example `online`). **JSON fields:** `name`, `status`, `active`, `port`.
+and `oauth_proxy` subscriptions (`oauth_proxy` goes through a proxy), `stopped` when no proxy port
+is assigned, otherwise the pm2 status (for example `online`), or `unknown` if the status lookup
+fails. **JSON fields:** `name`, `status`, `active`, `port`.
 
 **TUI equivalent:** Main table (auto-refreshes every 5s)
 
@@ -369,26 +375,30 @@ claude-mux logs deepseek --tail 100
 
 ### `claude-mux force-model <name> [model]`
 
-Force a model for one tier of a subscription (writes the tier's model alias).
+Set the model map of one tier of a subscription (writes the tier's model alias).
 
 ```bash
 claude-mux force-model deepseek deepseek-reasoner --tier sonnet
-claude-mux force-model deepseek --reset --tier sonnet   # remove the override
+claude-mux force-model deepseek --reset --tier sonnet   # remove the tier's model map
 ```
 
 **Options:**
 | Flag | Description |
 |---|---|
 | `--tier TEXT` | `haiku` \| `sonnet` \| `opus` (default `sonnet`) |
-| `--reset` | Remove the override for the tier |
+| `--reset` | Remove the tier's model map |
 | `--json` | Output as JSON |
 
 Exits with code 2 without `MODEL` and without `--reset`.
 
-> The force option in the TUI edit wizard (`e`) forces all three tiers to one model. The CLI works on
-> one tier at a time; run it once per tier for the same effect.
+> **Parity gap:** this command is not the CLI equivalent of the force option in the TUI edit wizard
+> (`e`). The wizard stores a separate `force_model` on the subscription, which is applied to all
+> three tiers without touching the model maps and can be removed again without losing them.
+> `force-model` instead writes (or, with `--reset`, removes) one tier's model map, so running it once
+> per tier does not give the same result, and `--reset` leaves the tier without a mapping. There is
+> no CLI for the wizard's force option.
 
-**TUI equivalent:** `e` (Edit wizard, force model)
+**TUI equivalent:** none for the wizard's force option; this command edits a tier's model map.
 
 ---
 
@@ -513,7 +523,7 @@ claude-mux blacklist deepseek --list                       # list (also the defa
 
 ### `claude-mux test-tui`
 
-Open the TUI, exit after about one second and print `✅ TUI started OK`, or print the error and exit
+Open the TUI, exit after about half a second and print `✅ TUI started OK`, or print the error and exit
 with code 1. Use it to check that the TUI starts, for example in CI.
 
 ---
@@ -732,7 +742,8 @@ claude-mux test || claude-mux failover
 | `s` (stop) | `claude-mux stop <name>` | Stop proxy |
 | `t` | `claude-mux test [name]` | Test all tiers |
 | `e` | `claude-mux edit <name>` | Edit subscription |
-| `e` (force model) | `claude-mux force-model <name> <model> --tier <tier>` | Force model (CLI: one tier per call) |
+| `e` (force model) | — | Force one model for all tiers (no CLI equivalent; `claude-mux force-model` sets a tier's model map instead) |
+| `e` (rename, literal API key) | — | Rename a subscription or save a literal key (TUI only; `claude-mux edit` has no `--name` or `--api-key`) |
 | `e` on `*current settings` | `claude-mux add` | Save current settings as new subscription |
 | `d` | `claude-mux delete <name>` | Delete subscription |
 | `l` | `claude-mux logs <name>` | PM2 logs |
