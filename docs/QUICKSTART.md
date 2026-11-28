@@ -4,18 +4,22 @@ claude-mux is a terminal UI for managing AI provider subscriptions. Switch betwe
 
 ## Installation
 
-### pip (recommended)
+> **Install from this repository.** The name `claude-mux` on PyPI belongs to a different,
+> unrelated project, so `pip install claude-mux` does **not** install this tool.
+
+### pipx (isolated environment, recommended)
 
 ```bash
-pip install claude-mux
+pipx install git+https://github.com/Cura-Simple-AI/Claude-Mux.git
 claude-mux init   # set up Claude Code status line (run once)
 claude-mux
 ```
 
-### pipx (isolated environment)
+### pip
 
 ```bash
-pipx install claude-mux
+pip install git+https://github.com/Cura-Simple-AI/Claude-Mux.git
+claude-mux init   # set up Claude Code status line (run once)
 claude-mux
 ```
 
@@ -26,13 +30,6 @@ git clone https://github.com/Cura-Simple-AI/Claude-Mux
 cd Claude-Mux
 pip install -e .
 claude-mux
-```
-
-### Standalone (no install)
-
-```bash
-pip install textual rich psutil
-python3 claude-mux.py --tui
 ```
 
 ## Requirements
