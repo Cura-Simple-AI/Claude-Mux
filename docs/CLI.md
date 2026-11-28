@@ -1,21 +1,25 @@
 # CLI Reference
 
-claude-mux provides a full command-line interface that mirrors every TUI action. Scripts, CI pipelines, and automation use the CLI; the TUI is a convenience layer on top of the same logic.
+claude-mux provides a command-line interface for the TUI actions (see the
+[parity table](#tui--cli-parity-table) for the few without one). Scripts, CI pipelines, and automation use the CLI; the TUI is
+a convenience layer on top of the same logic. `cm` is a short alias for `claude-mux`.
 
 **Design principles:** [CLI Guidelines](https://clig.dev/) — subcommands, `--json` for scripting, stderr for errors, exit codes, `--help` on every command.
 
 ---
 
-## Global flags
+## Global options
+
+Only these options work on the root command, in front of a subcommand:
 
 | Flag | Short | Description |
 |---|---|---|
-| `--json` | `-j` | Output as JSON (machine-readable) |
-| `--quiet` | `-q` | Suppress non-essential output |
-| `--no-color` | | Disable color output |
-| `--config-dir PATH` | | Override config directory (default: `~/.claude-mux/`) |
 | `--version` | `-V` | Show version and exit |
 | `--help` | `-h` | Show help and exit |
+
+Run without a subcommand, `claude-mux` opens the TUI. `--json` and `--quiet`/`-q` are options of
+individual commands, not global flags; the sections below list which commands accept them. The
+config directory is always `~/.claude-mux/`.
 
 ---
 
@@ -27,7 +31,7 @@ claude-mux provides a full command-line interface that mirrors every TUI action.
 | `1` | General error |
 | `2` | Usage / argument error |
 | `3` | Subscription not found |
-| `4` | Health check failed |
+| `4` | Health check failed (also: `session restart` skipped, see below) |
 
 ---
 
@@ -40,9 +44,12 @@ List all subscriptions.
 ```bash
 claude-mux list
 claude-mux list --json
+claude-mux list --quiet     # no header, rows only
 ```
 
-**Output columns:** ID, Name, Provider, Status, Port, Active
+**Options:** `--json`, `-q` / `--quiet` (suppress the header).
+
+**Output columns:** NAME, PROVIDER (base URL, cut to 18 characters), AUTH, PORT, ACTIVE (`✓`)
 
 **JSON output:**
 ```json
@@ -50,11 +57,10 @@ claude-mux list --json
   {
     "id": "abc123",
     "name": "claude-max",
-    "provider": "claude-max",
+    "provider": "",
     "auth_type": "oauth",
     "port": null,
-    "active": true,
-    "status": "oauth"
+    "active": true
   }
 ]
 ```
@@ -65,36 +71,35 @@ claude-mux list --json
 
 ### `claude-mux add`
 
-Add a new subscription interactively or non-interactively.
+Add a new subscription. The command is non-interactive; use the TUI `+` wizard for a guided flow.
 
 ```bash
-# Interactive wizard (same as TUI `+`)
-claude-mux add
+# API key read from an environment variable
+claude-mux add -n deepseek -u https://api.deepseek.com/v1 -k DEEPSEEK_API_KEY
 
-# Non-interactive
-claude-mux add \
-  --name deepseek \
-  --provider deepseek \
-  --api-key-env DEEPSEEK_API_KEY \
-  --port 18082
-
-# Claude Max (OAuth) — opens browser for OAuth flow
-claude-mux add --name claude-max --provider claude-max
+# Claude Max (OAuth)
+claude-mux add -n claude-max -u https://api.anthropic.com -k CLAUDE_CODE_OAUTH_TOKEN --auth oauth
 ```
 
-**Flags:**
+**Options:**
 | Flag | Description |
 |---|---|
-| `--name NAME` | Subscription name |
-| `--provider PROVIDER` | Provider preset (deepseek, anthropic, openai, copilot, claude-max, gemini, z-ai, custom) |
-| `--api-key-env VAR` | Environment variable holding the API key |
-| `--port PORT` | Proxy port (auto-assigned if omitted) |
-| `--url URL` | Base URL (custom provider only) |
-| `--model-haiku MODEL` | Override haiku model alias |
-| `--model-sonnet MODEL` | Override sonnet model alias |
-| `--model-opus MODEL` | Override opus model alias |
+| `-n`, `--name TEXT` | Subscription name (required) |
+| `-u`, `--url TEXT` | Provider base URL (required) |
+| `-k`, `--key-env TEXT` | Env var name that holds the API key |
+| `-K`, `--api-key TEXT` | API key value, stored directly in `subscriptions.json` (prefer `-k`) |
+| `--auth TEXT` | Auth type: `bearer` \| `gh_token` \| `x-goog-api-key` \| `oauth` \| `oauth_proxy` (default `bearer`) |
+| `--haiku TEXT` | Model alias for the haiku tier |
+| `--sonnet TEXT` | Model alias for the sonnet tier |
+| `--opus TEXT` | Model alias for the opus tier |
+| `--json` | Output as JSON |
 
-**TUI equivalent:** `+` (Add wizard)
+Fails with exit code 1 if a subscription with the same name (case-insensitive) exists. After adding,
+the command tries to fetch the provider's model list; a failed fetch is not an error (run
+`claude-mux models NAME --refresh` later). The proxy port is assigned when the proxy is started.
+
+**TUI equivalent:** `+` (Add wizard). Also `e` on the `*current settings` row, which saves the current
+Claude Code settings as a new subscription.
 
 ---
 
@@ -105,7 +110,10 @@ Activate a subscription as the default for Claude Code.
 ```bash
 claude-mux activate claude-max
 claude-mux activate deepseek --json
+claude-mux activate deepseek --quiet
 ```
+
+**Options:** `-q` / `--quiet` (suppress output), `--json`.
 
 Updates `~/.claude/settings.json` with the correct env vars. All provider-specific keys
 (`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`,
@@ -133,6 +141,8 @@ Start the proxy for a subscription (pm2).
 claude-mux start deepseek
 ```
 
+**Options:** `-q` / `--quiet`. OAuth (direct) subscriptions need no proxy: the command prints a message and exits with code 1.
+
 Waits until the proxy accepts connections (up to 10 s). If it does not — for example because the
 API key variable is not exported — the command exits with code 1, prints the proxy's own error
 output and removes the pm2 process. Proxies listen on `127.0.0.1` only and refuse requests from web
@@ -155,37 +165,43 @@ claude-mux stop --all
 | Flag | Description |
 |---|---|
 | `--all` | Stop all running proxies |
+| `-q`, `--quiet` | Suppress output |
+
+Without `NAME` and without `--all` the command exits with code 2.
 
 **TUI equivalent:** `s` (Stop)
 
 ---
 
-### `claude-mux test [name]`
+### `claude-mux test [name] [tier]`
 
-Run a health check on a subscription.
+Test a subscription with a real inference request, per model tier.
 
 ```bash
-# Test active subscription
-claude-mux test
-
-# Test specific
-claude-mux test deepseek
+claude-mux test                      # all three tiers of the active subscription
+claude-mux test deepseek             # all three tiers of deepseek
+claude-mux test deepseek haiku       # one tier (haiku | sonnet | opus)
+claude-mux test deepseek --model deepseek-chat   # one model id, bypasses tier resolution
 claude-mux test deepseek --json
 ```
+
+**Options:** `--model TEXT`, `--json`.
+
+Output per tier: `<name> [<tier>] <model>: OK|FAIL (<http code>, <ms>ms)` followed by the start of the
+response body.
 
 **JSON output:**
 ```json
 {
   "name": "deepseek",
-  "port": 18082,
-  "http_code": 200,
-  "elapsed_ms": 342,
-  "model": "deepseek-chat",
-  "ok": true
+  "results": [
+    {"tier": "haiku", "model": "deepseek-chat", "ok": true, "code": 200, "elapsed_ms": 342, "body": "..."}
+  ]
 }
 ```
 
-Exit code `4` if health check fails.
+Exit code `4` if any tier fails; `3` if the subscription is not found, there is no active subscription,
+or there is no model to test.
 
 **TUI equivalent:** `t` (Test)
 
@@ -202,6 +218,9 @@ claude-mux probe acct-a --quota           # one OAuth profile
 claude-mux probe --quota --all            # every subscription with auth_type oauth
 claude-mux probe --quota --all --json     # machine-readable
 ```
+
+**Options:** `--model TEXT` (default: haiku map, then sonnet map, then `claude-haiku-4-5-20251001`),
+`--quota`, `--all` (with `--quota`), `--json`.
 
 With `--quota` no proxy is needed: one 1-token haiku call per OAuth profile goes directly to
 `api.anthropic.com` (`anthropic-beta: oauth-2025-04-20`) and the `anthropic-ratelimit-unified-*`
@@ -237,28 +256,29 @@ respectively (usage error, exit 2).
 
 ### `claude-mux edit <name>`
 
-Edit a subscription's settings interactively or via flags.
-
-Provider URL and auth type are **locked after creation** — they define what the subscription is. To use a different provider, add a new subscription.
+Edit a subscription. Only the options you pass are updated; the command is non-interactive.
 
 ```bash
-# Interactive
-claude-mux edit deepseek
-
-# Non-interactive
-claude-mux edit deepseek --api-key-env NEW_KEY_VAR
-claude-mux edit deepseek --port 18090
+claude-mux edit deepseek --key-env NEW_KEY_VAR
+claude-mux edit deepseek --sonnet deepseek-reasoner
 ```
 
-**Editable flags:**
+**Options:**
 | Flag | Description |
 |---|---|
-| `--name NAME` | Rename the subscription |
-| `--api-key-env VAR` | Change API key env variable |
-| `--port PORT` | Change proxy port |
-| `--model-haiku MODEL` | Override haiku model alias |
-| `--model-sonnet MODEL` | Override sonnet model alias |
-| `--model-opus MODEL` | Override opus model alias |
+| `-u`, `--url TEXT` | New provider base URL |
+| `-k`, `--key-env TEXT` | New env var name for the API key |
+| `--auth TEXT` | New auth type |
+| `--haiku TEXT` | Model alias for the haiku tier |
+| `--sonnet TEXT` | Model alias for the sonnet tier |
+| `--opus TEXT` | Model alias for the opus tier |
+| `--json` | Output as JSON |
+
+Exits with code 2 if no option is passed. Changing `--url` or `--auth` re-fetches the model list. A
+subscription cannot be renamed and its port cannot be set; ports are assigned when the proxy starts.
+
+> The TUI edit wizard locks the provider URL and auth type of an existing subscription. The CLI does
+> not; to switch provider in the TUI, add a new subscription.
 
 **TUI equivalent:** `e` (Edit)
 
@@ -266,12 +286,14 @@ claude-mux edit deepseek --port 18090
 
 ### `claude-mux delete <name>`
 
-Delete a subscription (prompts for confirmation unless `--yes`).
+Delete a subscription (prompts for confirmation unless `--yes` or `--json`).
 
 ```bash
 claude-mux delete deepseek
 claude-mux delete deepseek --yes   # skip confirmation
 ```
+
+**Options:** `-y` / `--yes`, `--json` (also skips the confirmation prompt).
 
 **TUI equivalent:** `d` (Delete)
 
@@ -286,6 +308,10 @@ claude-mux status
 claude-mux status claude-max
 claude-mux status --json
 ```
+
+**Output:** one line per subscription, `name: status [port=N] [active]`. Status is `oauth` for OAuth
+subscriptions (no proxy), `stopped` when no proxy port is assigned, otherwise the pm2 status
+(for example `online`). **JSON fields:** `name`, `status`, `active`, `port`.
 
 **TUI equivalent:** Main table (auto-refreshes every 5s)
 
@@ -316,11 +342,11 @@ claude-mux failover-log --tail 20
 claude-mux failover-log --json
 ```
 
-**Flags:**
+**Options:**
 | Flag | Description |
 |---|---|
-| `--tail N` | Show last N entries (default: all) |
-| `--follow` / `-f` | Follow log in real time |
+| `-n`, `--tail N` | Show last N lines (default: all) |
+| `--json` | Output as JSON |
 
 **TUI equivalent:** `L` (Failover Log modal)
 
@@ -328,29 +354,41 @@ claude-mux failover-log --json
 
 ### `claude-mux logs <name>`
 
-Show PM2 proxy logs for a subscription.
+Show PM2 proxy logs for a subscription. Requires `pm2`.
 
 ```bash
 claude-mux logs deepseek
-claude-mux logs deepseek --tail 50
-claude-mux logs deepseek --follow
+claude-mux logs deepseek --tail 100
 ```
+
+**Options:** `-n` / `--tail N` (default 50). The logs are printed once, not followed.
 
 **TUI equivalent:** `l` (PM2 Logs)
 
 ---
 
-### `claude-mux force-model <name> <model>`
+### `claude-mux force-model <name> [model]`
 
-Override all model aliases to a single model.
+Force a model for one tier of a subscription (writes the tier's model alias).
 
 ```bash
-claude-mux force-model deepseek deepseek-chat
-claude-mux force-model claude-max claude-opus-4-6
-claude-mux force-model deepseek --reset   # remove override
+claude-mux force-model deepseek deepseek-reasoner --tier sonnet
+claude-mux force-model deepseek --reset --tier sonnet   # remove the override
 ```
 
-**TUI equivalent:** `f` (Force model)
+**Options:**
+| Flag | Description |
+|---|---|
+| `--tier TEXT` | `haiku` \| `sonnet` \| `opus` (default `sonnet`) |
+| `--reset` | Remove the override for the tier |
+| `--json` | Output as JSON |
+
+Exits with code 2 without `MODEL` and without `--reset`.
+
+> The force option in the TUI edit wizard (`e`) forces all three tiers to one model. The CLI works on
+> one tier at a time; run it once per tier for the same effect.
+
+**TUI equivalent:** `e` (Edit wizard, force model)
 
 ---
 
@@ -363,13 +401,15 @@ claude-mux config
 claude-mux config --json
 ```
 
+**Options:** `--json` (keys: `config_dir`, `subscriptions`, `failover_log`, `claude_settings`, `active`, `active_auth`).
+
 **Output:**
 ```
 Config dir:    ~/.claude-mux/
 Subscriptions: ~/.claude-mux/subscriptions.json
 Failover log:  ~/.claude-mux/failover.log
 Claude config: ~/.claude/settings.json
-Active sub:    claude-max (oauth, direct)
+Active sub:    claude-max (oauth)
 ```
 
 ---
@@ -386,7 +426,8 @@ claude-mux active          # print name, exit 0; or exit 1 if no match
 claude-mux active --json   # {"active": "deepseek", "id": "de3a7e01-..."}
 ```
 
-**Exit codes:** `0` = match found · `1` = no match (settings not from any saved subscription)
+**Exit codes:** `0` = match found · `1` = no match (settings not from any saved subscription; with
+`--json` the output is `{"active": null}`)
 
 ---
 
@@ -403,16 +444,16 @@ echo '{"model":"claude-sonnet-4-6","rate_limits":[...]}' | claude-mux statusline
 
 **Output format:**
 ```
-🔌 claude-max · claude-sonnet-4-6 · 5h 23% · 7d 41% · ctx 12%
+🔌 claude-max · sonnet-4-6 · 5h 23% · 7d 41% · ctx 12%
 ```
 
-- **Subscription name** — active subscription
-- **Model** — model currently in use
-- **5h %** — input token usage in the 5-hour window
-- **7d %** — input token usage in the 7-day window
+- **Subscription name** — active subscription (from `~/.claude-mux/active-name`)
+- **Model** — model currently in use, without the `claude-` prefix
+- **5h %, 7d %** — usage of the rate-limit windows, shown only when Claude Code sends `rate_limits`
 - **ctx %** — context window used this turn
 
-Usage is color-coded: green < 50%, yellow 50–79%, red ≥ 80%.
+Parts that are not available are left out. If stdin is empty or not JSON, only the subscription name
+is printed.
 
 **TUI equivalent:** Status bar (bottom of TUI)
 
@@ -433,6 +474,49 @@ claude-mux init --force   # overwrite existing statusLine setting
 
 **After running:** restart Claude Code. The status bar shows the active subscription name,
 updated every time you activate a subscription with `claude-mux activate`.
+
+---
+
+### `claude-mux models [name]`
+
+Show the cached model list of a subscription (default: the active one).
+
+```bash
+claude-mux models
+claude-mux models deepseek --refresh   # re-fetch from the provider first
+claude-mux models deepseek --json
+```
+
+**Options:** `--refresh`, `--json` (keys: `name`, `available_models`, `blacklisted_models`, `models_fetched_at`).
+Blacklisted models are marked `[blacklisted]`. A failed refresh is reported on stdout, not as an
+error code; exit code `3` if the subscription is not found or none is active.
+
+**TUI equivalent:** the model list is fetched when a subscription is added or edited.
+
+---
+
+### `claude-mux blacklist <name> [model]`
+
+Manage the models of a subscription that tests never use (`claude-mux test` and the TUI Test button).
+
+```bash
+claude-mux blacklist deepseek deepseek-reasoner            # add
+claude-mux blacklist deepseek --remove deepseek-reasoner   # remove
+claude-mux blacklist deepseek --list                       # list (also the default without MODEL)
+```
+
+**Options:** `--remove MODEL`, `--list`, `--json`.
+
+**TUI equivalent:** none — CLI only.
+
+---
+
+### `claude-mux test-tui`
+
+Open the TUI, exit after about one second and print `✅ TUI started OK`, or print the error and exit
+with code 1. Use it to check that the TUI starts, for example in CI.
+
+---
 
 ### `claude-mux session list`
 
@@ -614,7 +698,7 @@ fi
 claude-mux test --json | python3 -c "
 import sys, json
 r = json.load(sys.stdin)
-sys.exit(0 if r['ok'] else 4)
+sys.exit(0 if all(t['ok'] for t in r['results']) else 4)
 "
 ```
 
@@ -642,27 +726,33 @@ claude-mux test || claude-mux failover
 
 | TUI key | CLI command | Description |
 |---|---|---|
-| `r` | — | Reload TUI (hotload restart) |
 | `+` | `claude-mux add` | Add subscription |
-| `Enter` | `claude-mux activate <name>` | Set as default |
+| `Enter`, `1`–`9` | `claude-mux activate <name>` | Set as default |
 | `s` (start) | `claude-mux start <name>` | Start proxy |
 | `s` (stop) | `claude-mux stop <name>` | Stop proxy |
-| `t` | `claude-mux test [name]` | Health check |
+| `t` | `claude-mux test [name]` | Test all tiers |
 | `e` | `claude-mux edit <name>` | Edit subscription |
-| `e` on `*current` | — | Save current settings as new subscription |
+| `e` (force model) | `claude-mux force-model <name> <model> --tier <tier>` | Force model (CLI: one tier per call) |
+| `e` on `*current settings` | `claude-mux add` | Save current settings as new subscription |
 | `d` | `claude-mux delete <name>` | Delete subscription |
-| `f` | `claude-mux force-model <name> <model>` | Force model |
 | `l` | `claude-mux logs <name>` | PM2 logs |
 | `L` | `claude-mux failover-log` | Failover log |
 | `x` | `claude-mux failover` | Manual failover |
-| `h` | `claude-mux --help` | Help |
-| `q` | (exit TUI) | — |
+| `/` | `claude-mux list` | Filter the list (CLI: list all, filter with your shell) |
+| `h`, `?` | `claude-mux --help` | Help |
+| `r` | — | Reload the TUI (hotload restart) |
+| `q` | — | Quit the TUI |
+| Reauth button | — | Renew an OAuth token (no CLI command) |
 | — | `claude-mux probe --quota [--all]` | Measure OAuth week / 5h rate-limit usage (no TUI view) |
+| — | `claude-mux models`, `claude-mux blacklist` | Model list and test blacklist (no TUI view) |
 | — | `claude-mux active` | Print active subscription name |
+| — | `claude-mux status` | Status of subscriptions (TUI: main table) |
+| — | `claude-mux config` | Show configuration paths |
 | — | `claude-mux init` | Install Claude Code status line |
 | — | `claude-mux session list` | List Claude Code sessions in tmux (TUI view may follow) |
 | — | `claude-mux session restart` | Exit and resume sessions safely (TUI action may follow) |
 | — | `claude-mux statusline` | Format status line from Claude Code JSON (called by statusline.sh) |
+| — | `claude-mux test-tui` | Check that the TUI starts |
 
 ---
 
